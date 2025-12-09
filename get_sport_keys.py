@@ -29,7 +29,9 @@ def get_keys():
     # Filter for Esports specifically
     found_esports = False
     for sport in data:
+        
         key = sport['key']
+        print(key)
         if "esports" in key or "lol" in key or "league" in key:
             print(f"🎮 ESPORT FOUND: {sport['title']}")
             print(f"   Key: '{key}'") # <--- THIS IS WHAT YOU NEED

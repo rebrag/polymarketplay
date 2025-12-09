@@ -1,3 +1,4 @@
+#print_edge_v5.py
 import requests
 import json
 import os
@@ -11,18 +12,31 @@ load_dotenv()
 
 # --- CONFIG ---
 ODDS_API_KEY = os.getenv('ODDS_KEY')
-USE_LIVE_API = False    # Set TRUE to refresh data (Costs 1 Credit)
-SPORT = "americanfootball_nfl"
+USE_LIVE_API = True    # Set TRUE to refresh data (Costs 1 Credit)
+SPORT = "soccer_epl"
 MIN_EDGE = 0.01         # 1.0% Edge
 
 client = ClobClient("https://clob.polymarket.com")
+
+def normalize_point(point):
+    """
+    Converts '42.0' -> '42', but keeps '42.5' -> '42.5'.
+    Helps match Pinnacle '42.0' to Polymarket '42'.
+    """
+    try:
+        f_point = float(point)
+        if f_point.is_integer():
+            return str(int(f_point))
+        return str(f_point)
+    except:
+        return str(point)
 
 class PolymarketEngine:
     def __init__(self):
         self.markets = []
 
     def fetch_all_markets(self):
-        NFL_TAG_ID = 450 
+        NFL_TAG_ID = 306  ## 450 for NFL, 306 = EPL Soccer
         print(f"📥 Downloading NFL Markets (Tag: {NFL_TAG_ID})...")
         
         params = {
@@ -82,12 +96,13 @@ class PolymarketEngine:
                 if re.search(r'\d+\.\d+', q): continue 
 
             elif market_type == "totals":
-                # Must look like a total
                 if not any(k in q for k in ["over", "under", "total", "o/u"]): continue
                 
-                # Must contain the exact point number (e.g., "43.5")
+                # --- FIXED DECIMAL MATCHING ---
                 if target_point:
-                    if str(target_point) not in q: continue
+                    # We normalize both the target and the question text
+                    clean_point = normalize_point(target_point)
+                    if clean_point not in q: continue
 
             # --- MATCHING ---
             score = fuzz.token_set_ratio(f"{clean_a} vs {clean_b}", q)
