@@ -7,8 +7,6 @@ slug = "russia-x-ukraine-ceasefire-in-2025"
 def get_market_tokens(slug):
     print(f"🔎 Fetching data for: {slug}...")
     
-    # We hit the "Gamma" API (Polymarket's Data Layer) directly
-    # This is more reliable than the python client for lookups
     url = f"https://gamma-api.polymarket.com/events?slug={slug}"
     
     try:
@@ -20,8 +18,6 @@ def get_market_tokens(slug):
             print("❌ No event found. Check the slug spelling.")
             return
 
-        # Polymarket events can have multiple markets (e.g., "Will it rain?" has "Yes" and "No")
-        # usually data[0] is the main event wrapper
         event = data[0]
         markets = event.get('markets', [])
         
