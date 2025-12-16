@@ -69,7 +69,6 @@ ODDS_KEY=YourTheOddsApiKey
 
 # Copy Trading Target (Required for CopyTrader)
 TARGET_WALLET=0xTargetAddressToCopy
-```
 
 🛠️ Usage Guide
 🔍 1. Real-Time Market Analysis
