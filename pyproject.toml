@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polymarket_bot"
+version = "0.1.0"
+dependencies = [
+    "requests",
+    "python-dotenv",
+    "websocket-client",
+    "py-clob-client",
+    "thefuzz"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]  # Scans for 'src' and other packages
+include = ["src*"]
