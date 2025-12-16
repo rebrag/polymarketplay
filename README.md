@@ -1,47 +1,118 @@
-# Polymarket NFL Arbitrage Bot (Proof of Concept)
+# Polymarket Algo-Trading Bot
 
-This project is a quantitative trading tool designed to identify and exploit arbitrage opportunities ("edges") on the [Polymarket](https://polymarket.com/) prediction market.
+A modular, high-performance Python framework for interacting with the Polymarket CLOB (Central Limit Order Book) and Gamma APIs.
 
-The bot calculates "Fair Value" probabilities derived from **Pinnacle** (a sharp sportsbook) via The Odds API and compares them against live Ask prices on the Polymarket CLOB (Central Limit Order Book).
+This project is a quantitative trading tool designed to:
+1.  **Identify Arbitrage Edges:** Calculates "Fair Value" probabilities derived from **Pinnacle** (via The Odds API) and compares them against live Ask prices on Polymarket.
+2.  **Automate Execution:** Provides tools for copy-trading, limit order management, and real-time book verification.
 
-## ⚠️ Current Status: Proof of Concept
+## 📂 Project Structure
 
-This repository currently contains **two primary Proof of Concept (PoC) files** that demonstrate the core logic of the strategy:
+This project is designed with a "Scripts & Source" architecture. The heavy lifting is done in the `src/` directory, while `scripts/` contains the executable tools you will actually run.
 
-1.  **`find_edge_v6.py`**: The **Scanner**. It finds the trades.
-2.  **`submitting_transactions.py`**: The **Executor**. It places the trades.
+```text
+├── scripts/                 # <--- 🚀 RUN THESE FILES
+│   ├── verify_book.py       # Real-time WebSocket order book visualizer (Highly Recommended)
+│   ├── trades_and_books.py  # Tracks trades and book updates simultaneously
+│   ├── edge_scanner.py      # Scans for +EV bets vs Pinnacle odds (The "Brain")
+│   ├── copytrader.py        # Automates copying a specific wallet's trades
+│   ├── check_orders.py      # Checks your current open orders
+│   └── lookup_game.py       # Quick utility to find Market IDs/Slugs
+│
+├── src/                     # Core logic (Do not edit unless developing)
+│   ├── clients.py           # API Wrappers (HTTP & WebSocket)
+│   ├── engine.py            # Matching engine for market reconciliation
+│   ├── book.py              # Local OrderBook management
+│   └── models.py            # Strict Type definitions
+│
+├── .env                     # API Keys and Secrets
+└── pyproject.toml           # Package configuration
 
----
+⚡ Quick Start
+1. Prerequisites
+Python 3.10+ (Tested on 3.12)
 
-## 📂 File Breakdown
+A Polymarket Account (with USDC on Polygon)
 
-### 1. `find_edge_v6.py` (The Scanner)
-This is the "Brain" of the operation. It performs the following steps:
-* **Data Ingestion:** Fetches fresh NFL odds from Pinnacle (via The Odds API) and downloads all active NFL markets from Polymarket using pagination and Tag ID filtering.
-* **Entity Resolution:** Uses **Fuzzy Matching** (`thefuzz`) and strict keyword filtering (e.g., ignoring "1H", "O/U" for Moneyline bets) to align Pinnacle team names with Polymarket market questions.
-* **Math & Logic:**
-    * Converts Pinnacle's decimal odds into "Fair Value" probability (removing the vig/fee).
-    * Fetches the live Order Book for the matched Polymarket ID.
-    * Calculates the Edge: `(Fair Probability) - (Polymarket Ask Price)`.
-* **Output:** Prints a list of matched markets. If `Edge > 1%` (configurable), it flags a **💰 BUY SIGNAL** and provides the URL.
+(Optional) An API Key from The Odds API for edge scanning
 
-### 2. `submitting_transactions.py` (The Executor)
-This is the "Hands" of the operation. It validates network connectivity and order execution capability.
-* **Authentication:** Connects to the Polymarket CLOB API using L1 (Private Key) and L2 (API Key) authentication.
-* **Proxy Support:** Specifically configured with `signature_type=1` and a `funder` address to support **Magic Link / Email Wallets**.
-* **Market Check:** Fetches the live orderbook for a specific hardcoded Token ID to calculate the spread.
-* **Execution:** Submits a live **Limit Order** to the Polygon blockchain.
-    * *Note: Currently hardcoded to place a test bid (Buy 5 shares @ $0.01).*
+2. Installation
+Clone the repo and install the project in editable mode. This ensures all scripts can find the src module automatically without path hacks.
 
----
+```
+# 1. Clone the repository
+git clone <your-repo-url>
+cd polymarket_bot
 
-## 🚀 Setup & Installation
+# 2. Install dependencies & project
+pip install -e .
+```
 
-### 1. Prerequisites
-* Python 3.10+ (I used python 3.12)
-* A Polymarket Account (with USDC deposited on Polygon)
-* An API Key from [The Odds API](https://the-odds-api.com/)
+3. Configuration
+Create a .env file in the root directory:
+(.env.example is provided for context)
 
-### 2. Install Dependencies
-```bash
-pip install requests python-dotenv py-clob-client thefuzz
+```
+touch .env
+```
+Add your credentials to .env:
+```
+# Polymarket Credentials (Required for Trading/Orders)
+PRIVATE_KEY=0xYourPolygonPrivateKeyHere
+POLY_KEY=YourPolymarketApiKey
+POLY_SECRET=YourPolymarketApiSecret
+POLY_PASSPHRASE=YourPolymarketPassphrase
+POLY_FUNDER=0xYourProxyWalletAddress  # Optional (if using proxy/magic link)
+
+# Odds API (Required for Edge Scanner)
+ODDS_KEY=YourTheOddsApiKey
+
+# Copy Trading Target (Required for CopyTrader)
+TARGET_WALLET=0xTargetAddressToCopy
+```
+
+🛠️ Usage Guide
+🔍 1. Real-Time Market Analysis
+These are the primary tools for monitoring the market state.
+
+Verify Book (verify_book.py) Connects to the WebSocket and reconstructs the local order book in real-time. Useful for debugging latency or verifying liquidity for a specific market token.
+
+```
+python -m scripts.verify_book
+```
+Trades & Books Tracker (trades_and_books.py) Monitors live trades and order book updates simultaneously. Great for watching market activity on specific assets.
+```
+python -m scripts.trades_and_books
+```
+
+🤖 2. Automation & Trading
+Edge Scanner (edge_scanner.py) The core arbitrage logic. It:
+
+Fetches fresh odds from Pinnacle.
+
+Uses fuzzy matching to align teams with Polymarket markets.
+
+Calculates Edge: (Fair Probability) - (Polymarket Ask Price).
+
+Outputs buy signals if the edge > 1%.
+```
+python -m scripts.edge_scanner
+```
+Check Orders (check_orders.py) A simple utility to view your currently open limit orders.
+```
+python -m scripts.check_orders
+```
+
+⚠️ Risk Warning
+This software involves financial risk. The py-clob-client executes real transactions on the Polygon network.
+
+Always test with small sizes first.
+
+Secure your .env file. Never commit your Private Key to GitHub.
+
+The authors are not responsible for financial losses incurred by using this software.
+
+🤝 Contributing
+Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
+
+Please ensure strict typing (mypy --strict) is maintained when modifying src/.
