@@ -15,8 +15,8 @@ from rich import box
 from src.clients import PolyClient, PolySocket
 from src.book import OrderBook
 
-TARGET_SLUG = "cbb-dart-holy-2025-12-16"
-TARGET_OUTCOME = "Dartmouth Big Green"
+TARGET_SLUG = "elc-swa-wre-2025-12-19"
+TARGET_OUTCOME = "No"
 
 def get_cum_values(levels: List[Tuple[float, float]]) -> List[float]:
     out: List[float] = []

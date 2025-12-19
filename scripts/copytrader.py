@@ -20,7 +20,7 @@ from src.models import TradeActivity
 
 # --- CONFIG ---
 load_dotenv()
-PK = os.getenv("PRIVATE_KEY", "") # Your Polygon Private Key
+PK = os.getenv("POLY_KEY", "") # Your Polygon Private Key
 POLL_INTERVAL = 2.0
 FIXED_SIZE = 5.0 # Amount of USDC to bet per copy
 MAX_SLIPPAGE = 0.05 # 5% Slippage tolerance
