@@ -185,7 +185,7 @@ def get_event_assets(client: PolyClient, slug: str) -> List[str]:
 
 def trade_logger_loop() -> None:
     client = PolyClient()
-    
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     f_trades = open(TRADES_CSV_PATH, "w", newline="", encoding="utf-8")
     w_trades = csv.DictWriter(f_trades, fieldnames=TRADES_FIELDNAMES)
     w_trades.writeheader()
