@@ -1,12 +1,7 @@
 .env
-original_tests
 __pycache__
-game_logs
-giayn_supercompact.csv
-giayn_trades_only.jsonl
-odds_snapshot.json
-backup_print_block.txt
 output
-output_by_slug
-output_AH
 polymarket_bot.egg-info
+frontend/node_modules
+frontend/public
+typings

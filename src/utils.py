@@ -1,7 +1,9 @@
 import json
 import requests
-from typing import List, Any, Dict, cast
+from typing import List, Any, Dict, cast, Optional
+from urllib.parse import urlparse # <--- New Import
 from src.config import GAMMA_URL
+from src.models import GammaEvent, GammaMarket
 
 def normalize_point(point: float | str | None) -> str:
     if point is None:
@@ -27,75 +29,70 @@ def safe_float(val: Any, default: float = 0.0) -> float:
     except (ValueError, TypeError):
         return default
 
-def get_tokens_from_game(user_input: str) -> str:
-    slug = ""
-    
-    # Simple parsing logic
-    if "polymarket.com/event/" in user_input:
-        try:
-            clean_url = user_input.split("?")[0]
-            slug = clean_url.rstrip("/").split("/")[-1]
-        except Exception:
-            slug = user_input.strip()
-    else:
-        slug = user_input.strip()
+def get_game_data(user_input: str) -> Optional[GammaEvent]:
+    user_input = user_input.strip()
+    slug = user_input
+    if "polymarket.com" in user_input:
+        path = urlparse(user_input).path.rstrip('/')
+        slug = path.split('/')[-1]
+    print(f"🔎 Looking up slug: '{slug}'")
+    resp = requests.get(GAMMA_URL, params={"slug": slug}, timeout=10.0)
+    resp.raise_for_status()
+    data = cast(List[Dict[str, Any]], resp.json())
+    if not data:
+        return None
+        
+    event = cast(GammaEvent, data[0])
+    raw_markets = event["markets"]
+    cleaned_markets: List[Dict[str, GammaEvent]] = []
 
-    try:
-        resp = requests.get(GAMMA_URL, params={"slug": slug}, timeout=10.0)
-        resp.raise_for_status()
+    for m in raw_markets:
+        clean_m = m.copy()
+        clean_m["volumeNum"] = float(m["volume"]) if "volume" in m else 0.0
+        out_raw = m["outcomes"]
+        clob_raw = m["clobTokenIds"]
         
-        # FIX: Strict casting of the JSON response
-        data = cast(List[Dict[str, Any]], resp.json())
-        
-        if not data:
-            return f"❌ No event found for input: '{user_input}'"
-            
-        event = data[0]
-        
-        event_title = str(event.get("title", "Unknown Title"))
-        event_slug = str(event.get("slug", "Unknown Slug"))
-        event_id = str(event.get("id", "N/A"))
-        
-        # FIX: Cast markets list
-        markets = cast(List[Dict[str, Any]], event.get("markets", []))
-        
-        output_lines = [
-            f"🎯 EVENT: {event_title}",
-            f"🔗 SLUG:  {event_slug}",
-            f"🆔 ID:    {event_id}",
-            "-" * 40
+        clean_m["outcomes"] = json.loads(out_raw) if isinstance(out_raw, str) else out_raw
+        clean_m["clobTokenIds"] = json.loads(clob_raw) if isinstance(clob_raw, str) else clob_raw
+
+        cleaned_markets.append(clean_m)
+
+    event["markets"] = cleaned_markets
+    return event
+
+def filter_markets_by_asset(
+    raw_markets: List[GammaMarket], 
+    valid_assets: set[str], 
+    min_volume: float
+) -> List[GammaMarket]:
+    """
+    Returns a list of markets where only the specific 'valid_assets' 
+    (tokens the user traded) are kept in 'clobTokenIds' and 'outcomes'.
+    """
+    filtered_output: List[GammaMarket] = []
+
+    for m in raw_markets:
+        # 1. Check Volume First
+        vol = float(m.get("volumeNum", 0.0))
+        if vol < min_volume:
+            continue
+
+        # 2. Identify which indices (0=Yes, 1=No) match the user's trades
+        keep_indices = [
+            i for i, token_id in enumerate(m["clobTokenIds"]) 
+            if token_id in valid_assets
         ]
 
-        for m in markets:
-            q = str(m.get("question", "No Question"))
-            cond_id = str(m.get("conditionId", "N/A"))
-            
-            out_raw = m.get("outcomes", "[]")
-            clob_raw = m.get("clobTokenIds", "[]")
-            
-            try:
-                # Handle stringified JSON or raw lists
-                outcomes_any = json.loads(out_raw) if isinstance(out_raw, str) else out_raw
-                clob_ids_any = json.loads(clob_raw) if isinstance(clob_raw, str) else clob_raw
-                
-                # FIX: Cast to list for Pylance
-                outcomes = cast(List[Any], outcomes_any) if isinstance(outcomes_any, list) else []
-                clob_ids = cast(List[Any], clob_ids_any) if isinstance(clob_ids_any, list) else []
-            except json.JSONDecodeError:
-                outcomes, clob_ids = [], []
+        if not keep_indices:
+            continue
 
-            output_lines.append(f"  📌 MARKET: {q}")
-            output_lines.append(f"     Condition ID: {cond_id}")
-            
-            if len(outcomes) == len(clob_ids):
-                for i, outcome in enumerate(outcomes):
-                    output_lines.append(f"     - {outcome}: {clob_ids[i]}")
-            else:
-                output_lines.append(f"     ⚠️ Token mismatch (Outcomes: {len(outcomes)}, IDs: {len(clob_ids)})")
-            
-            output_lines.append("")
+        # 3. Create a clean copy with ONLY those tokens
+        clean_m = m.copy()
+        
+        # Filter lists using the indices we found
+        clean_m["clobTokenIds"] = [m["clobTokenIds"][i] for i in keep_indices]
+        clean_m["outcomes"] = [m["outcomes"][i] for i in keep_indices]
 
-        return "\n".join(output_lines)
+        filtered_output.append(clean_m)
 
-    except Exception as e:
-        return f"❌ Error resolving game info: {str(e)}"
+    return filtered_output

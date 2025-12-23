@@ -26,10 +26,10 @@ BOOK_FILENAME = "giayn_book_{placeholder}.csv"
 
 BOOK_FIELDNAMES = [
     "t_rel_s", "spread", 
-    "bid1_price", "bid2_price", "bid3_price", 
-    "ask1_price", "ask2_price", "ask3_price", 
-    "bid1_size", "bid2_size", "bid3_size", 
-    "ask1_size", "ask2_size", "ask3_size", 
+    "bid1_price", "bid2_price", "bid3_price",
+    "ask1_price", "ask2_price", "ask3_price",
+    "bid1_size", "bid2_size", "bid3_size",
+    "ask1_size", "ask2_size", "ask3_size",
     "reason"
 ]
 

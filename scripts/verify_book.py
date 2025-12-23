@@ -1,41 +1,29 @@
 from __future__ import annotations
 import time
-from typing import List, Tuple
-
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich import box
-
-# PROJECT_ROOT = Path(__file__).resolve().parent.parent
-# if str(PROJECT_ROOT) not in sys.path:
-#     sys.path.append(str(PROJECT_ROOT))
-
 from src.clients import PolyClient, PolySocket
 from src.book import OrderBook
 
-TARGET_SLUG = "elc-swa-wre-2025-12-19"
-TARGET_OUTCOME = "No"
-
-def get_cum_values(levels: List[Tuple[float, float]]) -> List[float]:
-    out: List[float] = []
-    total = 0.0
-    for price, size in levels:
-        total += price * size
-        out.append(total)
-    return out
+TARGET_SLUG = "lol-lng-jdg-2025-12-21"
+TARGET_OUTCOME = "LNG Esports"
 
 def generate_table(book: OrderBook) -> Panel:
     bids, asks = book.get_snapshot(limit=50)
-    bid_cum = get_cum_values(bids)
-    ask_cum = get_cum_values(asks)
+    
+    # REFACTOR: Use the method inside OrderBook instead of the standalone function
+    bid_cum = book.get_cumulative_values(bids)
+    ask_cum = book.get_cumulative_values(asks)
 
     table = Table(box=box.SIMPLE, show_header=True, header_style="bold white")
     table.add_column("Price", justify="right", style="cyan", width=10)
     table.add_column("Size", justify="right", style="white", width=10)
     table.add_column("Cum Val ($)", justify="right", style="green", width=15)
 
+    # Asks (Red, Sorted Ascending but printed Top-Down for ladder view)
     for i in range(len(asks) - 1, -1, -1):
         p, s = asks[i]
         c = ask_cum[i]
@@ -43,6 +31,7 @@ def generate_table(book: OrderBook) -> Panel:
 
     table.add_row("---", "---", "---", style="yellow")
 
+    # Bids (Green, Sorted Descending)
     for i in range(len(bids)):
         p, s = bids[i]
         c = bid_cum[i]

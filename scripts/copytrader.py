@@ -84,7 +84,7 @@ def execute_copy(client: ClobClient, trade: TradeActivity) -> None:
     title_raw = trade.get("title", "Unknown")
 
     # 2. Type Checking
-    if not isinstance(asset_raw, str) or not isinstance(side_raw, str):
+    if not asset_raw or not isinstance(side_raw, str):
         return
     if not isinstance(price_raw, (float, int)):
         return

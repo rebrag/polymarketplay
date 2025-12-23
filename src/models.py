@@ -1,7 +1,29 @@
-from typing import TypedDict, Protocol, Literal
+from enum import Enum
+from typing import TypedDict, Protocol, Literal, Required, List, Any, NotRequired, Optional
+
+class AssetType(str, Enum):
+    COLLATERAL = "COLLATERAL"
+    CONDITIONAL = "CONDITIONAL"
+
+class BalanceAllowanceParams(TypedDict):
+    asset_type: AssetType
+    token_id: Optional[str]
+
+# The method accepts a List of these params
+type BalanceAllowanceParamsList = List[BalanceAllowanceParams]
+
+class BalanceAllowanceResponse(TypedDict):
+    balance: str
+    allowance: str
+
+class UserValueEntry(TypedDict):
+    user: str
+    value: float
+
+type UserValueResponse = list[UserValueEntry]
 
 class WebSocketAppProto(Protocol):
-    def run_forever(self) -> bool: ...
+    def run_forever(self, ping_interval: int, ping_timeout: int) -> bool: ...
     def send(self, data: str | bytes) -> None: ...
     def close(self) -> None: ...
 
@@ -12,15 +34,38 @@ class GammaMarket(TypedDict, total=False):
     active: bool
     closed: bool
     liquidity: str
-    volume: str
-    outcomes: str        
-    clobTokenIds: str    
+    volume: float
+    outcomes: Required[List[str]]
+    clobTokenIds:Required [List[str]]
 
 class GammaEvent(TypedDict, total=False):
-    id: str
-    slug: str
+    id: Required[str]
+    slug: Required[str]
+    title: Required[str]
+    markets: Required[List[Any]]  # Should ideally be List[Market] later
+    description: str
+    ticker: str
+    resolutionSource: str
+    image: str
+    icon: str
+    startDate: str
+    endDate: str
+    creationDate: str
+    updatedAt: str
+    volume: float
+    volume24hr: float
+    liquidity: float
+    openInterest: float
+    commentCount: int
     active: bool
-    markets: list[GammaMarket]
+    closed: bool
+    archived: bool
+    new: bool
+    featured: bool
+    restricted: bool
+    enableOrderBook: bool
+    enableNegRisk: bool
+    tags: List[Any]
 
 # --- WebSocket Message Types ---
 class WsBookLevel(TypedDict, total=False):
@@ -69,13 +114,13 @@ class TradeActivity(TypedDict, total=False):
     usdcSize: float
     transactionHash: str
     price: float
-    asset: str
+    asset: Required[str]
     side: TradeSide
     outcomeIndex: int
     title: str
-    slug: str
+    slug: Required[str]
     icon: str
-    eventSlug: str
+    eventSlug: Required[str]
     outcome: str
     name: str
     pseudonym: str
@@ -93,3 +138,24 @@ class Order(TypedDict):
     timestamp: int
     owner: str
     hash: str
+
+class MarketWithVolume(GammaMarket):
+    # Extends GammaMarket to include the volumeNum we added in utils
+    volumeNum: float
+
+class UserActivityResponse(TypedDict):
+    title: str
+    markets: List[GammaMarket] # We use Any here to avoid circular imports, or use GammaMarket if order permits
+
+class WsBidAsk(TypedDict):
+    price: float
+    size: float
+    cum: float
+
+class WsPayload(TypedDict):
+    asset_id: str
+    ready: bool
+    msg_count: int
+    bids: List[WsBidAsk]
+    asks: List[WsBidAsk]
+    status: NotRequired[str] # Use NotRequired if this key is optional
