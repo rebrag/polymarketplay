@@ -7,10 +7,12 @@ import time
 
 import requests
 import websocket
+from decimal import Decimal, InvalidOperation
 from typing import Any, Literal, Protocol, TypedDict, cast
 
 from src.config import GAMMA_URL, REST_URL, WSS_URL
 from src.models import (
+    BalanceAllowanceResponse,
     GammaEvent,
     Order,
     TradeActivity,
@@ -20,10 +22,16 @@ from src.models import (
 )
 
 # External Lib Imports
-from py_clob_client.client import ClobClient  # type: ignore
-from py_clob_client.clob_types import OpenOrderParams, OrderArgs, OrderType  # type: ignore
-from py_clob_client.order_builder.constants import BUY, SELL  # type: ignore
-
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import (
+    BalanceAllowanceParams as ClobBalanceAllowanceParams,
+    AssetType as ClobAssetType,
+    OpenOrderParams,
+    OrderArgs,
+    OrderType,
+)  # type: ignore
+from py_clob_client.order_builder.constants import BUY, SELL
+from typings.py_clob_client import *
 
 class BookCallback(Protocol):
     def __call__(self, msg: WsBookMessage) -> None: ...
@@ -196,6 +204,80 @@ class PolyClient:
             print(f"❌ Positions Fetch Error: {e}")
             return []
 
+
+    def get_balance_allowance(
+        self,
+        asset_type: str = "COLLATERAL",
+        token_id: str | None = None,
+        signature_type: int | None = None,
+    ) -> BalanceAllowanceResponse:
+        """
+        Fetches balance + allowance for the authenticated wallet.
+
+        Notes:
+        - Requires Level 2 auth (API creds) from _get_trading_clob_client().
+        - For COLLATERAL, token_id must be None or omitted.
+        """
+        client = self._get_trading_clob_client()
+
+        asset_enum = (
+            ClobAssetType.COLLATERAL
+            if asset_type.upper() == "COLLATERAL"
+            else ClobAssetType.CONDITIONAL
+        )
+        params = ClobBalanceAllowanceParams(asset_type=asset_enum, token_id=token_id) # type: ignore
+        if signature_type is not None:
+            params.signature_type = signature_type
+        else:
+            # -1 works with most wallet types (avoids 400 for collateral balance calls).
+            params.signature_type = -1
+
+        def _to_amount(val: object) -> Decimal:
+            try:
+                if isinstance(val, Decimal):
+                    return val
+                if isinstance(val, (int, float)):
+                    return Decimal(str(val))
+                if isinstance(val, str):
+                    return Decimal(val)
+            except InvalidOperation:
+                return Decimal(0)
+            return Decimal(0)
+
+        def _format_amount(dec: Decimal) -> str:
+            if asset_type.upper() == "COLLATERAL" and dec == dec.to_integral_value():
+                dec = dec / Decimal("1000000")
+            return format(dec, "f")
+
+        raw = client.get_balance_allowance(params)  # type: ignore
+        if isinstance(raw, dict) and "balance" in raw:
+            balance_dec = _to_amount(raw.get("balance"))
+
+            allowance_val: object | None = raw.get("allowance")
+            if allowance_val is None:
+                allowances = raw.get("allowances")
+                if isinstance(allowances, dict) and allowances:
+                    allowance_vals = [_to_amount(v) for v in allowances.values()]
+                    allowance_val = max(allowance_vals) if allowance_vals else Decimal(0)
+
+            allowance_dec = _to_amount(allowance_val) if allowance_val is not None else Decimal(0)
+            return {
+                "balance": _format_amount(balance_dec),
+                "allowance": _format_amount(allowance_dec),
+            }
+
+        raise RuntimeError(f"Unexpected balance response: {raw!r}")
+
+    def get_authenticated_address(self) -> str | None:
+        client = self._get_trading_clob_client()
+        addr = client.get_address()
+        return str(addr) if addr else None
+
+    def get_positions_address(self) -> str | None:
+        funder = os.getenv("POLY_FUNDER")
+        if funder and funder.strip():
+            return funder.strip()
+        return self.get_authenticated_address()
 
     def _get_public_clob_client(self) -> ClobClient:
         if self._public_clob is not None:

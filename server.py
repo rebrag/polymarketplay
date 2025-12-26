@@ -1,6 +1,7 @@
 from __future__ import annotations
 from asyncio import AbstractEventLoop, Queue
 from typing import Set
+import logging
 
 import asyncio
 from contextlib import asynccontextmanager
@@ -15,7 +16,17 @@ load_dotenv()
 
 from src.book import OrderBook
 from src.clients import PolyClient, PolySocket
-from src.models import WsPriceChangeMessage, GammaEvent, GammaMarket, Order, UserActivityResponse, WsBidAsk, WsPayload, WsBookMessage
+from src.models import (
+    BalanceAllowanceResponse,
+    WsPriceChangeMessage,
+    GammaEvent,
+    GammaMarket,
+    Order,
+    UserActivityResponse,
+    WsBidAsk,
+    WsPayload,
+    WsBookMessage,
+)
 from src.utils import filter_markets_by_asset, get_game_data
 
 
@@ -175,6 +186,56 @@ def resolve_user_activity(address: str, limit: int = 50, min_volume: float = 0.0
     }
 
 
+@app.get("/user/balance_allowance", response_model=BalanceAllowanceResponse)
+def get_balance_allowance(
+    asset_type: Literal["COLLATERAL", "CONDITIONAL"] = "COLLATERAL",
+    token_id: str | None = None,
+    signature_type: int | None = None,
+) -> BalanceAllowanceResponse:
+    try:
+        return registry.poly_client.get_balance_allowance(
+            asset_type=asset_type,
+            token_id=token_id,
+            signature_type=signature_type,
+        )
+    except Exception as e:
+        logger.exception(
+            "Balance/allowance fetch failed (asset_type=%s token_id=%s signature_type=%s)",
+            asset_type,
+            token_id,
+            signature_type,
+        )
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/user/positions")
+def get_positions(address: str, limit: int = 100) -> list[dict[str, object]]:
+    try:
+        raw = registry.poly_client.get_positions(address, limit=limit)
+        filtered: list[dict[str, object]] = []
+        for pos in raw:
+            size = float(pos.get("size", 0) or 0)
+            value = float(pos.get("currentValue", 0) or 0)
+            if size > 0 and value > 0:
+                filtered.append(pos) # type: ignore
+        return filtered
+    except Exception as e:
+        logger.exception("Positions fetch failed (address=%s limit=%s)", address, limit)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/user/positions/auth")
+def get_positions_auth(limit: int = 100) -> list[dict[str, object]]:
+    try:
+        address = registry.poly_client.get_positions_address()
+        if not address:
+            raise RuntimeError("Authenticated address unavailable.")
+        return registry.poly_client.get_positions(address, limit=limit) # type: ignore
+    except Exception as e:
+        logger.exception("Auth positions fetch failed (limit=%s)", limit)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 class LimitOrderRequest(BaseModel):
     token_id: str = Field(min_length=1)
     side: Literal["BUY", "SELL"]
@@ -182,6 +243,7 @@ class LimitOrderRequest(BaseModel):
     ttl_seconds: int = Field(default=0)
     price_offset_cents: int = Field(default=0, ge=-50, le=50)
 
+logger = logging.getLogger("polymarket")
 
 @app.post("/orders/limit")
 def post_limit_order(req: LimitOrderRequest) -> dict[str, object]:
@@ -213,7 +275,18 @@ def post_limit_order(req: LimitOrderRequest) -> dict[str, object]:
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # This prints the *actual* reason (403/401/cloudflare html/etc)
+        logger.exception("Order Error (token_id=%s side=%s)", req.token_id, req.side)
+
+        # Try to preserve useful structured fields if present (PolyApiException-like)
+        status = getattr(e, "status_code", 500)
+        err_msg = getattr(e, "error_message", None)
+
+        detail: object = {"error": str(e)}
+        if err_msg is not None:
+            detail = {"error": str(e), "upstream": err_msg}
+
+        raise HTTPException(status_code=int(status), detail=detail)
 
 
 @app.get("/orders/open", response_model=list[Order])

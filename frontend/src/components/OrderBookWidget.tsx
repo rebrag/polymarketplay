@@ -30,6 +30,7 @@ interface WidgetProps {
   outcomeName: string;
   volume: number;
   userPosition?: UserPosition | null;
+  positionShares?: number | null;
   isHighlighted?: boolean;
   viewMode?: "full" | "mini";
   onClose?: (assetId: string) => void;
@@ -94,6 +95,7 @@ export function OrderBookWidget({
   outcomeName,
   volume,
   userPosition,
+  positionShares,
   isHighlighted,
   viewMode = "full",
   onClose,
@@ -109,7 +111,7 @@ export function OrderBookWidget({
 
   const [sharesRaw, setSharesRaw] = useState("5");
   const [ttlRaw, setTtlRaw] = useState("10");
-  const [offsetCents, setOffsetCents] = useState(0);
+  const [offsetCents, setOffsetCents] = useState(0); // This now represents "Aggression"
   const [placing, setPlacing] = useState<"idle" | "buy" | "sell">("idle");
 
   const bestBid = data?.bids?.[0]?.price ?? null;
@@ -168,6 +170,35 @@ export function OrderBookWidget({
     };
   }, [data?.ready, viewMode]);
 
+  const placeLimitOrder = async (side: "BUY" | "SELL"): Promise<void> => {
+    try {
+      setPlacing(side === "BUY" ? "buy" : "sell");
+      
+      // BUY moves UP with offset, SELL moves DOWN with offset
+      const calculatedOffset = side === "BUY" ? offsetCents : -offsetCents;
+
+      const payload = {
+        token_id: assetId,
+        side,
+        size: Number(sharesRaw),
+        ttl_seconds: ttlRaw === "" ? 0 : Number(ttlRaw),
+        price_offset_cents: calculatedOffset,
+      };
+
+      await fetch(`${apiBaseUrl}/orders/limit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    } catch (e) {
+      console.error("Order failed", { e });
+    } finally {
+      setPlacing("idle");
+    }
+  };
+
+  const btnStyles = "hover:cursor-pointer font-bold bg-sky-500 hover:bg-sky-400 border-b-4 border-sky-700 hover:translate-y-0.5 hover:border-b-2 active:translate-y-1 active:border-b-0 transition-all text-white disabled:opacity-50 disabled:translate-y-0 disabled:border-b-4";
+
   const handleCopyAssetId = useCallback(async (): Promise<void> => {
     await copyToClipboard(assetId);
     setCopied(true);
@@ -187,30 +218,32 @@ export function OrderBookWidget({
     }
   }, [data?.ready, viewMode]);
 
-  const placeLimitOrder = async (side: "BUY" | "SELL"): Promise<void> => {
-    try {
-      setPlacing(side === "BUY" ? "buy" : "sell");
-      const payload = {
-        token_id: assetId,
-        side,
-        size: Number(sharesRaw),
-        ttl_seconds: ttlRaw === "" ? 0 : Number(ttlRaw),
-        price_offset_cents: offsetCents,
-      };
+  // const placeLimitOrder = async (side: "BUY" | "SELL"): Promise<void> => {
+  //   try {
+  //     setPlacing(side === "BUY" ? "buy" : "sell");
+  //     const payload = {
+  //       token_id: assetId,
+  //       side,
+  //       size: Number(sharesRaw),
+  //       ttl_seconds: ttlRaw === "" ? 0 : Number(ttlRaw),
+  //       price_offset_cents: offsetCents,
+  //     };
 
-      await fetch(`${apiBaseUrl}/orders/limit`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-    } catch (e) {
-      console.error("Order failed - see server terminal.", {e});
-    } finally {
-      setPlacing("idle");
-    }
-  };
+  //     await fetch(`${apiBaseUrl}/orders/limit`, {
+  //       method: "POST",
+  //       headers: { "Content-Type": "application/json" },
+  //       body: JSON.stringify(payload),
+  //     });
+  //   } catch (e) {
+  //     console.error("Order failed - see server terminal.", {e});
+  //   } finally {
+  //     setPlacing("idle");
+  //   }
+  // };
 
   if (viewMode === "mini") {
+    const holdingLabel =
+      positionShares && positionShares > 0 ? `${positionShares.toFixed(2)} sh` : null;
     return (
       <div className="relative">
         {onClose && (
@@ -231,6 +264,11 @@ export function OrderBookWidget({
                 <span className="text-[10px] text-blue-400 font-mono">${formatVol(volume)}</span>
               </div>
             </div>
+            {holdingLabel && (
+              <div className="mt-2 text-[10px] font-mono text-emerald-400">
+                HOLD {holdingLabel}
+              </div>
+            )}
           </CardHeader>
           <CardContent className="px-4 pb-4 pt-0 flex items-center justify-between gap-2 h-full">
             <div className="flex-1 bg-green-950/20 border border-green-900/30 rounded p-2 flex flex-col items-center">
@@ -267,6 +305,11 @@ export function OrderBookWidget({
               {userPosition && (
                 <div className={`text-[10px] px-1.5 py-0.5 rounded font-mono border ${userPosition.side === "BUY" ? "bg-blue-950/30 border-blue-900 text-blue-300" : "bg-red-950/30 border-red-900 text-red-300"}`}>
                   <span className="font-bold">{userPosition.side}</span> @ <span className="text-white">{(userPosition.price * 100).toFixed(0)}¢</span>
+                </div>
+              )}
+              {positionShares && positionShares > 0 && (
+                <div className="text-[10px] px-1.5 py-0.5 rounded font-mono border bg-emerald-950/30 border-emerald-900 text-emerald-300">
+                  HOLD {positionShares.toFixed(2)} sh
                 </div>
               )}
             </div>
@@ -307,9 +350,20 @@ export function OrderBookWidget({
               <div className="border-t border-slate-800 bg-slate-950/80 p-3 shrink-0">
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2 items-center">
-                    <Button size="sm" variant="outline" className="h-7 px-2 border-slate-700 bg-black" onClick={() => setOffsetCents(v => clampInt(v - 1, -20, 20))}>-1¢</Button>
-                    <Button size="sm" variant="outline" className="h-7 px-2 border-slate-700 bg-black" onClick={() => setOffsetCents(v => clampInt(v + 1, -20, 20))}>+1¢</Button>
-                    <span className="text-[10px] font-mono text-slate-500">offset {offsetCents >= 0 ? "+" : ""}{offsetCents}¢</span>
+                    <Button 
+                      size="sm" 
+                      className={`${btnStyles} h-7 px-4 text-xs`}
+                      onClick={() => setOffsetCents(v => clampInt(v - 1, -20, 20))}
+                    >
+                      -1¢
+                    </Button>
+                    <Button 
+                      size="sm" 
+                      className={`${btnStyles} h-7 px-4 text-xs`}
+                      onClick={() => setOffsetCents(v => clampInt(v + 1, -20, 20))}
+                    >
+                      +1¢
+                    </Button><span className="text-[10px] font-mono text-slate-500">offset {offsetCents >= 0 ? "+" : ""}{offsetCents}¢</span>
                   </div>
                   <div className="text-[10px] font-mono text-slate-500">
                     bid {bestBid ? `${(bestBid * 100).toFixed(0)}¢` : "—"} / ask {bestAsk ? `${(bestAsk * 100).toFixed(0)}¢` : "—"}
@@ -332,7 +386,7 @@ export function OrderBookWidget({
                     {placing === "buy" ? "..." : `BUY @ ${bestBid ? Math.round(bestBid * 100 + offsetCents) : "—"}¢`}
                   </Button>
                   <Button disabled={placing !== "idle" || !bestAsk} onClick={() => void placeLimitOrder("SELL")} className="hover:cursor-pointer h-10 font-bold bg-sky-500 hover:bg-sky-400 border-b-4 border-sky-700 hover:translate-y-0.5 hover:border-b-2 active:translate-y-1 active:border-b-0 transition-all text-white">
-                    {placing === "sell" ? "..." : `SELL @ ${bestAsk ? Math.round(bestAsk * 100 + offsetCents) : "—"}¢`}
+                    {placing === "sell" ? "..." : `SELL @ ${bestAsk ? Math.round(bestAsk * 100 - offsetCents) : "—"}¢`}
                   </Button>
                 </div>
               </div>

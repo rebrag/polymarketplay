@@ -9,6 +9,10 @@ interface NavbarProps {
   onResolve: () => void;
   loading: boolean;
   apiBaseUrl?: string;
+  balance?: number | null;
+  portfolio?: number | null;
+  positionsCount?: number | null;
+  onPositionsClick?: () => void;
 }
 
 // interface BalanceData {
@@ -23,6 +27,10 @@ export function Navbar({
   onResolve, 
   loading,
 //   apiBaseUrl = "http://localhost:8000" 
+  balance,
+  portfolio,
+  positionsCount,
+  onPositionsClick,
 }: NavbarProps) {
 //   const [data, setData] = useState<BalanceData>({ portfolioValue: 0, cash: 0 });
 
@@ -72,16 +80,25 @@ export function Navbar({
       </div>
 
       {/* Right: Metrics Only */}
-      <div className="flex items-center gap-6 min-w-[220px] justify-end">
+      <div className="flex items-center gap-6 min-w-[280px] justify-end">
         <div className="flex flex-col items-end">
           <span className="text-[9px] text-slate-500 uppercase font-bold">Portfolio</span>
-          {/* <span className="text-sm font-bold text-emerald-400 font-mono">${data.portfolioValue.toFixed(2)}</span> */}
-          <span className="text-sm font-bold text-emerald-400 font-mono">${0.00}</span>
+          <span className="text-sm font-bold text-emerald-400 font-mono">
+            {portfolio === null || portfolio === undefined ? "--" : `$${portfolio.toFixed(2)}`}
+          </span>
         </div>
         <div className="flex flex-col items-end">
           <span className="text-[9px] text-slate-500 uppercase font-bold">Cash</span>
-          {/* <span className="text-sm font-bold text-emerald-400 font-mono">${data.cash.toFixed(2)}</span> */}
+          <span className="text-sm font-bold text-emerald-400 font-mono">
+            {balance === null || balance === undefined ? "--" : `$${balance.toFixed(2)}`}
+          </span>
         </div>
+        <Button
+          onClick={onPositionsClick}
+          className="h-8 px-4 text-[11px] uppercase font-bold border border-slate-800 bg-slate-950 text-slate-200 hover:text-white hover:border-slate-700 transition-colors"
+        >
+          Positions {positionsCount === null || positionsCount === undefined ? "--" : `(${positionsCount})`}
+        </Button>
       </div>
     </nav>
   );
