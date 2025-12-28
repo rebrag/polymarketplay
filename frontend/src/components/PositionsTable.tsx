@@ -58,6 +58,7 @@ export function PositionsTable({ positions, onSelect }: PositionsTableProps) {
               <TableRow className="hover:bg-slate-950 border-slate-800">
                 <TableHead className="text-slate-400 h-7 text-[10px]">Market</TableHead>
                 <TableHead className="text-slate-400 h-7 text-right text-[10px]">Size</TableHead>
+                <TableHead className="text-slate-400 h-7 text-right text-[10px]">Avg</TableHead>
                 <TableHead className="text-slate-400 h-7 text-right text-[10px]">Value</TableHead>
                 <TableHead className="text-slate-400 h-7 text-right text-[10px] pr-3">P/L</TableHead>
               </TableRow>
@@ -80,6 +81,9 @@ export function PositionsTable({ positions, onSelect }: PositionsTableProps) {
                     </TableCell>
                     <TableCell className="py-0 text-right align-middle font-mono text-[11px] text-slate-200">
                       {p.sizeNum.toFixed(2)}
+                    </TableCell>
+                    <TableCell className="py-0 text-right align-middle font-mono text-[11px] text-slate-200">
+                      {p.avgNum > 0 ? `${(p.avgNum * 100).toFixed(0)}¢` : "--"}
                     </TableCell>
                     <TableCell className="py-0 text-right align-middle font-mono text-[11px] text-slate-200">
                       ${p.valueNum.toFixed(2)}

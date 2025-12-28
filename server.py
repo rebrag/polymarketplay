@@ -2,9 +2,12 @@ from __future__ import annotations
 from asyncio import AbstractEventLoop, Queue
 from typing import Set
 import logging
+import time
 
 import asyncio
+import threading
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Literal
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -12,13 +15,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 load_dotenv()
+import os
 
 
 from src.book import OrderBook
-from src.clients import PolyClient, PolySocket
+from src.clients import PolyClient, PolySocket, UserSocket
 from src.models import (
     BalanceAllowanceResponse,
     WsPriceChangeMessage,
+    WsTickSizeChangeMessage,
     GammaEvent,
     GammaMarket,
     Order,
@@ -27,19 +32,34 @@ from src.models import (
     WsPayload,
     WsBookMessage,
 )
+from py_clob_client.clob_types import OpenOrderParams  # type: ignore
 from src.utils import filter_markets_by_asset, get_game_data
+from src.config import POLY_TAG_ID
 
 
 class MarketRegistry:
     def __init__(self) -> None:
         self.active_books: Dict[str, OrderBook] = {}
-        self.active_sockets: Dict[str, PolySocket] = {}
         self.client_counts: Dict[str, int] = {}
         self.poly_client = PolyClient()
 
         # NEW: subscriber queues per asset + the loop they belong to
         self._subs: Dict[str, Set[Queue[None]]] = {}
         self._loops: Dict[str, AbstractEventLoop] = {}
+        self._tracked_assets: set[str] = set()
+        self._socket: PolySocket | None = None
+        self._socket_lock = threading.Lock()
+        self._logged_books: set[str] = set()
+        self._logged_price_changes: set[str] = set()
+        self._order_subs: set[Queue[dict[str, object]]] = set()
+        self._order_loops: Dict[Queue[dict[str, object]], AbstractEventLoop] = {}
+        self._user_socket: UserSocket | None = None
+        self._user_lock = threading.Lock()
+        self._last_order_ws_accept_ts: float | None = None
+        self._last_order_ws_register_ts: float | None = None
+        self._last_user_event_ts: float | None = None
+        self._last_user_event_type: str | None = None
+        self._user_event_count = 0
 
     def register_subscriber(self, asset_id: str, q: Queue[None], loop: AbstractEventLoop) -> None:
         self._subs.setdefault(asset_id, set()).add(q)
@@ -76,24 +96,60 @@ class MarketRegistry:
             return self.active_books[asset_id]
 
         book = OrderBook(asset_id)
-        socket = PolySocket([asset_id])
-
-        # CHANGED: wrap callbacks so we can notify websocket subscribers *on real updates*
-        def _on_book(msg: WsBookMessage) -> None:  # msg type matches your WsBookMessage at runtime
-            book.on_book_snapshot(msg)
-            self.notify_updated(asset_id)
-
-        def _on_price(msg: WsPriceChangeMessage) -> None:
-            book.on_price_change(msg)
-            self.notify_updated(asset_id)
-
-        socket.on_book = _on_book
-        socket.on_price_change = _on_price
-        socket.start()
-
         self.active_books[asset_id] = book
-        self.active_sockets[asset_id] = socket
         self.client_counts[asset_id] = 1
+
+        with self._socket_lock:
+            self._tracked_assets.add(asset_id)
+            if self._socket is None:
+                self._socket = PolySocket(list(self._tracked_assets))
+
+                def _on_book(msg: WsBookMessage) -> None:
+                    msg_asset = msg.get("asset_id")
+                    if not msg_asset:
+                        return
+                    asset_id_str = str(msg_asset)
+                    target = self.active_books.get(asset_id_str)
+                    if not target:
+                        return
+                    target.on_book_snapshot(msg)
+                    if asset_id_str not in self._logged_books:
+                        self._logged_books.add(asset_id_str)
+                        print(f"Book snapshot received (asset_id={asset_id_str})")
+                    self.notify_updated(asset_id_str)
+
+                def _on_price(msg: WsPriceChangeMessage) -> None:
+                    changes = msg.get("price_changes", [])
+                    assets = {str(ch.get("asset_id")) for ch in changes if ch.get("asset_id")}
+                    for aid in assets:
+                        target = self.active_books.get(aid)
+                        if not target:
+                            continue
+                        target.on_price_change(msg)
+                        if aid not in self._logged_price_changes:
+                            self._logged_price_changes.add(aid)
+                            print(f"Price change received (asset_id={aid})")
+                        self.notify_updated(aid)
+
+                def _on_tick(msg: WsTickSizeChangeMessage) -> None:
+                    msg_asset = msg.get("asset_id")
+                    if not msg_asset:
+                        return
+                    asset_id_str = str(msg_asset)
+                    target = self.active_books.get(asset_id_str)
+                    if not target:
+                        return
+                    target.on_tick_size_change(msg)
+                    print(f"Tick size change received (asset_id={asset_id_str})")
+                    self.notify_updated(asset_id_str)
+
+                self._socket.on_book = _on_book
+                self._socket.on_price_change = _on_price
+                self._socket.on_tick_size_change = _on_tick
+                self._socket.start()
+            else:
+                self._socket.update_assets(list(self._tracked_assets), force_reconnect=True)
+
         return book
     
     def release(self, asset_id: str) -> None:
@@ -106,13 +162,145 @@ class MarketRegistry:
             self.client_counts[asset_id] = count
             return
 
-        sock = self.active_sockets.pop(asset_id, None)
-        if sock is not None:
-            sock.stop()
-
         self.active_books.pop(asset_id, None)
         self.client_counts.pop(asset_id, None)
 
+        with self._socket_lock:
+            self._tracked_assets.discard(asset_id)
+            if self._socket is not None:
+                if not self._tracked_assets:
+                    self._socket.stop()
+                    self._socket = None
+                else:
+                    self._socket.update_assets(list(self._tracked_assets))
+
+    def register_order_subscriber(self, q: Queue[dict[str, object]], loop: AbstractEventLoop) -> None:
+        print(f"Registering order subscriber (pre_count={len(self._order_subs)})")
+        self._order_subs.add(q)
+        self._order_loops[q] = loop
+        print(f"Order subscriber registered (count={len(self._order_subs)})")
+        self._last_order_ws_register_ts = time.time()
+        self.ensure_user_socket()
+
+    def unregister_order_subscriber(self, q: Queue[dict[str, object]]) -> None:
+        self._order_subs.discard(q)
+        self._order_loops.pop(q, None)
+        if not self._order_subs:
+            with self._user_lock:
+                if self._user_socket is not None:
+                    print("Stopping user websocket (no order subscribers).")
+                    self._user_socket.stop()
+                    self._user_socket = None
+
+    def ensure_user_socket(self) -> None:
+        with self._user_lock:
+            if self._user_socket is None:
+                print(f"Starting user websocket for order updates... (pid={os.getpid()})")
+                auth = self.poly_client.get_user_ws_auth()
+                self._user_socket = UserSocket(auth)
+                self._user_socket.on_event = self._handle_user_event
+                self._user_socket.start()
+
+    def _handle_user_event(self, ev: dict[str, object]) -> None:
+        self._last_user_event_ts = time.time()
+        self._last_user_event_type = str(ev.get("type", ""))
+        self._user_event_count += 1
+        if str(ev.get("event_type", "")) == "trade":
+            print(f"User WS TRADE event: {ev}")
+        else:
+            print(f"User WS event received (type={self._last_user_event_type})")
+        event_type = str(ev.get("event_type", ""))
+        if event_type == "order":
+            order_type = str(ev.get("type", "")).upper()
+            oid = str(ev.get("id", ""))
+            if not oid:
+                return
+            order: Order = {
+                "orderID": oid,
+                "price": str(ev.get("price", "")),
+                "size": str(ev.get("original_size", "")),
+                "side": str(ev.get("side", "")),
+                "asset_id": str(ev.get("asset_id", "")),
+                "expiration": int(float(ev.get("expiration", 0) or 0)),
+                "timestamp": int(ev.get("timestamp", 0) or 0),
+                "owner": str(ev.get("owner", "")),
+                "hash": "",
+            }
+            msg_type = "update"
+            if order_type == "PLACEMENT":
+                msg_type = "opened"
+            elif order_type == "CANCELLATION":
+                msg_type = "closed"
+            payload: dict[str, object] = {"type": msg_type, "order": order, "event": order_type}
+        elif event_type == "trade":
+            maker_orders = ev.get("maker_orders", [])
+            if not isinstance(maker_orders, list) or not maker_orders:
+                return
+            payloads: list[dict[str, object]] = []
+            trade_id = str(ev.get("id", ""))
+            trade_status = str(ev.get("status", ""))
+            for maker in maker_orders:
+                if not isinstance(maker, dict):
+                    continue
+                oid = str(maker.get("order_id", ""))
+                if not oid:
+                    continue
+                order: Order = {
+                    "orderID": oid,
+                    "price": str(maker.get("price", "")),
+                    "size": str(maker.get("matched_amount", "")),
+                    "side": str(ev.get("side", "")),
+                    "asset_id": str(maker.get("asset_id", "")) or str(ev.get("asset_id", "")),
+                    "expiration": 0,
+                    "timestamp": int(ev.get("timestamp", 0) or 0),
+                    "owner": str(maker.get("owner", "")),
+                    "hash": "",
+                }
+                payloads.append(
+                    {"type": "closed", "order": order, "event": "TRADE", "trade_id": trade_id, "trade_status": trade_status}
+                )
+            if not payloads:
+                return
+            for payload in payloads:
+                self._dispatch_order_payload(payload)
+            return
+        else:
+            return
+
+        self._dispatch_order_payload(payload)
+
+    def _dispatch_order_payload(self, payload: dict[str, object]) -> None:
+        if not self._order_subs:
+            print("User WS event dropped (no subscribers)")
+        for q in tuple(self._order_subs):
+            loop = self._order_loops.get(q)
+            if loop is None:
+                continue
+            def _put_one(q_local: Queue[dict[str, object]] = q, payload_local: dict[str, object] = payload) -> None:
+                try:
+                    q_local.put_nowait(payload_local)
+                except Exception:
+                    pass
+            loop.call_soon_threadsafe(_put_one)
+
+    def get_user_socket_status(self) -> dict[str, object]:
+        connected = False
+        status: dict[str, object] = {}
+        if self._user_socket is not None:
+            status = self._user_socket.get_status()
+            connected = bool(status.get("connected"))
+        return {
+            "has_socket": self._user_socket is not None,
+            "connected": connected,
+            "subscribers": len(self._order_subs),
+            "pid": os.getpid(),
+            "status": status,
+            "last_order_ws_accept_ts": self._last_order_ws_accept_ts,
+            "last_order_ws_register_ts": self._last_order_ws_register_ts,
+            "last_user_event_ts": self._last_user_event_ts,
+            "last_user_event_type": self._last_user_event_type,
+            "user_event_count": self._user_event_count,
+        }
 
 
 registry = MarketRegistry()
@@ -120,11 +308,19 @@ registry = MarketRegistry()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    try:
+        registry.ensure_user_socket()
+    except Exception as e:
+        print(f"User WS startup failed: {e}")
     yield
     print("Shutting down: Closing all WebSockets...")
-    asset_ids = list(registry.active_sockets.keys())
+    asset_ids = list(registry.active_books.keys())
     for aid in asset_ids:
         registry.release(aid)
+    with registry._user_lock:
+        if registry._user_socket is not None:
+            registry._user_socket.stop()
+            registry._user_socket = None
 
 
 app = FastAPI(lifespan=lifespan)
@@ -154,6 +350,89 @@ def resolve_event(query: str, min_volume: float = 0.0) -> GammaEvent:
 
     data["markets"] = filtered_markets
     return data
+
+
+@app.get("/events/list", response_model=list[GammaEvent])
+def list_events(
+    tag_id: int = 1,
+    limit: int = 20,
+    window_hours: int = 24,
+    window_before_hours: int = 0,
+    volume_min: float = 1000,
+) -> list[GammaEvent]:
+    now = datetime.now(timezone.utc)
+    end_date_min = now.isoformat()
+    end_date_max = (now + timedelta(hours=24)).isoformat()
+    fetch_limit = max(limit, 500)
+    params: dict[str, object] = {
+        "limit": fetch_limit,
+        "active": True,
+        "closed": False,
+        "order": "volume24hr",
+        "ascending": False,
+        "end_date_min": end_date_min,
+        "end_date_max": end_date_max,
+        "volume_min": volume_min,
+    }
+    if tag_id and tag_id > 0:
+        params["tag_id"] = tag_id
+    events = registry.poly_client.get_gamma_events(**params)  # type: ignore[arg-type]
+    total_markets = 0
+    for ev in events:
+        markets = ev.get("markets", [])
+        if isinstance(markets, list):
+            total_markets += len(markets)
+    print(f"Gamma events fetched: {len(events)} events, {total_markets} markets")
+    window_start = now - timedelta(hours=window_before_hours)
+    window_end = now + timedelta(hours=window_hours)
+
+    def _parse(dt_str: str | None) -> datetime | None:
+        if not dt_str:
+            return None
+        cleaned = dt_str.replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(cleaned)
+        except ValueError:
+            return None
+
+    filtered: list[GammaEvent] = []
+    for ev in events:
+        end_raw = ev.get("endDate")
+        end_dt = _parse(str(end_raw)) if end_raw else None
+        if end_dt and window_start <= end_dt <= window_end:
+            filtered.append(ev)
+    def _sort_key(ev: GammaEvent) -> datetime:
+        end_raw = ev.get("endDate")
+        end_dt = _parse(str(end_raw)) if end_raw else None
+        if end_dt:
+            return end_dt
+        return now
+
+    filtered.sort(key=_sort_key)
+    print(f"Gamma events in window: {len(filtered)} (fetch_limit={fetch_limit})")
+    return filtered[:limit]
+
+
+@app.get("/debug/events_raw")
+def debug_events_raw(tag_id: int = 1, limit: int = 500, volume_min: float = 1000) -> dict[str, object]:
+    fetch_limit = min(max(limit, 1), 500)
+    now = datetime.now(timezone.utc)
+    end_date_min = now.isoformat()
+    end_date_max = (now + timedelta(hours=24)).isoformat()
+    params: dict[str, object] = {
+        "limit": fetch_limit,
+        "active": True,
+        "closed": False,
+        "order": "volume24hr",
+        "ascending": False,
+        "end_date_min": end_date_min,
+        "end_date_max": end_date_max,
+        "volume_min": volume_min,
+    }
+    if tag_id and tag_id > 0:
+        params["tag_id"] = tag_id
+    events = registry.poly_client.get_gamma_events(**params)  # type: ignore[arg-type]
+    return {"count": len(events), "tag_id": tag_id, "events": events}
 
 
 @app.get("/user/resolve", response_model=UserActivityResponse)
@@ -207,6 +486,104 @@ def get_balance_allowance(
         )
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.get("/user/balance")
+def get_balance() -> dict[str, str]:
+    try:
+        data = registry.poly_client.get_balance_allowance()
+        return {"balance": data["balance"]}
+    except Exception as e:
+        logger.exception("Balance fetch failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/debug/open_orders_raw")
+def debug_open_orders_raw() -> dict[str, object]:
+    try:
+        client = registry.poly_client._get_trading_clob_client()
+        raw = client.get_orders(OpenOrderParams())  # type: ignore
+        print(f"DEBUG open_orders_raw type={type(raw)}")
+        print(f"DEBUG open_orders_raw payload={raw}")
+        return {"type": str(type(raw)), "payload": raw}
+    except Exception as e:
+        logger.exception("Debug open orders raw failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _normalize_open_orders(raw_orders: list[dict[str, object]]) -> list[Order]:
+    def _order_id(o: dict[str, object]) -> str | None:
+        for key in ("orderID", "orderId", "order_id", "id"):
+            val = o.get(key)
+            if isinstance(val, str) and val:
+                return val
+        return None
+
+    def _norm(o: dict[str, object], oid: str) -> Order:
+        size_val = o.get("size", "")
+        if not size_val:
+            size_val = o.get("original_size", "")
+        return {
+            "orderID": oid,
+            "price": str(o.get("price", "")),
+            "size": str(size_val),
+            "side": str(o.get("side", "")),
+            "asset_id": str(o.get("asset_id") or o.get("assetId") or o.get("market") or ""),
+            "expiration": int(o.get("expiration", 0) or 0),
+            "timestamp": int(o.get("timestamp", 0) or o.get("created_at", 0) or 0),
+            "owner": str(o.get("owner", "")),
+            "hash": str(o.get("hash", "")),
+        }
+
+    out: list[Order] = []
+    for raw in raw_orders:
+        if not isinstance(raw, dict):
+            continue
+        oid = _order_id(raw)
+        if not oid:
+            continue
+        out.append(_norm(raw, oid))
+    return out
+
+
+# @app.get("/orders/open", response_model=list[Order])
+# def get_open_orders_endpoint() -> list[Order]:
+#     try:
+#         raw_orders = registry.poly_client.get_open_orders()
+#         return _normalize_open_orders(raw_orders)  # type: ignore[arg-type]
+#     except Exception as e:
+#         logger.exception("Open orders fetch failed")
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/debug/auth_status")
+def debug_auth_status() -> dict[str, object]:
+    try:
+        client = registry.poly_client._get_trading_clob_client()
+        address = client.get_address()
+        try:
+            keys = client.get_api_keys()  # type: ignore
+            keys_info: object = keys
+        except Exception as e:
+            keys_info = {"error": str(e)}
+        print(f"DEBUG auth_status address={address}")
+        print(f"DEBUG auth_status api_keys={keys_info}")
+        return {"address": str(address), "api_keys": keys_info}
+    except Exception as e:
+        logger.exception("Debug auth status failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/debug/user_ws")
+def debug_user_ws() -> dict[str, object]:
+    return registry.get_user_socket_status()
+
+@app.post("/debug/user_ws/start")
+def debug_user_ws_start() -> dict[str, object]:
+    try:
+        registry.ensure_user_socket()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return registry.get_user_socket_status()
 
 @app.get("/user/positions")
 def get_positions(address: str, limit: int = 100) -> list[dict[str, object]]:
@@ -288,13 +665,45 @@ def post_limit_order(req: LimitOrderRequest) -> dict[str, object]:
 
         raise HTTPException(status_code=int(status), detail=detail)
 
+class MarketOrderRequest(BaseModel):
+    token_id: str = Field(min_length=1)
+    side: Literal["BUY", "SELL"]
+    size: float = Field(gt=0)
 
-@app.get("/orders/open", response_model=list[Order])
-def get_open_orders() -> list[Order]:
+
+@app.post("/orders/market")
+def post_market_order(req: MarketOrderRequest) -> dict[str, object]:
     try:
-        return registry.poly_client.get_open_orders()
+        snapshot = registry.poly_client.get_order_book_snapshot(req.token_id)
+        if snapshot:
+            asks = snapshot.get("asks", []) if isinstance(snapshot, dict) else []
+            bids = snapshot.get("bids", []) if isinstance(snapshot, dict) else []
+            if req.side == "BUY" and not asks:
+                raise HTTPException(status_code=400, detail="No asks available for market buy.")
+            if req.side == "SELL" and not bids:
+                raise HTTPException(status_code=400, detail="No bids available for market sell.")
+        result = registry.poly_client.place_market_order(
+            token_id=req.token_id,
+            side=req.side,
+            size=req.size,
+        )
+        return {"ok": True, "result": result}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Market Order Error (token_id=%s side=%s size=%s)", req.token_id, req.side, req.size)
+        status = getattr(e, "status_code", 500)
+        err_msg = getattr(e, "error_message", None)
+        detail: object = {"error": str(e)}
+        if err_msg is not None:
+            detail = {"error": str(e), "upstream": err_msg}
+        raise HTTPException(status_code=int(status), detail=detail)
+
+
+# @app.get("/orders/open", response_model=list[Order])
+# def get_open_orders() -> list[Order]:
+#     try:
+#         return registry.poly_client.get_open_orders()
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
 
 
 class CancelOrderRequest(BaseModel):
@@ -355,6 +764,48 @@ async def watch_user_endpoint(websocket: WebSocket, address: str, min_volume: fl
         await websocket.close()
 
 
+@app.websocket("/ws/orders")
+@app.websocket("/ws/user")
+async def orders_websocket_endpoint(websocket: WebSocket) -> None:
+    await websocket.accept()
+    print(f"Orders WS accepted (pid={os.getpid()})")
+    registry._last_order_ws_accept_ts = time.time()
+    last_open: dict[str, Order] = {}
+    q: Queue[dict[str, object]] = Queue(maxsize=200)
+    registry.register_order_subscriber(q, asyncio.get_running_loop())
+    print(f"Orders WS registered (subscribers={len(registry._order_subs)})")
+    await websocket.send_json(
+        {"type": "status", "status": "subscribed", "pid": os.getpid(), "server_now": int(time.time())}
+    )
+    try:
+        # Initial snapshot from open orders
+        try:
+            open_orders = await asyncio.to_thread(registry.poly_client.get_open_orders)
+            normalized = _normalize_open_orders(open_orders)  # type: ignore[arg-type]
+            last_open = {o["orderID"]: o for o in normalized}
+            await websocket.send_json(
+                {"type": "snapshot", "orders": normalized, "server_now": int(time.time())}
+            )
+        except Exception as e:
+            await websocket.send_json({"type": "error", "error": str(e)})
+
+        while True:
+            msg = await q.get()
+            msg["server_now"] = int(time.time())
+            await websocket.send_json(msg)
+    except WebSocketDisconnect:
+        print("Orders WS disconnected")
+        registry.unregister_order_subscriber(q)
+        return
+    except Exception as e:
+        print(f"Orders WS error: {e}")
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+        registry.unregister_order_subscriber(q)
+
+
 @app.websocket("/ws/{asset_id}")
 async def websocket_endpoint(websocket: WebSocket, asset_id: str) -> None:
     await websocket.accept()
@@ -392,6 +843,7 @@ async def websocket_endpoint(websocket: WebSocket, asset_id: str) -> None:
                 "msg_count": msg_count,
                 "bids": bids_list,
                 "asks": asks_list,
+                "tick_size": float(getattr(book, "tick_size", 0.01)),
             }
             await websocket.send_json(payload)
 

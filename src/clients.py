@@ -8,9 +8,9 @@ import time
 import requests
 import websocket
 from decimal import Decimal, InvalidOperation
-from typing import Any, Literal, Protocol, TypedDict, cast
+from typing import Any, Callable, Literal, Protocol, TypedDict, cast
 
-from src.config import GAMMA_URL, REST_URL, WSS_URL
+from src.config import GAMMA_URL, REST_URL, WSS_URL, WSS_USER_URL
 from src.models import (
     BalanceAllowanceResponse,
     GammaEvent,
@@ -19,13 +19,16 @@ from src.models import (
     WebSocketAppProto,
     WsBookMessage,
     WsPriceChangeMessage,
+    WsTickSizeChangeMessage,
 )
 
 # External Lib Imports
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
+    ApiCreds,
     BalanceAllowanceParams as ClobBalanceAllowanceParams,
     AssetType as ClobAssetType,
+    MarketOrderArgs,
     OpenOrderParams,
     OrderArgs,
     OrderType,
@@ -39,6 +42,9 @@ class BookCallback(Protocol):
 
 class PriceChangeCallback(Protocol):
     def __call__(self, msg: WsPriceChangeMessage) -> None: ...
+
+class TickSizeCallback(Protocol):
+    def __call__(self, msg: WsTickSizeChangeMessage) -> None: ...
 
 
 Side = Literal["BUY", "SELL"]
@@ -87,6 +93,7 @@ class PolyClient:
 
         self._public_clob: ClobClient | None = None
         self._trading_clob: ClobClient | None = None
+        self._api_creds: ApiCreds | None = None
 
     def _parse_string_or_list(self, raw: object) -> list[str]:
         match raw:
@@ -139,6 +146,9 @@ class PolyClient:
         limit: int = 100,
         order: str = "volume24hr",
         ascending: bool = False,
+        end_date_min: str | None = None,
+        end_date_max: str | None = None,
+        volume_min: float | None = None,
     ) -> list[GammaEvent]:
         """
         Fetches events from Gamma API. Supports:
@@ -159,6 +169,12 @@ class PolyClient:
 
         if slug:
             params["slug"] = slug
+        if end_date_min:
+            params["end_date_min"] = end_date_min
+        if end_date_max:
+            params["end_date_max"] = end_date_max
+        if volume_min is not None:
+            params["volume_min"] = str(volume_min)
 
         try:
             resp = self.session.get(GAMMA_URL, params=params, timeout=self.timeout)
@@ -300,6 +316,48 @@ class PolyClient:
             return float(price_val) if isinstance(price_val, str) else float(price_val) # type: ignore
         return float(raw) #type:ignore
 
+    def get_order_book_snapshot(self, token_id: str) -> WsBookMessage | None:
+        """
+        Fetches a point-in-time order book snapshot via REST.
+        """
+        try:
+            client = self._get_public_clob_client()
+            raw = client.get_order_book(token_id)  # type: ignore
+        except Exception as e:
+            print(f"⚠️ Order book REST fetch failed: {e}")
+            return None
+
+        book: dict[str, Any] | None
+        if isinstance(raw, dict):
+            book = cast(dict[str, Any], raw)
+        else:
+            book = getattr(raw, "__dict__", None)
+            if not isinstance(book, dict):
+                return None
+
+        def _levels(key: str) -> list[dict[str, str]]:
+            levels = book.get(key, [])
+            if not isinstance(levels, list):
+                return []
+            out: list[dict[str, str]] = []
+            for lvl in levels:
+                if isinstance(lvl, dict):
+                    price = str(lvl.get("price", "0"))
+                    size = str(lvl.get("size", "0"))
+                    out.append({"price": price, "size": size})
+                else:
+                    price = str(getattr(lvl, "price", "0"))
+                    size = str(getattr(lvl, "size", "0"))
+                    out.append({"price": price, "size": size})
+            return out
+
+        return {
+            "event_type": "book",
+            "asset_id": token_id,
+            "bids": _levels("bids"),
+            "asks": _levels("asks"),
+        } # type: ignore
+
     def _require_env(self, name: str) -> str:
         val = os.getenv(name)
         if not val:
@@ -362,9 +420,33 @@ class PolyClient:
                 signature_type=signature_type,
             )
 
-        client.set_api_creds(client.create_or_derive_api_creds()) #type: ignore
+        creds = client.create_or_derive_api_creds()  # type: ignore
+        client.set_api_creds(creds)  # type: ignore
+        self._api_creds = creds
         self._trading_clob = client
         return client
+
+    def get_api_creds(self) -> ApiCreds:
+        if self._api_creds is not None:
+            return self._api_creds
+        client = self._get_trading_clob_client()
+        creds = client.create_or_derive_api_creds()  # type: ignore
+        self._api_creds = creds
+        return creds
+
+    def get_user_ws_auth(self) -> dict[str, str]:
+        api_key = os.getenv("CLOB_API_KEY", "").strip()
+        api_secret = os.getenv("CLOB_API_SECRET", "").strip()
+        api_passphrase = os.getenv("CLOB_API_PASSPHRASE", "").strip()
+        if not api_key or not api_secret or not api_passphrase:
+            raise RuntimeError(
+                "Missing CLOB_API_KEY/CLOB_API_SECRET/CLOB_API_PASSPHRASE for user websocket auth."
+            )
+        return {
+            "apiKey": api_key,
+            "secret": api_secret,
+            "passphrase": api_passphrase,
+        }
 
     def check_orders(self, client: ClobClient) -> list[Order]:
         """
@@ -448,6 +530,51 @@ class PolyClient:
             return cast(dict[str, Any], resp)
         return {"result": resp}
 
+    def place_market_order(
+        self,
+        token_id: str,
+        side: Side,
+        size: float,
+    ) -> dict[str, Any]:
+        """
+        Places a MARKET order using a FOK order type.
+        """
+        if size <= 0:
+            raise ValueError("size must be > 0")
+
+        side_const = BUY if side == "BUY" else SELL
+        client = self._get_trading_clob_client()
+
+        price: float | None = None
+        try:
+            price = client.calculate_market_price(
+                token_id, side=side.lower(), amount=size, order_type=OrderType.FAK
+            )  # type: ignore
+        except Exception:
+            price = None
+
+        if not price or price <= 0:
+            if side == "BUY":
+                best_ask = self.get_best_price(token_id, "SELL")
+                price = min(0.99, best_ask + 0.01)
+            else:
+                best_bid = self.get_best_price(token_id, "BUY")
+                price = max(0.01, best_bid - 0.01)
+
+        order = MarketOrderArgs(
+            token_id=token_id,
+            amount=size,
+            side=side_const,
+            price=float(price),
+            order_type=OrderType.FAK,
+        )
+        signed = client.create_market_order(order)  # type: ignore
+        resp = client.post_order(signed, OrderType.FAK)  # type: ignore
+
+        if isinstance(resp, dict):
+            return cast(dict[str, Any], resp)
+        return {"result": resp}
+
 
 class OddsApiClient:
     def __init__(self, api_key: str, sport: str = "soccer_epl"):
@@ -518,9 +645,11 @@ class PolySocket:
         self.ws: websocket.WebSocketApp | None = None
         self.thread: threading.Thread | None = None
         self.keep_running = True
+        self._asset_lock = threading.Lock()
 
         self.on_book: BookCallback | None = None
         self.on_price_change: PriceChangeCallback | None = None
+        self.on_tick_size_change: TickSizeCallback | None = None
 
     def start(self) -> None:
         self.keep_running = True
@@ -547,9 +676,28 @@ class PolySocket:
                 time.sleep(2.0)
 
     def _on_open(self, ws: websocket.WebSocketApp) -> None:
-        print(f"✅ Connected. Subscribing to {len(self.asset_ids)} assets...")
-        sub_msg: dict[str, Any] = {"assets_ids": self.asset_ids, "type": "market"}
+        with self._asset_lock:
+            assets = list(self.asset_ids)
+        print(f"✅ Connected. Subscribing to {len(assets)} assets...")
+        sub_msg: dict[str, Any] = {"assets_ids": assets, "type": "market"}
         ws.send(json.dumps(sub_msg))
+
+    def update_assets(self, asset_ids: list[str], force_reconnect: bool = False) -> None:
+        with self._asset_lock:
+            self.asset_ids = asset_ids
+            ws = self.ws
+            assets = list(self.asset_ids)
+        if ws and force_reconnect:
+            try:
+                ws.close()
+            except Exception as e:
+                print(f"⚠️ WebSocket Reconnect Error: {e}")
+            return
+        if ws:
+            try:
+                ws.send(json.dumps({"assets_ids": assets, "type": "market"}))
+            except Exception as e:
+                print(f"⚠️ WebSocket Subscribe Error: {e}")
 
     def _on_message(self, ws: websocket.WebSocketApp, msg_str: str) -> None:
         try:
@@ -574,5 +722,121 @@ class PolySocket:
             elif etype == "price_change" and self.on_price_change:
                 self.on_price_change(cast(WsPriceChangeMessage, ev))
 
+            elif etype == "tick_size_change" and self.on_tick_size_change:
+                self.on_tick_size_change(cast(WsTickSizeChangeMessage, ev))
+
     def _on_error(self, ws: websocket.WebSocketApp, error: object) -> None:
         print(f"❌ WebSocket Error: {error}")
+
+class UserSocket:
+    """
+    Handles authenticated user WebSocket events (orders, trades).
+    """
+
+    def __init__(self, auth: dict[str, str]):
+        self.auth = auth
+        self.ws: websocket.WebSocketApp | None = None
+        self.thread: threading.Thread | None = None
+        self.keep_running = True
+        self.connected = False
+        self.markets = self._parse_markets(os.getenv("POLY_USER_WS_MARKETS", ""))
+        self._last_payload: dict[str, Any] | None = None
+        self.last_message_ts: float | None = None
+        self.last_error: str | None = None
+
+        self.on_event: Callable[[dict[str, Any]], None] | None = None
+
+    def start(self) -> None:
+        self.keep_running = True
+        self.thread = threading.Thread(target=self._run_loop, daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.keep_running = False
+        if self.ws:
+            cast(WebSocketAppProto, self.ws).close()
+
+    def _run_loop(self) -> None:
+        while self.keep_running:
+            print("User WS connecting...")
+            self.ws = websocket.WebSocketApp(
+                WSS_USER_URL,
+                on_open=self._on_open,
+                on_message=self._on_message,
+                on_error=self._on_error,
+                on_close=self._on_close,
+            )
+            cast(WebSocketAppProto, self.ws).run_forever(ping_interval=30, ping_timeout=10)
+
+            if self.keep_running:
+                time.sleep(2.0)
+
+    def _on_open(self, ws: websocket.WebSocketApp) -> None:
+        self.connected = True
+        print("User WS connected, sending auth...")
+        auth_msg: dict[str, Any] = {
+            "type": "user",
+            "auth": self.auth,
+        }
+        if self.markets:
+            auth_msg["markets"] = self.markets
+        self._last_payload = auth_msg
+        print(f"User WS subscribe payload (redacted): {self._redact(auth_msg)}")
+        ws.send(json.dumps(auth_msg))
+
+    def _on_message(self, ws: websocket.WebSocketApp, msg_str: str) -> None:
+        self.last_message_ts = time.time()
+        # print(f"User WS message: {msg_str}")
+        try:
+            data: Any = json.loads(msg_str)
+        except json.JSONDecodeError:
+            return
+
+        if isinstance(data, dict) and self.on_event:
+            self.on_event(cast(dict[str, Any], data))
+        elif isinstance(data, list) and self.on_event:
+            for item in data:
+                if isinstance(item, dict):
+                    self.on_event(cast(dict[str, Any], item))
+
+    def _on_error(self, ws: websocket.WebSocketApp, error: object) -> None:
+        self.connected = False
+        self.last_error = str(error)
+        print(f"User WS Error: {error}")
+
+    def _on_close(
+        self,
+        ws: websocket.WebSocketApp,
+        status_code: int | None,
+        msg: str | None,
+    ) -> None:
+        self.connected = False
+        print(f"User WS closed: code={status_code} msg={msg}")
+
+    def is_connected(self) -> bool:
+        return self.connected
+
+    def get_status(self) -> dict[str, object]:
+        return {
+            "connected": self.connected,
+            "last_message_ts": self.last_message_ts,
+            "last_error": self.last_error,
+            "last_payload": self._redact(self._last_payload) if self._last_payload else None,
+        }
+
+    def _parse_markets(self, raw: str) -> list[str]:
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        return parts
+
+    def _redact(self, payload: dict[str, Any]) -> dict[str, Any]:
+        def _mask(value: object) -> object:
+            if isinstance(value, str) and value:
+                return "*****"
+            return value
+        out: dict[str, Any] = {}
+        for key, val in payload.items():
+            if key == "auth" and isinstance(val, dict):
+                out[key] = {k: _mask(v) for k, v in val.items()}
+            else:
+                out[key] = val
+        return out

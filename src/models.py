@@ -90,6 +90,11 @@ class WsPriceChangeMessage(TypedDict, total=False):
     event_type: str
     price_changes: list[WsPriceChange]
 
+class WsTickSizeChangeMessage(TypedDict, total=False):
+    event_type: str
+    asset_id: str
+    tick_size: str
+
 class Token(TypedDict):
     token_id: str
     outcome: str
@@ -158,4 +163,5 @@ class WsPayload(TypedDict):
     msg_count: int
     bids: List[WsBidAsk]
     asks: List[WsBidAsk]
+    tick_size: NotRequired[float]
     status: NotRequired[str] # Use NotRequired if this key is optional

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Table, TableBody, TableCell, TableRow } from "@/components/ui/table";
@@ -17,6 +17,7 @@ interface BookState {
   msg_count: number;
   bids: OrderLevel[];
   asks: OrderLevel[];
+  tick_size: number;
 }
 
 export interface UserPosition {
@@ -25,12 +26,27 @@ export interface UserPosition {
   shares: number;
 }
 
+interface OpenOrder {
+  orderID: string;
+  asset_id: string;
+  side: "BUY" | "SELL";
+  price: string;
+  size: string;
+  expiration?: number;
+}
+
 interface WidgetProps {
   assetId: string;
   outcomeName: string;
   volume: number;
   userPosition?: UserPosition | null;
   positionShares?: number | null;
+  positionAvgPrice?: number | null;
+  openOrders?: OpenOrder[];
+  ordersServerNowSec?: number | null;
+  ordersServerNowLocalMs?: number | null;
+  defaultShares?: string;
+  defaultTtl?: string;
   isHighlighted?: boolean;
   viewMode?: "full" | "mini";
   onClose?: (assetId: string) => void;
@@ -51,7 +67,7 @@ function parseBookState(payload: unknown): BookState | null {
   if (!isRecord(payload)) return null;
   if (payload.status === "loading") return null;
 
-  const { ready, msg_count, bids, asks } = payload;
+  const { ready, msg_count, bids, asks, tick_size } = payload;
   if (typeof ready !== "boolean" || typeof msg_count !== "number") return null;
   if (!Array.isArray(bids) || !Array.isArray(asks)) return null;
 
@@ -60,6 +76,7 @@ function parseBookState(payload: unknown): BookState | null {
     msg_count,
     bids: bids.filter(isOrderLevel),
     asks: asks.filter(isOrderLevel),
+    tick_size: typeof tick_size === "number" ? tick_size : 0.01,
   };
 }
 
@@ -84,6 +101,27 @@ function clampInt(n: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, n));
 }
 
+function decimalsForTick(tickSize: number): number {
+  if (!Number.isFinite(tickSize) || tickSize <= 0) return 2;
+  const log = Math.round(-Math.log10(tickSize));
+  return Math.max(0, Math.min(6, log));
+}
+
+function formatPrice(price: number, tickSize: number): string {
+  const decimals = decimalsForTick(tickSize);
+  return price.toFixed(decimals);
+}
+
+function formatCents(price: number, tickSize: number): string {
+  const centsTick = tickSize * 100;
+  const decimals = decimalsForTick(centsTick);
+  return (price * 100).toFixed(decimals);
+}
+
+function formatOrderKey(price: number, tickSize: number): string {
+  return formatPrice(price, tickSize);
+}
+
 function formatVol(num: number): string {
   if (num >= 1_000_000) return `${(num / 1_000_000).toFixed(1)}M`;
   if (num >= 1_000) return `${(num / 1_000).toFixed(1)}k`;
@@ -96,6 +134,12 @@ export function OrderBookWidget({
   volume,
   userPosition,
   positionShares,
+  positionAvgPrice,
+  openOrders = [],
+  ordersServerNowSec,
+  ordersServerNowLocalMs,
+  defaultShares = "5",
+  defaultTtl = "10",
   isHighlighted,
   viewMode = "full",
   onClose,
@@ -109,13 +153,84 @@ export function OrderBookWidget({
   const spreadRef = useRef<HTMLTableRowElement>(null);
   const hasScrolledRef = useRef(false);
 
-  const [sharesRaw, setSharesRaw] = useState("5");
-  const [ttlRaw, setTtlRaw] = useState("10");
+  const [sharesRaw, setSharesRaw] = useState(defaultShares);
+  const [ttlRaw, setTtlRaw] = useState(defaultTtl);
+  const [sharesTouched, setSharesTouched] = useState(false);
+  const [ttlTouched, setTtlTouched] = useState(false);
   const [offsetCents, setOffsetCents] = useState(0); // This now represents "Aggression"
   const [placing, setPlacing] = useState<"idle" | "buy" | "sell">("idle");
+  const lastOrderTsRef = useRef<number>(0);
+  const minOrderIntervalMs = 500;
+  const serverOffsetSec = useMemo(() => {
+    if (ordersServerNowSec && ordersServerNowLocalMs) {
+      return ordersServerNowSec - Math.floor(ordersServerNowLocalMs / 1000);
+    }
+    return 0;
+  }, [ordersServerNowSec, ordersServerNowLocalMs]);
+  const [nowSec, setNowSec] = useState(() => Math.floor(Date.now() / 1000) + serverOffsetSec);
 
   const bestBid = data?.bids?.[0]?.price ?? null;
   const bestAsk = data?.asks?.[0]?.price ?? null;
+  const tickSize = data?.tick_size ?? 0.01;
+  const openOrderMap = useMemo(() => {
+    const buys = new Map<string, number>();
+    const sells = new Map<string, number>();
+    const buyExp = new Map<string, number>();
+    const sellExp = new Map<string, number>();
+    for (const o of openOrders) {
+      const priceNum = Number(o.price);
+      const sizeNum = Number(o.size);
+      const expirationNum = Number(o.expiration ?? 0);
+      if (!Number.isFinite(priceNum) || !Number.isFinite(sizeNum)) continue;
+      const key = formatOrderKey(priceNum, tickSize);
+      const isBuy = o.side === "BUY";
+      const target = isBuy ? buys : sells;
+      const targetExp = isBuy ? buyExp : sellExp;
+      target.set(key, (target.get(key) ?? 0) + sizeNum);
+      if (Number.isFinite(expirationNum) && expirationNum > 0) {
+        const prev = targetExp.get(key);
+        if (!prev || expirationNum < prev) targetExp.set(key, expirationNum);
+      }
+    }
+    return { buys, sells, buyExp, sellExp };
+  }, [openOrders, tickSize]);
+
+  const shouldTick = useMemo(
+    () => openOrders.some((o) => Number(o.expiration ?? 0) > 0),
+    [openOrders]
+  );
+
+  useEffect(() => {
+    if (!shouldTick) return;
+    const timer = window.setInterval(() => {
+      setNowSec(Math.floor(Date.now() / 1000) + serverOffsetSec);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [serverOffsetSec, shouldTick]);
+
+  useEffect(() => {
+    if (!shouldTick) return;
+    setNowSec(Math.floor(Date.now() / 1000) + serverOffsetSec);
+  }, [serverOffsetSec, shouldTick]);
+
+  useEffect(() => {
+    if (!sharesTouched) setSharesRaw(defaultShares);
+  }, [defaultShares, sharesTouched]);
+
+  useEffect(() => {
+    if (!ttlTouched) setTtlRaw(defaultTtl);
+  }, [defaultTtl, ttlTouched]);
+
+  const formatRemaining = useCallback(
+    (exp: number | undefined) => {
+      if (!exp) return "";
+      const remaining = exp - nowSec - 60;
+      if (!Number.isFinite(remaining)) return "";
+      if (remaining <= 0) return "exp";
+      return `${remaining}s`;
+    },
+    [nowSec]
+  );
 
   // Fix 1: WebSocket Cleanup and Reference Guarding
   useEffect(() => {
@@ -172,6 +287,11 @@ export function OrderBookWidget({
 
   const placeLimitOrder = async (side: "BUY" | "SELL"): Promise<void> => {
     try {
+      const now = Date.now();
+      if (now - lastOrderTsRef.current < minOrderIntervalMs) {
+        return;
+      }
+      lastOrderTsRef.current = now;
       setPlacing(side === "BUY" ? "buy" : "sell");
       
       // BUY moves UP with offset, SELL moves DOWN with offset
@@ -194,6 +314,30 @@ export function OrderBookWidget({
       console.error("Order failed", { e });
     } finally {
       setPlacing("idle");
+    }
+  };
+
+  const placeMarketOrder = async (side: "BUY" | "SELL"): Promise<void> => {
+    try {
+      const sizeNum = Number(sharesRaw);
+      if (!Number.isFinite(sizeNum) || sizeNum <= 0) return;
+      const confirmText =
+        side === "BUY"
+          ? `Market BUY ${sizeNum} shares at best ask?`
+          : `Market SELL ${sizeNum} shares at best bid?`;
+      if (!window.confirm(confirmText)) return;
+
+      await fetch(`${apiBaseUrl}/orders/market`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          token_id: assetId,
+          side,
+          size: sizeNum,
+        }),
+      });
+    } catch (e) {
+      console.error("Market order failed", { e });
     }
   };
 
@@ -244,12 +388,14 @@ export function OrderBookWidget({
   if (viewMode === "mini") {
     const holdingLabel =
       positionShares && positionShares > 0 ? `${positionShares.toFixed(2)} sh` : null;
+    const avgLabel =
+      positionAvgPrice && positionAvgPrice > 0 ? `${formatCents(positionAvgPrice, tickSize)}¢` : null;
     return (
       <div className="relative">
         {onClose && (
           <button onClick={() => onClose(assetId)} className="absolute -top-3 right-3 z-20 h-7 w-7 rounded-full border border-slate-800 bg-slate-950 text-slate-300 hover:text-white">×</button>
         )}
-        <Card className={`border-slate-800 bg-slate-950 text-slate-200 w-[350px] h-[140px] flex flex-col shrink-0 transition-all ${isHighlighted ? "ring-2 ring-blue-500" : ""}`}>
+        <Card className={`border-slate-800 bg-slate-950 text-slate-200 w-full h-[140px] flex flex-col shrink-0 transition-all ${isHighlighted ? "ring-2 ring-blue-500" : ""}`}>
           <CardHeader className="pb-2 pt-4 px-4 bg-slate-950 rounded-t-lg">
             <div className="flex justify-between items-start gap-2">
               <div className="flex flex-col overflow-hidden">
@@ -266,18 +412,18 @@ export function OrderBookWidget({
             </div>
             {holdingLabel && (
               <div className="mt-2 text-[10px] font-mono text-emerald-400">
-                HOLD {holdingLabel}
+                HOLD {holdingLabel}{avgLabel ? ` @ ${avgLabel}` : ""}
               </div>
             )}
           </CardHeader>
           <CardContent className="px-4 pb-4 pt-0 flex items-center justify-between gap-2 h-full">
             <div className="flex-1 bg-green-950/20 border border-green-900/30 rounded p-2 flex flex-col items-center">
               <span className="text-[10px] text-green-600 uppercase font-bold">Bid</span>
-              <span className="text-xl font-mono text-green-400">{bestBid?.toFixed(2) ?? "-"}</span>
+              <span className="text-xl font-mono text-green-400">{bestBid !== null ? formatPrice(bestBid, tickSize) : "-"}</span>
             </div>
             <div className="flex-1 bg-red-950/20 border border-red-900/30 rounded p-2 flex flex-col items-center">
               <span className="text-[10px] text-red-600 uppercase font-bold">Ask</span>
-              <span className="text-xl font-mono text-red-400">{bestAsk?.toFixed(2) ?? "-"}</span>
+              <span className="text-xl font-mono text-red-400">{bestAsk !== null ? formatPrice(bestAsk, tickSize) : "-"}</span>
             </div>
           </CardContent>
         </Card>
@@ -304,12 +450,13 @@ export function OrderBookWidget({
               </div>
               {userPosition && (
                 <div className={`text-[10px] px-1.5 py-0.5 rounded font-mono border ${userPosition.side === "BUY" ? "bg-blue-950/30 border-blue-900 text-blue-300" : "bg-red-950/30 border-red-900 text-red-300"}`}>
-                  <span className="font-bold">{userPosition.side}</span> @ <span className="text-white">{(userPosition.price * 100).toFixed(0)}¢</span>
+                  <span className="font-bold">{userPosition.side}</span> @ <span className="text-white">{formatCents(userPosition.price, tickSize)}¢</span>
                 </div>
               )}
               {positionShares && positionShares > 0 && (
                 <div className="text-[10px] px-1.5 py-0.5 rounded font-mono border bg-emerald-950/30 border-emerald-900 text-emerald-300">
                   HOLD {positionShares.toFixed(2)} sh
+                  {positionAvgPrice && positionAvgPrice > 0 ? ` @ ${formatCents(positionAvgPrice, tickSize)}¢` : ""}
                 </div>
               )}
             </div>
@@ -327,21 +474,71 @@ export function OrderBookWidget({
               <ScrollArea className="flex-1 w-full">
                 <Table className="table-fixed">
                   <TableBody className="text-xs font-mono">
-                    {data.asks.slice().reverse().map((row, i) => (
-                      <TableRow key={`ask-${i}`} className="hover:bg-red-950/10 border-0 h-5">
-                        <TableCell className="text-right text-red-400 py-0.5 w-20">{row.price.toFixed(2)}</TableCell>
-                        <TableCell className="text-right py-0.5 text-slate-400">{row.size.toFixed(2)}</TableCell>
+                    {data.asks.slice().reverse().map((row, i) => {
+                      const isBestAsk = i === data.asks.length - 1;
+                      return (
+                      <TableRow
+                        key={`ask-${i}`}
+                        onClick={isBestAsk ? () => void placeMarketOrder("BUY") : undefined}
+                        className={`border-0 h-5 ${
+                          isBestAsk ? "cursor-pointer hover:bg-blue-950/30" : "hover:bg-red-950/10"
+                        } ${
+                          openOrderMap.sells.has(formatOrderKey(row.price, tickSize))
+                            ? "bg-red-950/30"
+                            : ""
+                        }`}
+                      >
+                        <TableCell className="text-left text-emerald-400 py-0.5 w-7">
+                          {openOrderMap.sells.has(formatOrderKey(row.price, tickSize)) ? (
+                            <div className="flex items-center gap-1">
+                              <span>{openOrderMap.sells.get(formatOrderKey(row.price, tickSize))?.toFixed(2)}</span>
+                              <span className="text-[9px] text-slate-500">
+                                {formatRemaining(openOrderMap.sellExp.get(formatOrderKey(row.price, tickSize)))}
+                              </span>
+                            </div>
+                          ) : (
+                            ""
+                          )}
+                        </TableCell>
+                        <TableCell className="text-right text-red-400 py-0.5 w-20">{formatPrice(row.price, tickSize)}</TableCell>
+                        <TableCell className="text-right py-0.5 text-slate-400">{row.size.toFixed(1)}</TableCell>
                         <TableCell className="text-right text-slate-600 py-0.5 pr-4">${row.cum.toFixed(2)}</TableCell>
                       </TableRow>
-                    ))}
-                    <TableRow ref={spreadRef} className="bg-slate-900 h-1.5"><TableCell colSpan={3} className="py-0 border-y border-slate-800/40" /></TableRow>
-                    {data.bids.map((row, i) => (
-                      <TableRow key={`bid-${i}`} className="hover:bg-green-950/10 border-0 h-5">
-                        <TableCell className="text-right text-green-400 py-0.5 w-20">{row.price.toFixed(2)}</TableCell>
-                        <TableCell className="text-right py-0.5 text-slate-400">{row.size.toFixed(2)}</TableCell>
+                      );
+                    })}
+                    <TableRow ref={spreadRef} className="bg-slate-900 h-1.5"><TableCell colSpan={4} className="py-0 border-y border-slate-800/40" /></TableRow>
+                    {data.bids.map((row, i) => {
+                      const isBestBid = i === 0;
+                      return (
+                      <TableRow
+                        key={`bid-${i}`}
+                        onClick={isBestBid ? () => void placeMarketOrder("SELL") : undefined}
+                        className={`border-0 h-5 ${
+                          isBestBid ? "cursor-pointer hover:bg-amber-950/30" : "hover:bg-green-950/10"
+                        } ${
+                          openOrderMap.buys.has(formatOrderKey(row.price, tickSize))
+                            ? "bg-green-950/30"
+                            : ""
+                        }`}
+                      >
+                        <TableCell className="text-left text-emerald-400 py-0.5 w-10">
+                          {openOrderMap.buys.has(formatOrderKey(row.price, tickSize)) ? (
+                            <div className="flex items-center gap-1">
+                              <span>{openOrderMap.buys.get(formatOrderKey(row.price, tickSize))?.toFixed(2)}</span>
+                              <span className="text-[9px] text-slate-500">
+                                {formatRemaining(openOrderMap.buyExp.get(formatOrderKey(row.price, tickSize)))}
+                              </span>
+                            </div>
+                          ) : (
+                            ""
+                          )}
+                        </TableCell>
+                        <TableCell className="text-right text-green-400 py-0.5 w-20">{formatPrice(row.price, tickSize)}</TableCell>
+                        <TableCell className="text-right py-0.5 text-slate-400">{row.size.toFixed(1)}</TableCell>
                         <TableCell className="text-right text-slate-600 py-0.5 pr-4">${row.cum.toFixed(2)}</TableCell>
                       </TableRow>
-                    ))}
+                      );
+                    })}
                   </TableBody>
                 </Table>
               </ScrollArea>
@@ -366,29 +563,65 @@ export function OrderBookWidget({
                     </Button><span className="text-[10px] font-mono text-slate-500">offset {offsetCents >= 0 ? "+" : ""}{offsetCents}¢</span>
                   </div>
                   <div className="text-[10px] font-mono text-slate-500">
-                    bid {bestBid ? `${(bestBid * 100).toFixed(0)}¢` : "—"} / ask {bestAsk ? `${(bestAsk * 100).toFixed(0)}¢` : "—"}
+                    bid {bestBid !== null ? `${formatCents(bestBid, tickSize)}¢` : "—"} / ask {bestAsk !== null ? `${formatCents(bestAsk, tickSize)}¢` : "—"}
                   </div>
                 </div>
 
                 <div className="mt-2 grid grid-cols-2 gap-2">
                   <div className="space-y-1">
                     <label className="text-[10px] text-slate-500 uppercase font-bold">Shares</label>
-                    <Input value={sharesRaw} onChange={e => setSharesRaw(e.target.value)} onFocus={(e) => e.currentTarget.select()} className="h-8 bg-black border-slate-800 font-mono text-sm" />
+                    <Input
+                      value={sharesRaw}
+                      onChange={(e) => {
+                        setSharesRaw(e.target.value);
+                        setSharesTouched(true);
+                      }}
+                      onFocus={(e) => e.currentTarget.select()}
+                      className="h-8 bg-black border-slate-800 font-mono text-sm"
+                    />
                   </div>
                   <div className="space-y-1">
                     <label className="text-[10px] text-slate-500 uppercase font-bold">TTL (seconds)</label>
-                    <Input value={ttlRaw} onChange={e => setTtlRaw(e.target.value)} onFocus={(e) => e.currentTarget.select()} className="h-8 bg-black border-slate-800 font-mono text-sm" />
+                    <Input
+                      value={ttlRaw}
+                      onChange={(e) => {
+                        setTtlRaw(e.target.value);
+                        setTtlTouched(true);
+                      }}
+                      onFocus={(e) => e.currentTarget.select()}
+                      className="h-8 bg-black border-slate-800 font-mono text-sm"
+                    />
                   </div>
                 </div>
 
                 <div className="mt-3 grid grid-cols-2 gap-3">
                   <Button disabled={placing !== "idle" || !bestBid} onClick={() => void placeLimitOrder("BUY")} className="hover:cursor-pointer h-10 font-bold bg-sky-500 hover:bg-sky-400 border-b-4 border-sky-700 hover:translate-y-0.5 hover:border-b-2 active:translate-y-1 active:border-b-0 transition-all text-white">
-                    {placing === "buy" ? "..." : `BUY @ ${bestBid ? Math.round(bestBid * 100 + offsetCents) : "—"}¢`}
+                    {placing === "buy" ? "..." : `BUY @ ${bestBid !== null ? formatCents(bestBid + offsetCents / 100, tickSize) : "—"}¢`}
                   </Button>
                   <Button disabled={placing !== "idle" || !bestAsk} onClick={() => void placeLimitOrder("SELL")} className="hover:cursor-pointer h-10 font-bold bg-sky-500 hover:bg-sky-400 border-b-4 border-sky-700 hover:translate-y-0.5 hover:border-b-2 active:translate-y-1 active:border-b-0 transition-all text-white">
-                    {placing === "sell" ? "..." : `SELL @ ${bestAsk ? Math.round(bestAsk * 100 - offsetCents) : "—"}¢`}
+                    {placing === "sell" ? "..." : `SELL @ ${bestAsk !== null ? formatCents(bestAsk - offsetCents / 100, tickSize) : "—"}¢`}
                   </Button>
                 </div>
+
+                {/* {openOrders.length > 0 && (
+                  <div className="mt-3 border-t border-slate-800 pt-2 text-[10px] font-mono text-slate-400">
+                    <div className="flex items-center justify-between">
+                      <span>Open Orders</span>
+                      <span>{openOrders.length}</span>
+                    </div>
+                    <div className="mt-1 space-y-1">
+                      {openOrders.slice(0, 3).map((o) => (
+                        <div key={o.orderID} className="flex items-center justify-between">
+                          <span className={o.side === "BUY" ? "text-blue-300" : "text-red-300"}>
+                            {o.side}
+                          </span>
+                          <span>{formatCents(Number(o.price), tickSize)}¢</span>
+                          <span>{Number(o.size).toFixed(2)} sh</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )} */}
               </div>
             </>
           )}
