@@ -81,8 +81,10 @@ function App() {
   const cashSfxRef = useRef<HTMLAudioElement | null>(null);
   const prevCashRef = useRef<number | null>(null);
   const tradeSfxRef = useRef<HTMLAudioElement | null>(null);
-  const [defaultShares, setDefaultShares] = useState("5");
-  const [defaultTtl, setDefaultTtl] = useState("10");
+  const [defaultShares, setDefaultShares] = useState("10");
+  const [defaultTtl, setDefaultTtl] = useState("8");
+  const [eventsWindowBefore, setEventsWindowBefore] = useState("3");
+  const [eventsWindowAfter, setEventsWindowAfter] = useState("24");
   const [liveEvents, setLiveEvents] = useState<EventData[]>([]);
   const [subscribedSlugs, setSubscribedSlugs] = useState<Set<string>>(new Set());
   const [orders, setOrders] = useState<OrderView[]>([]);
@@ -96,6 +98,7 @@ function App() {
   const [ordersWsErrorInfo, setOrdersWsErrorInfo] = useState<string | null>(null);
   const seenTradeIdsRef = useRef<Set<string>>(new Set());
   const [draggedWidgetKey, setDraggedWidgetKey] = useState<string | null>(null);
+  const [autoPairs, setAutoPairs] = useState<Set<string>>(new Set());
 
   const [highlightedAsset, setHighlightedAsset] = useState<string | null>(null);
   const highlightTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -125,6 +128,18 @@ function App() {
     setHighlightedAsset((prev) => (prev === assetId ? null : prev));
   }, []);
 
+  const handleClosePair = useCallback((pairKey: string) => {
+    setWidgets((prev) => {
+      const next = prev.filter((w) => w.marketQuestion !== pairKey);
+      const dismissed = { ...dismissedAssetsRef.current };
+      prev.forEach((w) => {
+        if (w.marketQuestion === pairKey) dismissed[w.assetId] = true;
+      });
+      dismissedAssetsRef.current = dismissed;
+      return next;
+    });
+  }, []);
+
   const swapWidgets = useCallback((fromKey: string, toKey: string) => {
     if (fromKey === toKey) return;
     setWidgets((prev) => {
@@ -135,6 +150,15 @@ function App() {
       const temp = next[fromIndex];
       next[fromIndex] = next[toIndex];
       next[toIndex] = temp;
+      return next;
+    });
+  }, []);
+
+  const toggleAutoPair = useCallback((pairKey: string) => {
+    setAutoPairs((prev) => {
+      const next = new Set(prev);
+      if (next.has(pairKey)) next.delete(pairKey);
+      else next.add(pairKey);
       return next;
     });
   }, []);
@@ -217,9 +241,15 @@ function App() {
                 if (first) seen.delete(first);
               }
               playTradeFilled();
+              window.setTimeout(() => {
+                void fetchAuthMetrics();
+              }, 2000);
             }
           } else {
             playTradeFilled();
+            window.setTimeout(() => {
+              void fetchAuthMetrics();
+            }, 2000);
           }
         }
         setOrders((prev) => {
@@ -360,7 +390,7 @@ function App() {
 
   useEffect(() => {
     void fetchAuthMetrics();
-    const interval = window.setInterval(() => void fetchAuthMetrics(), 30000);
+    const interval = window.setInterval(() => void fetchAuthMetrics(), 10000);
     return () => window.clearInterval(interval);
   }, [fetchAuthMetrics]);
 
@@ -368,7 +398,13 @@ function App() {
     const baseUrl = "http://localhost:8000";
     const loadLive = async () => {
       try {
-        const res = await fetch(`${baseUrl}/events/list?limit=120`);
+        const beforeNum = Number(eventsWindowBefore);
+        const afterNum = Number(eventsWindowAfter);
+        const before = Number.isFinite(beforeNum) ? beforeNum : 0;
+        const after = Number.isFinite(afterNum) ? afterNum : 24;
+        const res = await fetch(
+          `${baseUrl}/events/list?limit=120&window_before_hours=${before}&window_hours=${after}`
+        );
         if (!res.ok) return;
         const data = (await res.json()) as EventData[];
         setLiveEvents(data);
@@ -379,7 +415,7 @@ function App() {
     void loadLive();
     const interval = window.setInterval(() => void loadLive(), 60000);
     return () => window.clearInterval(interval);
-  }, []);
+  }, [eventsWindowBefore, eventsWindowAfter]);
 
   const resolveInput = async (mode: "replace" | "add", override?: string) => {
     const input = (override ?? url).trim();
@@ -647,7 +683,7 @@ function App() {
     
     {/* Live Events Strip */}
     {liveEvents.length > 0 && (
-      <div className="px-4 pt-4">
+      <div className="px-4 pt-2">
         <LiveEventsStrip
           events={liveEvents.map((ev) => ({
             id: ev.slug,
@@ -709,8 +745,55 @@ function App() {
         )}
 
         {/* High-Density Order Book Grid */}
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6 gap-4 pb-3">
-          {widgets.map((w, index) => {
+        <div className="grid grid-cols-1 sm:grid-cols-1 lg:grid-cols-2 xl:grid-cols-2 2xl:grid-cols-3 gap-4 pb-0">
+          {Object.entries(
+            widgets.reduce<Record<string, TokenWidget[]>>((acc, w) => {
+              const key = w.marketQuestion || "Unknown";
+              if (!acc[key]) acc[key] = [];
+              acc[key].push(w);
+              return acc;
+            }, {})
+          ).map(([pairKey, group]) => {
+            const isPair = group.length >= 2;
+            const isAutoOn = autoPairs.has(pairKey);
+            return (
+              <div
+                key={pairKey}
+                className={`relative rounded-md p-2 ${
+                  isPair ? (isAutoOn ? "bg-slate-800/70" : "bg-slate-900/50") : ""
+                }`}
+              >
+                {isPair && (
+                  <div className="absolute -top-2 right-2 flex items-center gap-2">
+                    <Button
+                      onClick={() => toggleAutoPair(pairKey)}
+                      className={`h-6 px-2 text-[10px] uppercase font-bold border ${
+                        isAutoOn ? "bg-emerald-600/80 border-emerald-500 text-white" : "bg-slate-950 border-slate-800 text-slate-300"
+                      }`}
+                    >
+                      🤖 Auto
+                    </Button>
+                    <Button
+                      onClick={() => handleClosePair(pairKey)}
+                      className="h-6 w-6 rounded-full border border-slate-800 bg-slate-950 text-slate-300 hover:text-white"
+                    >
+                      ✕
+                    </Button>
+                  </div>
+                )}
+                {group[0] && (
+                  <div className="flex items-center gap-2 pb-0 -mb-1">
+                    <span className="text-[10px] text-slate-500 uppercase font-bold truncate px-1">
+                      {group[0].marketQuestion}
+                    </span>
+                    <span className="text-[10px] text-slate-400 font-mono">
+                      ${Math.round(group[0].marketVolume).toLocaleString()}
+                    </span>
+                  </div>
+                )}
+                <div className="grid grid-cols-2 gap-2">
+                  {group.map((w) => {
+                    const index = widgets.findIndex((item) => item.uniqueKey === w.uniqueKey);
             const match = positionHistory[w.assetId];
 
             let userPos: UserPosition | null = null;
@@ -721,7 +804,7 @@ function App() {
               userPos = { side: match.side, price, shares };
             }
 
-            const heldPosition = authPositions.find((p) => p.asset === w.assetId);
+                    const heldPosition = authPositions.find((p) => p.asset === w.assetId);
             const heldShares = heldPosition ? Number(heldPosition.size) : null;
             const heldAvg = heldPosition ? Number(heldPosition.avgPrice) : null;
             const openOrders = orders.filter((o) => o.asset_id === w.assetId && o.status === "open");
@@ -732,7 +815,7 @@ function App() {
             return (
               <div
                 key={w.uniqueKey}
-                className={`flex flex-col gap-1 ${draggedWidgetKey === w.uniqueKey ? "opacity-60" : ""}`}
+                        className={`flex flex-col gap-1 ${draggedWidgetKey === w.uniqueKey ? "opacity-60" : ""}`}
                 draggable
                 onDragStart={(event) => {
                   setDraggedWidgetKey(w.uniqueKey);
@@ -751,8 +834,8 @@ function App() {
                   setDraggedWidgetKey(null);
                 }}
               >
-                <span 
-                  className="text-[9px] text-slate-500 uppercase font-bold truncate px-1" 
+                <span
+                  className="text-[9px] text-slate-500 uppercase font-bold truncate px-1 opacity-0 -mt-1"
                   title={w.marketQuestion}
                 >
                   {w.marketQuestion}
@@ -769,11 +852,16 @@ function App() {
                   ordersServerNowLocalMs={ordersServerNowLocalMs}
                   defaultShares={defaultShares}
                   defaultTtl={defaultTtl}
+                  auto={isAutoOn}
                   isHighlighted={highlightedAsset === w.assetId}
                   viewMode={isFullMode ? "full" : "mini"}
-                  onClose={handleCloseWidget}
+                  onClose={isPair ? undefined : handleCloseWidget}
                   apiBaseUrl="http://localhost:8000"
                 />
+              </div>
+                    );
+                  })}
+                </div>
               </div>
             );
           })}
@@ -803,26 +891,38 @@ function App() {
               return Number.isFinite(value) && value > 0.01;
             })}
             onSelect={(pos) => {
-              if (dismissedAssetsRef.current[pos.asset]) {
-                const next = { ...dismissedAssetsRef.current };
-                delete next[pos.asset];
-                dismissedAssetsRef.current = next;
+              const assetsToAdd: Array<{ assetId: string; outcomeName: string }> = [
+                { assetId: pos.asset, outcomeName: pos.outcome || "Outcome" },
+              ];
+              if (pos.oppositeAsset) {
+                assetsToAdd.push({
+                  assetId: pos.oppositeAsset,
+                  outcomeName: pos.oppositeOutcome || "Opposite",
+                });
               }
+
+              const dismissed = { ...dismissedAssetsRef.current };
+              assetsToAdd.forEach(({ assetId }) => {
+                if (dismissed[assetId]) delete dismissed[assetId];
+              });
+              dismissedAssetsRef.current = dismissed;
+
               setWidgets((prev) => {
-                if (prev.some((w) => w.assetId === pos.asset)) return prev;
-                const outcomeName = pos.outcome || "Outcome";
+                const existing = new Set(prev.map((w) => w.assetId));
                 const marketQuestion = pos.title || "Position";
                 const volume = Number(pos.currentValue);
-                return [
-                  {
-                    uniqueKey: pos.asset,
-                    assetId: pos.asset,
+                const marketVolume = Number.isFinite(volume) ? volume : 0;
+                const additions = assetsToAdd
+                  .filter(({ assetId }) => !existing.has(assetId))
+                  .map(({ assetId, outcomeName }) => ({
+                    uniqueKey: assetId,
+                    assetId,
                     outcomeName,
                     marketQuestion,
-                    marketVolume: Number.isFinite(volume) ? volume : 0,
-                  },
-                  ...prev,
-                ];
+                    marketVolume,
+                  }));
+                if (additions.length === 0) return prev;
+                return [...additions, ...prev];
               });
               closePositions();
             }}
@@ -898,6 +998,26 @@ function App() {
                 onFocus={(e) => e.currentTarget.select()}
                 className="h-8 bg-black border-slate-800 font-mono text-sm"
               />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1">
+                <label className="text-[10px] text-slate-500 uppercase font-bold">Events Window Before (h)</label>
+                <Input
+                  value={eventsWindowBefore}
+                  onChange={(e) => setEventsWindowBefore(e.target.value)}
+                  onFocus={(e) => e.currentTarget.select()}
+                  className="h-8 bg-black border-slate-800 font-mono text-sm"
+                />
+              </div>
+              <div className="space-y-1">
+                <label className="text-[10px] text-slate-500 uppercase font-bold">Events Window After (h)</label>
+                <Input
+                  value={eventsWindowAfter}
+                  onChange={(e) => setEventsWindowAfter(e.target.value)}
+                  onFocus={(e) => e.currentTarget.select()}
+                  className="h-8 bg-black border-slate-800 font-mono text-sm"
+                />
+              </div>
             </div>
           </div>
         </div>

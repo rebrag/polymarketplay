@@ -556,10 +556,13 @@ class PolyClient:
         if not price or price <= 0:
             if side == "BUY":
                 best_ask = self.get_best_price(token_id, "SELL")
-                price = min(0.99, best_ask + 0.01)
+                price = best_ask + 0.01
             else:
                 best_bid = self.get_best_price(token_id, "BUY")
-                price = max(0.01, best_bid - 0.01)
+                price = best_bid - 0.01
+
+        # Market order price must be within [0.01, 0.99] per CLOB rules.
+        price = max(0.01, min(0.99, float(price)))
 
         order = MarketOrderArgs(
             token_id=token_id,

@@ -361,7 +361,7 @@ def list_events(
     volume_min: float = 1000,
 ) -> list[GammaEvent]:
     now = datetime.now(timezone.utc)
-    end_date_min = now.isoformat()
+    end_date_min = (now - timedelta(hours=4)).isoformat()
     end_date_max = (now + timedelta(hours=24)).isoformat()
     fetch_limit = max(limit, 500)
     params: dict[str, object] = {
@@ -417,7 +417,7 @@ def list_events(
 def debug_events_raw(tag_id: int = 1, limit: int = 500, volume_min: float = 1000) -> dict[str, object]:
     fetch_limit = min(max(limit, 1), 500)
     now = datetime.now(timezone.utc)
-    end_date_min = now.isoformat()
+    end_date_min = (now - timedelta(hours=4)).isoformat()
     end_date_max = (now + timedelta(hours=24)).isoformat()
     params: dict[str, object] = {
         "limit": fetch_limit,
@@ -433,6 +433,70 @@ def debug_events_raw(tag_id: int = 1, limit: int = 500, volume_min: float = 1000
         params["tag_id"] = tag_id
     events = registry.poly_client.get_gamma_events(**params)  # type: ignore[arg-type]
     return {"count": len(events), "tag_id": tag_id, "events": events}
+
+
+@app.get("/debug/event_by_slug")
+def debug_event_by_slug(slug: str, tag_id: int = 1, volume_min: float = 1000) -> dict[str, object]:
+    now = datetime.now(timezone.utc)
+    end_date_min = (now - timedelta(hours=4)).isoformat()
+    end_date_max = (now + timedelta(hours=24)).isoformat()
+    params: dict[str, object] = {
+        "limit": 1,
+        "active": True,
+        "closed": False,
+        "order": "volume24hr",
+        "ascending": False,
+        "end_date_min": end_date_min,
+        "end_date_max": end_date_max,
+        "volume_min": volume_min,
+        "tag_id": tag_id,
+        "slug": slug,
+    }
+    events = registry.poly_client.get_gamma_events(**params)  # type: ignore[arg-type]
+    ev = events[0] if events else None
+    if not ev:
+        return {
+            "slug": slug,
+            "found": False,
+            "filters": {
+                "tag_id": tag_id,
+                "end_date_min": end_date_min,
+                "end_date_max": end_date_max,
+                "volume_min": volume_min,
+            },
+        }
+
+    end_raw = ev.get("endDate")
+    end_dt = None
+    if end_raw:
+        try:
+            end_dt = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
+        except ValueError:
+            end_dt = None
+
+    volume_val = ev.get("volume24hr")
+    try:
+        volume_num = float(volume_val) if volume_val is not None else None
+    except (TypeError, ValueError):
+        volume_num = None
+
+    return {
+        "slug": slug,
+        "found": True,
+        "event": ev,
+        "filters": {
+            "tag_id": tag_id,
+            "end_date_min": end_date_min,
+            "end_date_max": end_date_max,
+            "volume_min": volume_min,
+        },
+        "checks": {
+            "end_date": str(end_raw),
+            "end_in_window": bool(end_dt and end_date_min <= end_dt.isoformat() <= end_date_max),
+            "volume24hr": volume_num,
+            "volume_ok": bool(volume_num is not None and volume_num >= volume_min),
+        },
+    }
 
 
 @app.get("/user/resolve", response_model=UserActivityResponse)

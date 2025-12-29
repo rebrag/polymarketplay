@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 
 interface LiveEvent {
   id?: string;
@@ -77,14 +78,13 @@ function getStatus(ev: LiveEvent): "live" | "upcoming" | "unknown" {
 }
 
 function getDisplayTime(ev: LiveEvent): string | null {
-  const now = Date.now();
   const gameStart = getEventGameStart(ev);
-  const start = parseDate(gameStart)?.getTime() ?? null;
-  if (start !== null && now < start) return formatStart(gameStart);
-  return null;
+  if (!gameStart) return null;
+  return formatStart(gameStart);
 }
 
 export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEventsStripProps) {
+  const [query, setQuery] = useState("");
   const sorted = useMemo(() => {
     const now = Date.now();
     const sortTime = (ev: LiveEvent): number => {
@@ -100,6 +100,11 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
       return (b.volume ?? 0) - (a.volume ?? 0);
     });
   }, [events]);
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return sorted;
+    return sorted.filter((ev) => ev.title.toLowerCase().includes(q));
+  }, [query, sorted]);
   const trackRef = useRef<HTMLDivElement | null>(null);
   const [canScrollLeft, setCanScrollLeft] = useState(false);
   const [canScrollRight, setCanScrollRight] = useState(false);
@@ -133,9 +138,17 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
   return (
     <div className="rounded-md border border-slate-800 bg-slate-950/70 px-3 py-2">
       <div className="flex items-center justify-between mb-2">
-        <span className="text-[10px] uppercase tracking-widest text-slate-400 font-bold">Live Markets</span>
+        <div className="flex items-center gap-3">
+          <span className="text-[10px] uppercase tracking-widest text-slate-400 font-bold">Live Markets</span>
+          <Input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search teams..."
+            className="h-7 w-44 bg-slate-900/60 border-slate-800 text-[10px] text-slate-200"
+          />
+        </div>
         <div className="flex items-center gap-2">
-          <span className="text-[10px] text-slate-500 font-mono">-2h to +12h</span>
+          <span className="text-[10px] text-slate-500 font-mono">Window set in Settings</span>
           <Button
             onClick={async () => {
               try {
@@ -168,7 +181,7 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
           ref={trackRef}
           className="flex gap-3 overflow-hidden scroll-smooth px-0"
         >
-          {sorted.slice(0, 50).map((ev) => {
+          {filtered.slice(0, 50).map((ev) => {
             const isOn = subscribed.has(ev.slug);
             const status = getStatus(ev);
             const displayTime = getDisplayTime(ev);
@@ -187,9 +200,14 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
                 className="flex min-w-[200px] items-center gap-3 rounded-md border border-slate-800 bg-slate-900/50 px-3 py-2"
               >
                 <div className="flex flex-col">
-                  <span className={`text-[10px] uppercase font-bold ${status === "live" ? "text-red-400" : "text-slate-400"}`}>
-                    {status === "live" ? "Live" : displayTime ? displayTime : "Upcoming"}
-                    {status === "live" && <span className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-red-500 align-middle" />}
+                  <span className="text-[10px] uppercase font-bold text-slate-400">
+                    {displayTime ? displayTime : "Upcoming"}
+                    {status === "live" && (
+                      <>
+                        <span className="ml-2 text-red-400">LIVE</span>
+                        <span className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-red-500 align-middle" />
+                      </>
+                    )}
                   </span>
                   <span className="text-[11px] text-slate-200 font-semibold">{shortTitle(ev.title)}</span>
                   <span className="text-[10px] text-slate-500 font-mono">{formatVol(ev.volume)} vol</span>

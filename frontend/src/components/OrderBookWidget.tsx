@@ -47,6 +47,7 @@ interface WidgetProps {
   ordersServerNowLocalMs?: number | null;
   defaultShares?: string;
   defaultTtl?: string;
+  auto?: boolean;
   isHighlighted?: boolean;
   viewMode?: "full" | "mini";
   onClose?: (assetId: string) => void;
@@ -140,6 +141,7 @@ export function OrderBookWidget({
   ordersServerNowLocalMs,
   defaultShares = "5",
   defaultTtl = "10",
+  auto = false,
   isHighlighted,
   viewMode = "full",
   onClose,
@@ -177,6 +179,8 @@ export function OrderBookWidget({
     const sells = new Map<string, number>();
     const buyExp = new Map<string, number>();
     const sellExp = new Map<string, number>();
+    const buyIds = new Map<string, string[]>();
+    const sellIds = new Map<string, string[]>();
     for (const o of openOrders) {
       const priceNum = Number(o.price);
       const sizeNum = Number(o.size);
@@ -186,13 +190,17 @@ export function OrderBookWidget({
       const isBuy = o.side === "BUY";
       const target = isBuy ? buys : sells;
       const targetExp = isBuy ? buyExp : sellExp;
+      const targetIds = isBuy ? buyIds : sellIds;
       target.set(key, (target.get(key) ?? 0) + sizeNum);
+      const existingIds = targetIds.get(key) ?? [];
+      existingIds.push(o.orderID);
+      targetIds.set(key, existingIds);
       if (Number.isFinite(expirationNum) && expirationNum > 0) {
         const prev = targetExp.get(key);
         if (!prev || expirationNum < prev) targetExp.set(key, expirationNum);
       }
     }
-    return { buys, sells, buyExp, sellExp };
+    return { buys, sells, buyExp, sellExp, buyIds, sellIds };
   }, [openOrders, tickSize]);
 
   const shouldTick = useMemo(
@@ -341,6 +349,24 @@ export function OrderBookWidget({
     }
   };
 
+  const cancelOrdersAtPrice = async (side: "BUY" | "SELL", priceKey: string): Promise<void> => {
+    const idsMap = side === "BUY" ? openOrderMap.buyIds : openOrderMap.sellIds;
+    const ids = idsMap.get(priceKey) ?? [];
+    if (!ids.length) return;
+    const confirmText = `Cancel ${ids.length} ${side} order${ids.length > 1 ? "s" : ""} at ${priceKey}¢?`;
+    if (!window.confirm(confirmText)) return;
+
+    await Promise.all(
+      ids.map((orderId) =>
+        fetch(`${apiBaseUrl}/orders/cancel`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ order_id: orderId }),
+        }).catch(() => {})
+      )
+    );
+  };
+
   const btnStyles = "hover:cursor-pointer font-bold bg-sky-500 hover:bg-sky-400 border-b-4 border-sky-700 hover:translate-y-0.5 hover:border-b-2 active:translate-y-1 active:border-b-0 transition-all text-white disabled:opacity-50 disabled:translate-y-0 disabled:border-b-4";
 
   const handleCopyAssetId = useCallback(async (): Promise<void> => {
@@ -395,7 +421,11 @@ export function OrderBookWidget({
         {onClose && (
           <button onClick={() => onClose(assetId)} className="absolute -top-3 right-3 z-20 h-7 w-7 rounded-full border border-slate-800 bg-slate-950 text-slate-300 hover:text-white">×</button>
         )}
-        <Card className={`border-slate-800 bg-slate-950 text-slate-200 w-full h-[140px] flex flex-col shrink-0 transition-all ${isHighlighted ? "ring-2 ring-blue-500" : ""}`}>
+        <Card
+          className={`border-slate-800 bg-slate-950 text-slate-200 w-full h-[140px] flex flex-col shrink-0 transition-all ${
+            isHighlighted ? "ring-2 ring-blue-500" : ""
+          } ${auto ? "ring-2 ring-amber-400/80" : ""}`}
+        >
           <CardHeader className="pb-2 pt-4 px-4 bg-slate-950 rounded-t-lg">
             <div className="flex justify-between items-start gap-2">
               <div className="flex flex-col overflow-hidden">
@@ -436,7 +466,11 @@ export function OrderBookWidget({
       {onClose && (
         <button onClick={() => onClose(assetId)} className="absolute -top-3 right-3 z-20 h-7 w-7 rounded-full border border-slate-800 bg-slate-950 text-slate-300 hover:text-white shadow">×</button>
       )}
-      <Card className={`border-slate-800 bg-slate-950 text-slate-200 shadow-xl flex flex-col w-full h-[520px] transition-all ${isHighlighted ? "ring-2 ring-blue-500 shadow-blue-500/20" : ""}`}>
+      <Card
+        className={`border-slate-800 bg-slate-950 text-slate-200 shadow-xl flex flex-col w-full h-[470px] transition-all ${
+          isHighlighted ? "ring-2 ring-blue-500 shadow-blue-500/20" : ""
+        } ${auto ? "ring-2 ring-amber-400/80" : ""}`}
+      >
         <CardHeader className="pb-2 pt-4 px-4 bg-slate-950 border-b border-slate-900 shrink-0">
           <div className="flex justify-between items-start">
             <div className="flex flex-col overflow-hidden">
@@ -476,24 +510,36 @@ export function OrderBookWidget({
                   <TableBody className="text-xs font-mono">
                     {data.asks.slice().reverse().map((row, i) => {
                       const isBestAsk = i === data.asks.length - 1;
+                      const priceKey = formatOrderKey(row.price, tickSize);
+                      const hasOrders = openOrderMap.sells.has(priceKey);
                       return (
                       <TableRow
                         key={`ask-${i}`}
-                        onClick={isBestAsk ? () => void placeMarketOrder("BUY") : undefined}
+                        onClick={
+                          hasOrders
+                            ? () => void cancelOrdersAtPrice("SELL", priceKey)
+                            : isBestAsk
+                            ? () => void placeMarketOrder("BUY")
+                            : undefined
+                        }
                         className={`border-0 h-5 ${
-                          isBestAsk ? "cursor-pointer hover:bg-blue-950/30" : "hover:bg-red-950/10"
+                          hasOrders
+                            ? "cursor-pointer hover:bg-red-950/40"
+                            : isBestAsk
+                            ? "cursor-pointer hover:bg-blue-950/30"
+                            : "hover:bg-red-950/10"
                         } ${
-                          openOrderMap.sells.has(formatOrderKey(row.price, tickSize))
+                          openOrderMap.sells.has(priceKey)
                             ? "bg-red-950/30"
                             : ""
                         }`}
                       >
                         <TableCell className="text-left text-emerald-400 py-0.5 w-7">
-                          {openOrderMap.sells.has(formatOrderKey(row.price, tickSize)) ? (
+                          {openOrderMap.sells.has(priceKey) ? (
                             <div className="flex items-center gap-1">
-                              <span>{openOrderMap.sells.get(formatOrderKey(row.price, tickSize))?.toFixed(2)}</span>
+                              <span>{openOrderMap.sells.get(priceKey)?.toFixed(2)}</span>
                               <span className="text-[9px] text-slate-500">
-                                {formatRemaining(openOrderMap.sellExp.get(formatOrderKey(row.price, tickSize)))}
+                                {formatRemaining(openOrderMap.sellExp.get(priceKey))}
                               </span>
                             </div>
                           ) : (
@@ -509,24 +555,36 @@ export function OrderBookWidget({
                     <TableRow ref={spreadRef} className="bg-slate-900 h-1.5"><TableCell colSpan={4} className="py-0 border-y border-slate-800/40" /></TableRow>
                     {data.bids.map((row, i) => {
                       const isBestBid = i === 0;
+                      const priceKey = formatOrderKey(row.price, tickSize);
+                      const hasOrders = openOrderMap.buys.has(priceKey);
                       return (
                       <TableRow
                         key={`bid-${i}`}
-                        onClick={isBestBid ? () => void placeMarketOrder("SELL") : undefined}
+                        onClick={
+                          hasOrders
+                            ? () => void cancelOrdersAtPrice("BUY", priceKey)
+                            : isBestBid
+                            ? () => void placeMarketOrder("SELL")
+                            : undefined
+                        }
                         className={`border-0 h-5 ${
-                          isBestBid ? "cursor-pointer hover:bg-amber-950/30" : "hover:bg-green-950/10"
+                          hasOrders
+                            ? "cursor-pointer hover:bg-green-950/40"
+                            : isBestBid
+                            ? "cursor-pointer hover:bg-amber-950/30"
+                            : "hover:bg-green-950/10"
                         } ${
-                          openOrderMap.buys.has(formatOrderKey(row.price, tickSize))
+                          openOrderMap.buys.has(priceKey)
                             ? "bg-green-950/30"
                             : ""
                         }`}
                       >
                         <TableCell className="text-left text-emerald-400 py-0.5 w-10">
-                          {openOrderMap.buys.has(formatOrderKey(row.price, tickSize)) ? (
+                          {openOrderMap.buys.has(priceKey) ? (
                             <div className="flex items-center gap-1">
-                              <span>{openOrderMap.buys.get(formatOrderKey(row.price, tickSize))?.toFixed(2)}</span>
+                              <span>{openOrderMap.buys.get(priceKey)?.toFixed(2)}</span>
                               <span className="text-[9px] text-slate-500">
-                                {formatRemaining(openOrderMap.buyExp.get(formatOrderKey(row.price, tickSize)))}
+                                {formatRemaining(openOrderMap.buyExp.get(priceKey))}
                               </span>
                             </div>
                           ) : (
@@ -543,31 +601,7 @@ export function OrderBookWidget({
                 </Table>
               </ScrollArea>
 
-              {/* Trade Panel: Flush with bottom */}
-              <div className="border-t border-slate-800 bg-slate-950/80 p-3 shrink-0">
-                <div className="flex items-center justify-between">
-                  <div className="flex gap-2 items-center">
-                    <Button 
-                      size="sm" 
-                      className={`${btnStyles} h-7 px-4 text-xs`}
-                      onClick={() => setOffsetCents(v => clampInt(v - 1, -20, 20))}
-                    >
-                      -1¢
-                    </Button>
-                    <Button 
-                      size="sm" 
-                      className={`${btnStyles} h-7 px-4 text-xs`}
-                      onClick={() => setOffsetCents(v => clampInt(v + 1, -20, 20))}
-                    >
-                      +1¢
-                    </Button><span className="text-[10px] font-mono text-slate-500">offset {offsetCents >= 0 ? "+" : ""}{offsetCents}¢</span>
-                  </div>
-                  <div className="text-[10px] font-mono text-slate-500">
-                    bid {bestBid !== null ? `${formatCents(bestBid, tickSize)}¢` : "—"} / ask {bestAsk !== null ? `${formatCents(bestAsk, tickSize)}¢` : "—"}
-                  </div>
-                </div>
-
-                <div className="mt-2 grid grid-cols-2 gap-2">
+                <div className="mt-0 grid grid-cols-2 gap-2">
                   <div className="space-y-1">
                     <label className="text-[10px] text-slate-500 uppercase font-bold">Shares</label>
                     <Input
@@ -594,6 +628,37 @@ export function OrderBookWidget({
                   </div>
                 </div>
 
+              {/* Trade Panel: Flush with bottom */}
+              <div className=" bg-slate-950/80 p-3 shrink-0">
+                <div className="flex items-center justify-between">
+                  <div className="flex gap-2 items-center">
+                    <Button 
+                      size="sm" 
+                      className={`${btnStyles} h-7 px-4 text-xs`}
+                      onClick={() => setOffsetCents(v => clampInt(v + 1, -20, 20))}
+                    >
+                      +1¢
+                    </Button>
+                    <Button 
+                      size="sm" 
+                      className={`${btnStyles} h-7 px-4 text-xs`}
+                      onClick={() => setOffsetCents(v => clampInt(v - 1, -20, 20))}
+                    >
+                      -1¢
+                    </Button>
+                    <Button
+                      size="sm"
+                      className={`${btnStyles} h-7 px-4 text-xs`}
+                      onClick={() => setOffsetCents(0)}
+                    >
+                      Clear
+                    </Button>
+                  </div>
+                  <div className="h-7 px-3 flex items-center rounded border border-slate-800 bg-slate-950 text-[10px] font-mono text-slate-200">
+                    offset {offsetCents >= 0 ? "+" : ""}{offsetCents}¢
+                  </div>
+                </div>
+
                 <div className="mt-3 grid grid-cols-2 gap-3">
                   <Button disabled={placing !== "idle" || !bestBid} onClick={() => void placeLimitOrder("BUY")} className="hover:cursor-pointer h-10 font-bold bg-sky-500 hover:bg-sky-400 border-b-4 border-sky-700 hover:translate-y-0.5 hover:border-b-2 active:translate-y-1 active:border-b-0 transition-all text-white">
                     {placing === "buy" ? "..." : `BUY @ ${bestBid !== null ? formatCents(bestBid + offsetCents / 100, tickSize) : "—"}¢`}
@@ -603,25 +668,6 @@ export function OrderBookWidget({
                   </Button>
                 </div>
 
-                {/* {openOrders.length > 0 && (
-                  <div className="mt-3 border-t border-slate-800 pt-2 text-[10px] font-mono text-slate-400">
-                    <div className="flex items-center justify-between">
-                      <span>Open Orders</span>
-                      <span>{openOrders.length}</span>
-                    </div>
-                    <div className="mt-1 space-y-1">
-                      {openOrders.slice(0, 3).map((o) => (
-                        <div key={o.orderID} className="flex items-center justify-between">
-                          <span className={o.side === "BUY" ? "text-blue-300" : "text-red-300"}>
-                            {o.side}
-                          </span>
-                          <span>{formatCents(Number(o.price), tickSize)}¢</span>
-                          <span>{Number(o.size).toFixed(2)} sh</span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )} */}
               </div>
             </>
           )}

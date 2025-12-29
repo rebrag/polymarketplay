@@ -4,6 +4,8 @@ import { Badge } from "@/components/ui/badge";
 
 export interface PositionRow {
   asset: string;
+  oppositeAsset?: string;
+  oppositeOutcome?: string;
   size?: number | string;
   avgPrice?: number | string;
   currentValue?: number | string;
