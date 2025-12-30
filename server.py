@@ -206,7 +206,8 @@ class MarketRegistry:
         self._last_user_event_type = str(ev.get("type", ""))
         self._user_event_count += 1
         if str(ev.get("event_type", "")) == "trade":
-            print(f"User WS TRADE event: {ev}")
+            # Trade events are expected; avoid noisy logging during normal operation.
+            pass
         else:
             print(f"User WS event received (type={self._last_user_event_type})")
         event_type = str(ev.get("event_type", ""))
@@ -221,6 +222,8 @@ class MarketRegistry:
                 "size": str(ev.get("original_size", "")),
                 "side": str(ev.get("side", "")),
                 "asset_id": str(ev.get("asset_id", "")),
+                "market": str(ev.get("market", "")),
+                "outcome": str(ev.get("outcome", "")),
                 "expiration": int(float(ev.get("expiration", 0) or 0)),
                 "timestamp": int(ev.get("timestamp", 0) or 0),
                 "owner": str(ev.get("owner", "")),
@@ -239,26 +242,56 @@ class MarketRegistry:
             payloads: list[dict[str, object]] = []
             trade_id = str(ev.get("id", ""))
             trade_status = str(ev.get("status", ""))
-            for maker in maker_orders:
-                if not isinstance(maker, dict):
-                    continue
-                oid = str(maker.get("order_id", ""))
-                if not oid:
-                    continue
+            api_key = ""
+            try:
+                api_key = registry.poly_client.get_api_creds().api_key
+            except Exception:
+                api_key = ""
+
+            taker_order_id = str(ev.get("taker_order_id", ""))
+            trade_owner = str(ev.get("trade_owner", "")) or str(ev.get("owner", ""))
+            if api_key and taker_order_id and trade_owner == api_key:
                 order: Order = {
-                    "orderID": oid,
-                    "price": str(maker.get("price", "")),
-                    "size": str(maker.get("matched_amount", "")),
+                    "orderID": taker_order_id,
+                    "price": str(ev.get("price", "")),
+                    "size": str(ev.get("size", "")),
                     "side": str(ev.get("side", "")),
-                    "asset_id": str(maker.get("asset_id", "")) or str(ev.get("asset_id", "")),
+                    "asset_id": str(ev.get("asset_id", "")),
+                    "market": str(ev.get("market", "")),
+                    "outcome": str(ev.get("outcome", "")),
                     "expiration": 0,
                     "timestamp": int(ev.get("timestamp", 0) or 0),
-                    "owner": str(maker.get("owner", "")),
+                    "owner": trade_owner,
                     "hash": "",
                 }
                 payloads.append(
                     {"type": "closed", "order": order, "event": "TRADE", "trade_id": trade_id, "trade_status": trade_status}
                 )
+            else:
+                for maker in maker_orders:
+                    if not isinstance(maker, dict):
+                        continue
+                    if api_key and str(maker.get("owner", "")) != api_key:
+                        continue
+                    oid = str(maker.get("order_id", ""))
+                    if not oid:
+                        continue
+                    order: Order = {
+                        "orderID": oid,
+                        "price": str(maker.get("price", "")),
+                        "size": str(maker.get("matched_amount", "")),
+                        "side": str(maker.get("side", "")) or str(ev.get("side", "")),
+                        "asset_id": str(maker.get("asset_id", "")) or str(ev.get("asset_id", "")),
+                        "market": str(ev.get("market", "")),
+                        "outcome": str(maker.get("outcome", "")) or str(ev.get("outcome", "")),
+                        "expiration": 0,
+                        "timestamp": int(ev.get("timestamp", 0) or 0),
+                        "owner": str(maker.get("owner", "")),
+                        "hash": "",
+                    } 
+                    payloads.append(
+                        {"type": "closed", "order": order, "event": "TRADE", "trade_id": trade_id, "trade_status": trade_status}
+                    )
             if not payloads:
                 return
             for payload in payloads:
@@ -592,6 +625,8 @@ def _normalize_open_orders(raw_orders: list[dict[str, object]]) -> list[Order]:
             "size": str(size_val),
             "side": str(o.get("side", "")),
             "asset_id": str(o.get("asset_id") or o.get("assetId") or o.get("market") or ""),
+            "market": str(o.get("market", "")),
+            "outcome": str(o.get("outcome", "")),
             "expiration": int(o.get("expiration", 0) or 0),
             "timestamp": int(o.get("timestamp", 0) or o.get("created_at", 0) or 0),
             "owner": str(o.get("owner", "")),
@@ -732,13 +767,25 @@ def post_limit_order(req: LimitOrderRequest) -> dict[str, object]:
 class MarketOrderRequest(BaseModel):
     token_id: str = Field(min_length=1)
     side: Literal["BUY", "SELL"]
-    size: float = Field(gt=0)
+    amount: float = Field(gt=0)
+    fok_only: bool = False
 
 
 @app.post("/orders/market")
 def post_market_order(req: MarketOrderRequest) -> dict[str, object]:
     try:
+        if req.fok_only:
+            result = registry.poly_client.place_market_order(
+                token_id=req.token_id,
+                side=req.side,
+                size=req.amount,
+            )
+            return {"ok": True, "mode": "fok", "result": result}
+
         snapshot = registry.poly_client.get_order_book_snapshot(req.token_id)
+        best_price: float | None = None
+        total_liquidity = 0.0
+        size_shares = req.amount
         if snapshot:
             asks = snapshot.get("asks", []) if isinstance(snapshot, dict) else []
             bids = snapshot.get("bids", []) if isinstance(snapshot, dict) else []
@@ -746,14 +793,62 @@ def post_market_order(req: MarketOrderRequest) -> dict[str, object]:
                 raise HTTPException(status_code=400, detail="No asks available for market buy.")
             if req.side == "SELL" and not bids:
                 raise HTTPException(status_code=400, detail="No bids available for market sell.")
+            if req.side == "BUY":
+                best_price = float(asks[0]["price"])
+                total_liquidity = sum(float(a.get("size", 0)) for a in asks)
+                if best_price > 0:
+                    size_shares = req.amount / best_price
+            else:
+                best_price = float(bids[0]["price"])
+                total_liquidity = sum(float(b.get("size", 0)) for b in bids)
+
+        if best_price is not None and total_liquidity < size_shares:
+            result = registry.poly_client.place_limit_order(
+                token_id=req.token_id,
+                side=req.side,
+                size=size_shares,
+                price=best_price,
+                ttl_seconds=None,
+            )
+            return {
+                "ok": True,
+                "mode": "limit_fallback",
+                "note": "Insufficient immediate liquidity for market order; placed aggressive limit.",
+                "placed_price": best_price,
+                "result": result,
+            }
+
         result = registry.poly_client.place_market_order(
             token_id=req.token_id,
             side=req.side,
-            size=req.size,
+            size=req.amount,
         )
         return {"ok": True, "result": result}
     except Exception as e:
-        logger.exception("Market Order Error (token_id=%s side=%s size=%s)", req.token_id, req.side, req.size)
+        error_text = str(e)
+        if "no orders found to match" in error_text or "couldn't be fully filled" in error_text:
+            try:
+                best_price = registry.poly_client.get_best_price(req.token_id, "SELL" if req.side == "BUY" else "BUY")
+                size_shares = req.amount
+                if req.side == "BUY" and best_price > 0:
+                    size_shares = req.amount / best_price
+                result = registry.poly_client.place_limit_order(
+                    token_id=req.token_id,
+                    side=req.side,
+                    size=size_shares,
+                    price=best_price,
+                    ttl_seconds=None,
+                )
+                return {
+                    "ok": True,
+                    "mode": "limit_fallback",
+                    "note": "Market order had no immediate match; placed aggressive limit.",
+                    "placed_price": best_price,
+                    "result": result,
+                }
+            except Exception:
+                pass
+        logger.exception("Market Order Error (token_id=%s side=%s amount=%s)", req.token_id, req.side, req.amount)
         status = getattr(e, "status_code", 500)
         err_msg = getattr(e, "error_message", None)
         detail: object = {"error": str(e)}
@@ -836,12 +931,19 @@ async def orders_websocket_endpoint(websocket: WebSocket) -> None:
     registry._last_order_ws_accept_ts = time.time()
     last_open: dict[str, Order] = {}
     q: Queue[dict[str, object]] = Queue(maxsize=200)
-    registry.register_order_subscriber(q, asyncio.get_running_loop())
-    print(f"Orders WS registered (subscribers={len(registry._order_subs)})")
-    await websocket.send_json(
-        {"type": "status", "status": "subscribed", "pid": os.getpid(), "server_now": int(time.time())}
-    )
+    ping_task: asyncio.Task[None] | None = None
     try:
+        registry.register_order_subscriber(q, asyncio.get_running_loop())
+        print(f"Orders WS registered (subscribers={len(registry._order_subs)})")
+        await websocket.send_json(
+            {"type": "status", "status": "subscribed", "pid": os.getpid(), "server_now": int(time.time())}
+        )
+        async def _ping_loop() -> None:
+            while True:
+                await asyncio.sleep(15)
+                await websocket.send_json({"type": "ping", "server_now": int(time.time())})
+
+        ping_task = asyncio.create_task(_ping_loop())
         # Initial snapshot from open orders
         try:
             open_orders = await asyncio.to_thread(registry.poly_client.get_open_orders)
@@ -856,18 +958,24 @@ async def orders_websocket_endpoint(websocket: WebSocket) -> None:
         while True:
             msg = await q.get()
             msg["server_now"] = int(time.time())
-            await websocket.send_json(msg)
+            try:
+                await websocket.send_json(msg)
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                break
     except WebSocketDisconnect:
         print("Orders WS disconnected")
-        registry.unregister_order_subscriber(q)
-        return
     except Exception as e:
         print(f"Orders WS error: {e}")
+    finally:
+        registry.unregister_order_subscriber(q)
+        if ping_task is not None:
+            ping_task.cancel()
         try:
             await websocket.close()
         except Exception:
             pass
-        registry.unregister_order_subscriber(q)
 
 
 @app.websocket("/ws/{asset_id}")

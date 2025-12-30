@@ -4,6 +4,8 @@ import { Badge } from "@/components/ui/badge";
 export interface OrderView {
   orderID: string;
   asset_id: string;
+  market?: string;
+  outcome?: string;
   side: "BUY" | "SELL";
   price: string;
   size: string;
@@ -25,7 +27,7 @@ function formatPrice(price: string): string {
 export function OrdersPanel({ orders }: OrdersPanelProps) {
   const sorted = [...orders].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 12);
   return (
-    <Card className="border-slate-800 bg-slate-950/70">
+    <Card className="border-slate-800 bg-blue-950/90">
       <CardHeader className="py-3 px-4 border-b border-slate-800">
         <CardTitle className="text-xs uppercase tracking-widest text-slate-400">
           Orders

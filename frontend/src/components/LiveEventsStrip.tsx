@@ -143,7 +143,7 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
           <Input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search teams..."
+            placeholder={`Search ${filtered.length} games...`}
             className="h-7 w-44 bg-slate-900/60 border-slate-800 text-[10px] text-slate-200"
           />
         </div>
@@ -181,7 +181,7 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
           ref={trackRef}
           className="flex gap-3 overflow-hidden scroll-smooth px-0"
         >
-          {filtered.slice(0, 50).map((ev) => {
+          {filtered.slice(0, 500).map((ev) => {
             const isOn = subscribed.has(ev.slug);
             const status = getStatus(ev);
             const displayTime = getDisplayTime(ev);

@@ -139,6 +139,8 @@ class Order(TypedDict):
     size: str        # API returns decimal strings ("10.0")
     side: Literal["BUY", "SELL"]
     asset_id: str
+    market: NotRequired[str]
+    outcome: NotRequired[str]
     expiration: int
     timestamp: int
     owner: str

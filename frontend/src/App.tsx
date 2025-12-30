@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { OrderBookWidget, type UserPosition } from "./components/OrderBookWidget";
 // import { Input } from "@/components/ui/input";
 // import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Card, CardContent } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -55,9 +56,46 @@ type UserSocketMessage =
   | { type: "new_markets"; markets: Market[] }
   | { type: "recent_trades"; trades: Trade[] };
 
+function loadSettings(): {
+  defaultShares: string;
+  defaultTtl: string;
+  minVolume: number;
+  eventsWindowBefore: string;
+  eventsWindowAfter: string;
+  autoBuyMaxCents: string;
+  autoSellMinCents: string;
+} {
+  const fallback = {
+    defaultShares: "10",
+    defaultTtl: "8",
+    minVolume: 1000,
+    eventsWindowBefore: "3",
+    eventsWindowAfter: "24",
+    autoBuyMaxCents: "97",
+    autoSellMinCents: "103",
+  };
+  try {
+    const raw = localStorage.getItem("pm_settings");
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw) as Partial<typeof fallback>;
+    return {
+      defaultShares: typeof parsed.defaultShares === "string" ? parsed.defaultShares : fallback.defaultShares,
+      defaultTtl: typeof parsed.defaultTtl === "string" ? parsed.defaultTtl : fallback.defaultTtl,
+      minVolume: typeof parsed.minVolume === "number" ? parsed.minVolume : fallback.minVolume,
+      eventsWindowBefore: typeof parsed.eventsWindowBefore === "string" ? parsed.eventsWindowBefore : fallback.eventsWindowBefore,
+      eventsWindowAfter: typeof parsed.eventsWindowAfter === "string" ? parsed.eventsWindowAfter : fallback.eventsWindowAfter,
+      autoBuyMaxCents: typeof parsed.autoBuyMaxCents === "string" ? parsed.autoBuyMaxCents : fallback.autoBuyMaxCents,
+      autoSellMinCents: typeof parsed.autoSellMinCents === "string" ? parsed.autoSellMinCents : fallback.autoSellMinCents,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
 function App() {
+  const settings = useMemo(() => loadSettings(), []);
   const [url, setUrl] = useState("0x507e52ef684ca2dd91f90a9d26d149dd3288beae");
-  const [minVolume, setMinVolume] = useState(1000);
+  const [minVolume, setMinVolume] = useState(settings.minVolume);
   const [loading, setLoading] = useState(false);
   const [eventData, setEventData] = useState<EventData | null>(null);
   const [widgets, setWidgets] = useState<TokenWidget[]>([]);
@@ -74,6 +112,9 @@ function App() {
   const [showOrders, setShowOrders] = useState(false);
   const [closingOrders, setClosingOrders] = useState(false);
   const closeOrdersTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [showNotifications, setShowNotifications] = useState(false);
+  const [closingNotifications, setClosingNotifications] = useState(false);
+  const closeNotificationsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [closingSettings, setClosingSettings] = useState(false);
   const closeSettingsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -81,10 +122,12 @@ function App() {
   const cashSfxRef = useRef<HTMLAudioElement | null>(null);
   const prevCashRef = useRef<number | null>(null);
   const tradeSfxRef = useRef<HTMLAudioElement | null>(null);
-  const [defaultShares, setDefaultShares] = useState("10");
-  const [defaultTtl, setDefaultTtl] = useState("8");
-  const [eventsWindowBefore, setEventsWindowBefore] = useState("3");
-  const [eventsWindowAfter, setEventsWindowAfter] = useState("24");
+  const [defaultShares, setDefaultShares] = useState(settings.defaultShares);
+  const [defaultTtl, setDefaultTtl] = useState(settings.defaultTtl);
+  const [autoBuyMaxCents, setAutoBuyMaxCents] = useState(settings.autoBuyMaxCents);
+  const [autoSellMinCents, setAutoSellMinCents] = useState(settings.autoSellMinCents);
+  const [eventsWindowBefore, setEventsWindowBefore] = useState(settings.eventsWindowBefore);
+  const [eventsWindowAfter, setEventsWindowAfter] = useState(settings.eventsWindowAfter);
   const [liveEvents, setLiveEvents] = useState<EventData[]>([]);
   const [subscribedSlugs, setSubscribedSlugs] = useState<Set<string>>(new Set());
   const [orders, setOrders] = useState<OrderView[]>([]);
@@ -99,6 +142,16 @@ function App() {
   const seenTradeIdsRef = useRef<Set<string>>(new Set());
   const [draggedWidgetKey, setDraggedWidgetKey] = useState<string | null>(null);
   const [autoPairs, setAutoPairs] = useState<Set<string>>(new Set());
+  const [autoDisabledAssets, setAutoDisabledAssets] = useState<Set<string>>(new Set());
+  const [recentFills, setRecentFills] = useState<OrderView[]>([]);
+  const [bookQuotes, setBookQuotes] = useState<Record<string, { bid: number | null; ask: number | null }>>({});
+  const [ordersWsReconnectSeq, setOrdersWsReconnectSeq] = useState(0);
+  const ordersWsReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const ordersWsClosingRef = useRef(false);
+  const [tradeNotices, setTradeNotices] = useState<
+    { id: string; market: string; outcome: string; side: "BUY" | "SELL"; size: string; price: string; ts: number }[]
+  >([]);
+  const fetchAuthMetricsRef = useRef<() => void>(() => {});
 
   const [highlightedAsset, setHighlightedAsset] = useState<string | null>(null);
   const highlightTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -121,6 +174,47 @@ function App() {
     sfx.currentTime = 0;
     sfx.play().catch(() => {});
   }, []);
+
+  const assetLabels = useMemo(() => {
+    const map = new Map<string, { market: string; outcome: string }>();
+    widgets.forEach((w) => map.set(w.assetId, { market: w.marketQuestion, outcome: w.outcomeName }));
+    authPositions.forEach((p) => {
+      const market = p.title || "Unknown market";
+      const outcome = p.outcome || p.asset;
+      map.set(p.asset, { market, outcome });
+    });
+    return map;
+  }, [widgets, authPositions]);
+
+  const pushTradeNotice = useCallback(
+    (order: OrderView) => {
+      const label =
+        order.market || order.outcome
+          ? {
+              market: order.market || "Unknown market",
+              outcome: order.outcome || order.asset_id.slice(0, 10),
+            }
+          : assetLabels.get(order.asset_id) ?? {
+              market: "Unknown market",
+              outcome: order.asset_id.slice(0, 10),
+            };
+      const id = `${order.orderID}-${Date.now()}`;
+      const notice = {
+        id,
+        market: label.market,
+        outcome: label.outcome,
+        side: order.side,
+        size: order.size,
+        price: order.price,
+        ts: Date.now(),
+      };
+      setTradeNotices((prev) => [notice, ...prev].slice(0, 3));
+      window.setTimeout(() => {
+        setTradeNotices((prev) => prev.filter((n) => n.id !== id));
+      }, 6000);
+    },
+    [assetLabels]
+  );
 
   const handleCloseWidget = useCallback((assetId: string) => {
     dismissedAssetsRef.current = { ...dismissedAssetsRef.current, [assetId]: true };
@@ -163,21 +257,46 @@ function App() {
     });
   }, []);
 
+  const toggleAutoAsset = useCallback((assetId: string) => {
+    setAutoDisabledAssets((prev) => {
+      const next = new Set(prev);
+      if (next.has(assetId)) next.delete(assetId);
+      else next.add(assetId);
+      return next;
+    });
+  }, []);
+
   useEffect(() => {
     return () => {
       if (userSocketRef.current) userSocketRef.current.close();
+      if (ordersWsReconnectTimerRef.current) window.clearTimeout(ordersWsReconnectTimerRef.current);
+      ordersWsClosingRef.current = true;
       if (highlightTimeout.current) window.clearTimeout(highlightTimeout.current);
       if (closePositionsTimerRef.current) window.clearTimeout(closePositionsTimerRef.current);
       if (closeOrdersTimerRef.current) window.clearTimeout(closeOrdersTimerRef.current);
+      if (closeNotificationsTimerRef.current) window.clearTimeout(closeNotificationsTimerRef.current);
       if (closeSettingsTimerRef.current) window.clearTimeout(closeSettingsTimerRef.current);
     };
   }, []);
 
+  const handleBookUpdate = useCallback((assetId: string, bid: number | null, ask: number | null) => {
+    setBookQuotes((prev) => {
+      const next = { ...prev };
+      next[assetId] = { bid, ask };
+      return next;
+    });
+  }, []);
+
   useEffect(() => {
+    if (userSocketRef.current) {
+      userSocketRef.current.close();
+    }
+    ordersWsClosingRef.current = false;
     setOrdersWsStatus("connecting");
     setOrdersWsCloseInfo(null);
     setOrdersWsErrorInfo(null);
     const ws = new WebSocket("ws://localhost:8000/ws/user");
+    userSocketRef.current = ws;
 
     ws.onopen = () => {
       console.log("Orders WS open");
@@ -189,11 +308,30 @@ function App() {
       console.log("Orders WS closed", event);
       setOrdersWsStatus("closed");
       setOrdersWsCloseInfo(`code=${event.code} reason=${event.reason || "none"}`);
+      if (ordersWsClosingRef.current) return;
+      if (event.code === 1000 || event.code === 1005) {
+        return;
+      }
+      if (ordersWsReconnectTimerRef.current) {
+        window.clearTimeout(ordersWsReconnectTimerRef.current);
+      }
+      ordersWsReconnectTimerRef.current = window.setTimeout(
+        () => setOrdersWsReconnectSeq((prev) => prev + 1),
+        3000
+      );
     };
     ws.onerror = (event) => {
       console.error("Orders WS error", event);
       setOrdersWsStatus("error");
       setOrdersWsErrorInfo("WebSocket error");
+      if (ordersWsClosingRef.current) return;
+      if (ordersWsReconnectTimerRef.current) {
+        window.clearTimeout(ordersWsReconnectTimerRef.current);
+      }
+      ordersWsReconnectTimerRef.current = window.setTimeout(
+        () => setOrdersWsReconnectSeq((prev) => prev + 1),
+        1000
+      );
     };
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data) as
@@ -241,15 +379,23 @@ function App() {
                 if (first) seen.delete(first);
               }
               playTradeFilled();
-              window.setTimeout(() => {
-                void fetchAuthMetrics();
-              }, 2000);
+              pushTradeNotice(data.order);
+              setRecentFills((prev) => {
+                const next = [{ ...data.order, status: "closed", updatedAt: Date.now() }, ...prev];
+                return next.slice(0, 20);
+              });
+              fetchAuthMetricsRef.current();
+              window.setTimeout(() => fetchAuthMetricsRef.current(), 1000);
             }
           } else {
             playTradeFilled();
-            window.setTimeout(() => {
-              void fetchAuthMetrics();
-            }, 2000);
+            pushTradeNotice(data.order);
+            setRecentFills((prev) => {
+              const next = [{ ...data.order, status: "closed", updatedAt: Date.now() }, ...prev];
+              return next.slice(0, 20);
+            });
+            fetchAuthMetricsRef.current();
+            window.setTimeout(() => fetchAuthMetricsRef.current(), 1000);
           }
         }
         setOrders((prev) => {
@@ -289,9 +435,13 @@ function App() {
     };
 
     return () => {
+      ordersWsClosingRef.current = true;
       ws.close();
+      if (userSocketRef.current === ws) {
+        userSocketRef.current = null;
+      }
     };
-  }, []);
+  }, [ordersWsReconnectSeq]);
 
 
   useEffect(() => {
@@ -326,6 +476,56 @@ function App() {
       setSearchHistory([]);
     }
   }, []);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("pm_settings");
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as Partial<{
+        defaultShares: string;
+        defaultTtl: string;
+        minVolume: number;
+        eventsWindowBefore: string;
+        eventsWindowAfter: string;
+        autoBuyMaxCents: string;
+        autoSellMinCents: string;
+      }>;
+      if (typeof parsed.defaultShares === "string") setDefaultShares(parsed.defaultShares);
+      if (typeof parsed.defaultTtl === "string") setDefaultTtl(parsed.defaultTtl);
+      if (typeof parsed.minVolume === "number") setMinVolume(parsed.minVolume);
+      if (typeof parsed.eventsWindowBefore === "string") setEventsWindowBefore(parsed.eventsWindowBefore);
+      if (typeof parsed.eventsWindowAfter === "string") setEventsWindowAfter(parsed.eventsWindowAfter);
+      if (typeof parsed.autoBuyMaxCents === "string") setAutoBuyMaxCents(parsed.autoBuyMaxCents);
+      if (typeof parsed.autoSellMinCents === "string") setAutoSellMinCents(parsed.autoSellMinCents);
+    } catch {
+      // ignore bad local storage
+    }
+  }, []);
+
+  useEffect(() => {
+    const payload = {
+      defaultShares,
+      defaultTtl,
+      minVolume,
+      eventsWindowBefore,
+      eventsWindowAfter,
+      autoBuyMaxCents,
+      autoSellMinCents,
+    };
+    try {
+      localStorage.setItem("pm_settings", JSON.stringify(payload));
+    } catch {
+      // ignore storage failures
+    }
+  }, [
+    defaultShares,
+    defaultTtl,
+    minVolume,
+    eventsWindowBefore,
+    eventsWindowAfter,
+    autoBuyMaxCents,
+    autoSellMinCents,
+  ]);
 
   const pushHistory = useCallback((value: string) => {
     const trimmed = value.trim();
@@ -380,6 +580,9 @@ function App() {
       setAuthPositions([]);
     }
   }, []);
+  useEffect(() => {
+    fetchAuthMetricsRef.current = () => void fetchAuthMetrics();
+  }, [fetchAuthMetrics]);
 
   useEffect(() => {
     if (!activeAddress) return;
@@ -640,8 +843,55 @@ function App() {
     }, 200);
   };
 
+  const openNotifications = () => {
+    if (closeNotificationsTimerRef.current) window.clearTimeout(closeNotificationsTimerRef.current);
+    setClosingNotifications(false);
+    setShowNotifications(true);
+  };
+
+  const closeNotifications = () => {
+    setClosingNotifications(true);
+    if (closeNotificationsTimerRef.current) window.clearTimeout(closeNotificationsTimerRef.current);
+    closeNotificationsTimerRef.current = window.setTimeout(() => {
+      setShowNotifications(false);
+      setClosingNotifications(false);
+    }, 200);
+  };
+
   return (
   <div className="h-screen w-full bg-black font-sans text-slate-200 overflow-hidden flex flex-col">
+    {tradeNotices.length > 0 && (
+      <div className="fixed top-20 left-1/2 -translate-x-1/2 z-50 flex flex-col gap-3 items-center">
+        {tradeNotices.map((notice) => (
+          <Card key={notice.id} className="border-slate-800 bg-slate-950/90 shadow-lg w-[380px]">
+            <CardContent className="p-4 text-sm">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex flex-col min-w-0">
+                  <span className="text-slate-200 font-semibold truncate max-w-[300px]">
+                    {notice.market}
+                  </span>
+                  <span className="text-[11px] text-slate-400 truncate max-w-[300px]">
+                    {notice.outcome}
+                  </span>
+                </div>
+                <Badge
+                  className={`text-[10px] uppercase ${
+                    notice.side === "BUY"
+                      ? "bg-blue-600/20 text-blue-300"
+                      : "bg-red-600/20 text-red-300"
+                  }`}
+                >
+                  {notice.side}
+                </Badge>
+              </div>
+              <div className="mt-2 text-[11px] text-slate-400 font-mono">
+                {Number(notice.size).toFixed(2)} sh @ {(Number(notice.price) * 100).toFixed(2)}¢
+              </div>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
+    )}
     {/* Top Navbar with Integrated Search & Balance Monitor */}
     <Navbar 
       userAddress={url.startsWith("0x") ? url : "0x507e52ef684ca2dd91f90a9d26d149dd3288beae"}
@@ -668,8 +918,10 @@ function App() {
       })()}
       onPositionsClick={openPositions}
       onOrdersClick={openOrders}
+      onNotificationsClick={openNotifications}
       onSettingsClick={openSettings}
       ordersCount={orders.filter((o) => o.status === "open").length}
+      notificationsCount={recentFills.length}
       ordersWsStatus={ordersWsStatus}
       ordersWsEvents={ordersWsEvents}
       ordersWsLastType={ordersWsLastType}
@@ -756,6 +1008,25 @@ function App() {
           ).map(([pairKey, group]) => {
             const isPair = group.length >= 2;
             const isAutoOn = autoPairs.has(pairKey);
+            const buyLimit = Number(autoBuyMaxCents);
+            const sellLimit = Number(autoSellMinCents);
+            const buyThreshold = Number.isFinite(buyLimit) ? buyLimit : 97;
+            const sellThreshold = Number.isFinite(sellLimit) ? sellLimit : 103;
+            const assetIds = group.map((g) => g.assetId);
+            const pairBidSum =
+              assetIds.length >= 2
+                ? assetIds.reduce((sum, id) => sum + (bookQuotes[id]?.bid ?? NaN), 0)
+                : NaN;
+            const pairAskSum =
+              assetIds.length >= 2
+                ? assetIds.reduce((sum, id) => sum + (bookQuotes[id]?.ask ?? NaN), 0)
+                : NaN;
+            const buyAllowedForPair = Number.isFinite(pairBidSum)
+              ? pairBidSum * 100 <= buyThreshold
+              : false;
+            const sellAllowedForPair = Number.isFinite(pairAskSum)
+              ? pairAskSum * 100 >= sellThreshold
+              : false;
             return (
               <div
                 key={pairKey}
@@ -807,7 +1078,13 @@ function App() {
                     const heldPosition = authPositions.find((p) => p.asset === w.assetId);
             const heldShares = heldPosition ? Number(heldPosition.size) : null;
             const heldAvg = heldPosition ? Number(heldPosition.avgPrice) : null;
-            const openOrders = orders.filter((o) => o.asset_id === w.assetId && o.status === "open");
+                    const otherAssetId = group.find((g) => g.assetId !== w.assetId)?.assetId;
+                    const otherHeldPosition = otherAssetId
+                      ? authPositions.find((p) => p.asset === otherAssetId)
+                      : undefined;
+                    const otherHeldShares = otherHeldPosition ? Number(otherHeldPosition.size) : null;
+                    const openOrders = orders.filter((o) => o.asset_id === w.assetId && o.status === "open");
+                    const isAutoAssetOn = isAutoOn && !autoDisabledAssets.has(w.assetId);
 
             // High-density optimization: first 10 books are "full", rest are "mini"
             const isFullMode = index < 10;
@@ -847,15 +1124,25 @@ function App() {
                   userPosition={userPos}
                   positionShares={Number.isFinite(heldShares ?? NaN) ? heldShares : null}
                   positionAvgPrice={Number.isFinite(heldAvg ?? NaN) ? heldAvg : null}
+                  otherAssetPositionShares={
+                    Number.isFinite(otherHeldShares ?? NaN) ? otherHeldShares : null
+                  }
                   openOrders={openOrders}
                   ordersServerNowSec={ordersServerNowSec}
                   ordersServerNowLocalMs={ordersServerNowLocalMs}
                   defaultShares={defaultShares}
                   defaultTtl={defaultTtl}
-                  auto={isAutoOn}
+                  auto={isAutoAssetOn}
+                  autoBuyAllowed={buyAllowedForPair}
+                  autoSellAllowed={sellAllowedForPair}
+                  onHeaderClick={() => {
+                    if (!isAutoOn) return;
+                    toggleAutoAsset(w.assetId);
+                  }}
                   isHighlighted={highlightedAsset === w.assetId}
                   viewMode={isFullMode ? "full" : "mini"}
                   onClose={isPair ? undefined : handleCloseWidget}
+                  onBookUpdate={handleBookUpdate}
                   apiBaseUrl="http://localhost:8000"
                 />
               </div>
@@ -951,6 +1238,66 @@ function App() {
         </div>
       </div>
     )}
+    {showNotifications && (
+      <div
+        className={`fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm transition-opacity duration-200 ${closingNotifications ? "opacity-0" : "opacity-100"}`}
+        onClick={closeNotifications}
+      >
+        <div
+          className={`relative w-[95vw] max-w-xl transition-all duration-200 ${closingNotifications ? "scale-95 opacity-0" : "scale-100 opacity-100"}`}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="absolute right-3 top-3 z-10">
+            <Button
+              onClick={closeNotifications}
+              className="h-8 w-8 rounded-full border border-slate-800 bg-slate-950 text-slate-300 hover:text-white"
+            >
+              X
+            </Button>
+          </div>
+          <Card className="border-slate-800 bg-slate-950/70">
+            <CardContent className="p-4 space-y-3 text-xs">
+              <div className="text-[10px] uppercase tracking-widest text-slate-400">
+                Recent Fills
+              </div>
+              {recentFills.length === 0 ? (
+                <div className="text-slate-500">No filled orders yet</div>
+              ) : (
+                recentFills.map((fill) => (
+                  <div
+                    key={`${fill.orderID}-${fill.updatedAt}`}
+                    className="flex items-center justify-between border border-slate-800 rounded px-2 py-2"
+                  >
+                    <div className="flex flex-col min-w-0">
+                      <span className="text-slate-200 font-semibold truncate max-w-[320px]">
+                        {fill.market || "Unknown market"}
+                      </span>
+                      <span className="text-[11px] text-slate-400 truncate max-w-[320px]">
+                        {fill.outcome || fill.asset_id}
+                      </span>
+                    </div>
+                    <div className="flex flex-col items-end gap-1">
+                      <Badge
+                        className={`text-[9px] uppercase ${
+                          fill.side === "BUY"
+                            ? "bg-blue-600/20 text-blue-300"
+                            : "bg-red-600/20 text-red-300"
+                        }`}
+                      >
+                        {fill.side}
+                      </Badge>
+                      <span className="text-[10px] text-slate-400 font-mono">
+                        {Number(fill.size).toFixed(2)} sh @ {(Number(fill.price) * 100).toFixed(2)}¢
+                      </span>
+                    </div>
+                  </div>
+                ))
+              )}
+            </CardContent>
+          </Card>
+        </div>
+      </div>
+    )}
     {showSettings && (
       <div
         className={`fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm transition-opacity duration-200 ${closingSettings ? "opacity-0" : "opacity-100"}`}
@@ -998,6 +1345,26 @@ function App() {
                 onFocus={(e) => e.currentTarget.select()}
                 className="h-8 bg-black border-slate-800 font-mono text-sm"
               />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1">
+                <label className="text-[10px] text-slate-500 uppercase font-bold">Auto Buy Max (¢)</label>
+                <Input
+                  value={autoBuyMaxCents}
+                  onChange={(e) => setAutoBuyMaxCents(e.target.value)}
+                  onFocus={(e) => e.currentTarget.select()}
+                  className="h-8 bg-black border-slate-800 font-mono text-sm"
+                />
+              </div>
+              <div className="space-y-1">
+                <label className="text-[10px] text-slate-500 uppercase font-bold">Auto Sell Min (¢)</label>
+                <Input
+                  value={autoSellMinCents}
+                  onChange={(e) => setAutoSellMinCents(e.target.value)}
+                  onFocus={(e) => e.currentTarget.select()}
+                  className="h-8 bg-black border-slate-800 font-mono text-sm"
+                />
+              </div>
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-1">

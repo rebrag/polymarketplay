@@ -535,6 +535,7 @@ class PolyClient:
         token_id: str,
         side: Side,
         size: float,
+        order_type: OrderType = OrderType.FOK,
     ) -> dict[str, Any]:
         """
         Places a MARKET order using a FOK order type.
@@ -548,7 +549,7 @@ class PolyClient:
         price: float | None = None
         try:
             price = client.calculate_market_price(
-                token_id, side=side.lower(), amount=size, order_type=OrderType.FAK
+                token_id, side=side.lower(), amount=size, order_type=order_type
             )  # type: ignore
         except Exception:
             price = None
@@ -569,10 +570,10 @@ class PolyClient:
             amount=size,
             side=side_const,
             price=float(price),
-            order_type=OrderType.FAK,
+            order_type=order_type,
         )
         signed = client.create_market_order(order)  # type: ignore
-        resp = client.post_order(signed, OrderType.FAK)  # type: ignore
+        resp = client.post_order(signed, order_type)  # type: ignore
 
         if isinstance(resp, dict):
             return cast(dict[str, Any], resp)

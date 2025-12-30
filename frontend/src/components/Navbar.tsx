@@ -15,8 +15,10 @@ interface NavbarProps {
   positionsCount?: number | null;
   onPositionsClick?: () => void;
   onOrdersClick?: () => void;
+  onNotificationsClick?: () => void;
   onSettingsClick?: () => void;
   ordersCount?: number | null;
+  notificationsCount?: number | null;
   ordersWsStatus?: "connecting" | "open" | "closed" | "error";
   ordersWsEvents?: number;
   ordersWsLastType?: string | null;
@@ -45,8 +47,10 @@ export function Navbar({
   positionsCount,
   onPositionsClick,
   onOrdersClick,
+  onNotificationsClick,
   onSettingsClick,
   ordersCount,
+  notificationsCount,
 //   ordersWsStatus,
 //   ordersWsEvents,
 //   ordersWsLastType,
@@ -147,6 +151,34 @@ export function Navbar({
           </span>
         </div>
         <div className="flex items-center gap-2">
+          <Button
+            onClick={onNotificationsClick}
+            className={`h-7 w-10 px-0 text-[10px] uppercase font-bold border transition-colors flex items-center justify-center relative ${
+              notificationsCount
+                ? "border-blue-500/60 bg-blue-500/10 text-blue-200 hover:border-blue-400"
+                : "border-slate-800 bg-slate-950 text-slate-200 hover:text-white hover:border-slate-700"
+            }`}
+            aria-label="Notifications"
+          >
+            <svg
+              className="h-4 w-4"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M15 17h5l-1.4-1.4A2 2 0 0 1 18 14.2V11a6 6 0 1 0-12 0v3.2a2 2 0 0 1-.6 1.4L4 17h5" />
+              <path d="M9 17a3 3 0 0 0 6 0" />
+            </svg>
+            {notificationsCount ? (
+              <>
+                <span className="absolute -top-1 -right-1 h-2 w-2 rounded-full bg-blue-500 animate-pulse" />
+                <span className="ml-1 text-[9px] text-blue-200 font-mono">{notificationsCount}</span>
+              </>
+            ) : null}
+          </Button>
           <div className="flex flex-col items-end gap-0.5">
             <Button
               onClick={onPositionsClick}
