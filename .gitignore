@@ -5,3 +5,4 @@ polymarket_bot.egg-info
 frontend/node_modules
 frontend/public
 typings
+logs

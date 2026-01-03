@@ -24,7 +24,7 @@ def _env(name: str) -> str:
 def main() -> None:
     private_key = _env("POLY_KEY")
     funder = _env("POLY_FUNDER")  # address that holds funds (proxy/smart wallet for Magic users)
-    token_id = "98390491357843733372462783020445622682606187748270339909077317942111035675836"  # outcome token (ERC1155 token id)
+    token_id = "75629705399315100429782801927688804009370855830465152723321991275574948545131"  # outcome token (ERC1155 token id)
 
     client = ClobClient(
         HOST,
@@ -35,7 +35,7 @@ def main() -> None:
     )
     client.set_api_creds(client.create_or_derive_api_creds())
 
-    usdc_amount = 10.0
+    usdc_amount = 5.0
     mo = MarketOrderArgs(
         token_id=token_id,
         amount=usdc_amount,        # BUY: amount is dollars (USDC)

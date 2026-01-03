@@ -18,6 +18,7 @@ interface BookState {
   bids: OrderLevel[];
   asks: OrderLevel[];
   tick_size: number;
+  last_trade?: LastTrade;
 }
 
 export interface UserPosition {
@@ -39,6 +40,8 @@ interface WidgetProps {
   assetId: string;
   outcomeName: string;
   volume: number;
+  marketQuestion?: string;
+  sourceSlug?: string;
   userPosition?: UserPosition | null;
   positionShares?: number | null;
   positionAvgPrice?: number | null;
@@ -51,14 +54,23 @@ interface WidgetProps {
   auto?: boolean;
   autoBuyAllowed?: boolean;
   autoSellAllowed?: boolean;
+  autoTradeSide?: "BUY" | "SELL";
+  autoMode?: "client" | "server";
   isHighlighted?: boolean;
   viewMode?: "full" | "mini";
   onBookUpdate?: (assetId: string, bestBid: number | null, bestAsk: number | null) => void;
   onHeaderClick?: (assetId: string) => void;
   onClose?: (assetId: string) => void;
   apiBaseUrl?: string;
+  onAutoSettingsChange?: (assetId: string, settings: { shares: number; ttl: number; level: number }) => void;
 }
 
+interface LastTrade {
+  price: number;
+  size: number;
+  side: "BUY" | "SELL";
+  timestamp: number;
+}
 /* ---------- Strict Runtime Guards ---------- */
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null;
@@ -77,12 +89,30 @@ function parseBookState(payload: unknown): BookState | null {
   if (typeof ready !== "boolean" || typeof msg_count !== "number") return null;
   if (!Array.isArray(bids) || !Array.isArray(asks)) return null;
 
+  let lastTrade: LastTrade | undefined;
+  const rawLast = (payload as { last_trade?: unknown }).last_trade;
+  if (isRecord(rawLast)) {
+    const price = Number(rawLast.price);
+    const size = Number(rawLast.size);
+    const timestamp = Number(rawLast.timestamp);
+    const side = String(rawLast.side || "").toUpperCase();
+    if (
+      Number.isFinite(price) &&
+      Number.isFinite(size) &&
+      Number.isFinite(timestamp) &&
+      (side === "BUY" || side === "SELL")
+    ) {
+      lastTrade = { price, size, timestamp, side } as LastTrade;
+    }
+  }
+
   return {
     ready,
     msg_count,
     bids: bids.filter(isOrderLevel),
     asks: asks.filter(isOrderLevel),
     tick_size: typeof tick_size === "number" ? tick_size : 0.01,
+    last_trade: lastTrade,
   };
 }
 
@@ -109,8 +139,10 @@ function clampInt(n: number, min: number, max: number): number {
 
 function decimalsForTick(tickSize: number): number {
   if (!Number.isFinite(tickSize) || tickSize <= 0) return 2;
-  const log = Math.round(-Math.log10(tickSize));
-  return Math.max(0, Math.min(6, log));
+  const text = tickSize.toFixed(10).replace(/0+$/, "");
+  const parts = text.split(".");
+  const decimals = parts.length > 1 ? parts[1].length : 0;
+  return Math.max(0, Math.min(6, decimals));
 }
 
 function formatPrice(price: number, tickSize: number): string {
@@ -138,6 +170,8 @@ export function OrderBookWidget({
   assetId,
   outcomeName,
   volume,
+  marketQuestion,
+  // sourceSlug,
   userPosition,
   positionShares,
   positionAvgPrice,
@@ -150,12 +184,16 @@ export function OrderBookWidget({
   auto = false,
   autoBuyAllowed = true,
   autoSellAllowed = true,
+  autoTradeSide,
+  autoMode = "client",
   isHighlighted,
   viewMode = "full",
   onBookUpdate,
   onHeaderClick,
   onClose,
   apiBaseUrl = "http://localhost:8000",
+  sourceSlug,
+  onAutoSettingsChange,
 }: WidgetProps) {
   const [data, setData] = useState<BookState | null>(null);
   const [status, setStatus] = useState<"connecting" | "live" | "error">("connecting");
@@ -163,8 +201,16 @@ export function OrderBookWidget({
   
   const ws = useRef<WebSocket | null>(null);
   const spreadRef = useRef<HTMLTableRowElement>(null);
-  const hasScrolledRef = useRef(false);
+  const lastSpreadScrollRef = useRef(0);
   const autoPlacedRef = useRef(false); // Track if auto order has been placed
+  const lastParseErrorRef = useRef(0);
+  const parseErrorCountRef = useRef(0);
+  const scrollTimerRef = useRef<number | null>(null);
+  const lastTradeTsRef = useRef(0);
+  // const tradeFlashTimerRef = useRef<number | null>(null);
+  const [tradeFlashes, setTradeFlashes] = useState<
+    Array<{ value: number; side: "BUY" | "SELL"; timestamp: number }>
+  >([]);
 
   const [sharesRaw, setSharesRaw] = useState(defaultShares);
   const [ttlRaw, setTtlRaw] = useState(defaultTtl);
@@ -188,6 +234,15 @@ export function OrderBookWidget({
   useEffect(() => {
     onBookUpdate?.(assetId, bestBid, bestAsk);
   }, [assetId, bestBid, bestAsk, onBookUpdate]);
+  const tradeFlashLabels = useMemo(() => {
+    return tradeFlashes
+      .filter((flash) => Number.isFinite(flash.value) && flash.value > 0)
+      .map((flash) => {
+        const sign = flash.side === "BUY" ? "+" : "-";
+        return { ...flash, label: `${sign}$${flash.value.toFixed(0)}` };
+      });
+  }, [tradeFlashes]);
+
   const openOrderMap = useMemo(() => {
     const buys = new Map<string, number>();
     const sells = new Map<string, number>();
@@ -236,6 +291,17 @@ export function OrderBookWidget({
   }, [serverOffsetSec, shouldTick]);
 
   useEffect(() => {
+    if (!onAutoSettingsChange) return;
+    const shares = Number(sharesRaw);
+    const ttl = Number(ttlRaw);
+    onAutoSettingsChange(assetId, {
+      shares: Number.isFinite(shares) ? shares : 0,
+      ttl: Number.isFinite(ttl) ? ttl : 0,
+      level,
+    });
+  }, [assetId, level, onAutoSettingsChange, sharesRaw, ttlRaw]);
+
+  useEffect(() => {
     if (!sharesTouched) setSharesRaw(defaultShares);
   }, [defaultShares, sharesTouched]);
 
@@ -254,58 +320,122 @@ export function OrderBookWidget({
     [nowSec]
   );
 
-  // Fix 1: WebSocket Cleanup and Reference Guarding
   useEffect(() => {
     let isMounted = true;
-    const socket = new WebSocket(`ws://localhost:8000/ws/${assetId}`);
-    ws.current = socket;
+    let reconnectTimer: number | null = null;
+    let reconnectAttempts = 0;
 
-    socket.onopen = () => { if (isMounted) setStatus("live"); };
-    socket.onclose = () => { if (isMounted) setStatus("connecting"); };
-    socket.onerror = () => { if (isMounted) setStatus("error"); };
-    
-    socket.onmessage = (event) => {
-      if (!isMounted) return;
-      try {
-        const parsed: unknown = JSON.parse(event.data);
-        const next = parseBookState(parsed);
-        if (next) setData(next);
-      } catch (e) {
-        console.error("Failed to parse WS message", e);
-      }
+    const params = new URLSearchParams();
+    if (sourceSlug) params.set("slug", sourceSlug);
+    if (marketQuestion) params.set("market_question", marketQuestion);
+    if (outcomeName) params.set("outcome", outcomeName);
+
+    const scheduleReconnect = () => {
+      if (reconnectTimer !== null || !isMounted) return;
+      const backoff = Math.min(5000, 500 * Math.pow(2, reconnectAttempts));
+      const jitter = Math.floor(Math.random() * 250);
+      reconnectAttempts += 1;
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, backoff + jitter);
     };
+
+    const connect = () => {
+      if (!isMounted) return;
+      setStatus("connecting");
+      const socket = new WebSocket(`ws://localhost:8000/ws/${assetId}?${params.toString()}`);
+      ws.current = socket;
+
+      socket.onopen = () => {
+        reconnectAttempts = 0;
+        if (isMounted) setStatus("live");
+      };
+      socket.onclose = () => {
+        if (isMounted) setStatus("connecting");
+        scheduleReconnect();
+      };
+      socket.onerror = () => {
+        if (isMounted) setStatus("error");
+      };
+
+      socket.onmessage = (event) => {
+        if (!isMounted) return;
+        try {
+          if (typeof event.data !== "string") return;
+          const trimmed = event.data.trim();
+          if (!trimmed || (trimmed[0] !== "{" && trimmed[0] !== "[")) return;
+          const parsed: unknown = JSON.parse(trimmed);
+          const next = parseBookState(parsed);
+          if (next) setData(next);
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        } catch (e) {
+          parseErrorCountRef.current += 1;
+          lastParseErrorRef.current = Date.now();
+        }
+      };
+    };
+
+    connect();
 
     return () => {
       isMounted = false;
-      // Explicitly nulling handlers helps garbage collection
-      socket.onopen = null;
-      socket.onclose = null;
-      socket.onerror = null;
-      socket.onmessage = null;
-      socket.close();
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+      }
+      const socket = ws.current;
+      if (socket) {
+        socket.onopen = null;
+        socket.onclose = null;
+        socket.onerror = null;
+        socket.onmessage = null;
+        socket.close();
+      }
       ws.current = null;
     };
-  }, [assetId]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [assetId, marketQuestion, outcomeName, sourceSlug]);
 
-  // Fix 2: Timer Cleanup for Auto-Scrolling
   useEffect(() => {
-    let scrollTimer: number | null = null;
-
-    if (viewMode === "full" && data?.ready && spreadRef.current && !hasScrolledRef.current) {
-      scrollTimer = window.setTimeout(() => {
-        const row = spreadRef.current;
-        const viewport = row?.closest("[data-radix-scroll-area-viewport]") as HTMLElement | null;
-        if (row && viewport) {
-          viewport.scrollTop = row.offsetTop - viewport.clientHeight / 2 + row.offsetHeight / 2;
-          hasScrolledRef.current = true;
-        }
-      }, 100);
+    if (viewMode !== "full" || !data?.ready || !spreadRef.current) return;
+    const now = Date.now();
+    if (now - lastSpreadScrollRef.current < 200) return;
+    lastSpreadScrollRef.current = now;
+    if (scrollTimerRef.current !== null) {
+      window.clearTimeout(scrollTimerRef.current);
     }
-
+    scrollTimerRef.current = window.setTimeout(() => {
+      const row = spreadRef.current;
+      const viewport = row?.closest("[data-radix-scroll-area-viewport]") as HTMLElement | null;
+      if (row && viewport) {
+        viewport.scrollTop = row.offsetTop - viewport.clientHeight / 2 + row.offsetHeight / 2;
+      }
+      scrollTimerRef.current = null;
+    }, 0);
     return () => {
-      if (scrollTimer) window.clearTimeout(scrollTimer);
+      if (scrollTimerRef.current !== null) {
+        window.clearTimeout(scrollTimerRef.current);
+        scrollTimerRef.current = null;
+      }
     };
-  }, [data?.ready, viewMode]);
+  }, [data?.ready, data?.asks.length, data?.bids.length, viewMode]);
+
+  useEffect(() => {
+    const last = data?.last_trade;
+    if (!last) return;
+    if (!Number.isFinite(last.timestamp) || last.timestamp <= 0) return;
+    if (last.timestamp === lastTradeTsRef.current) return;
+    lastTradeTsRef.current = last.timestamp;
+    const value = Math.max(0, last.price * last.size);
+    const flash = { value, side: last.side, timestamp: last.timestamp };
+    setTradeFlashes((prev) => [flash, ...prev].slice(0, 5));
+    const timerId = window.setTimeout(() => {
+      setTradeFlashes((prev) => prev.filter((item) => item.timestamp !== last.timestamp));
+    }, 3000);
+    return () => {
+      window.clearTimeout(timerId);
+    };
+  }, [data?.last_trade]);
 
   const placeLimitOrder = async (side: "BUY" | "SELL"): Promise<void> => {
     try {
@@ -458,29 +588,34 @@ export function OrderBookWidget({
 
   // Determine which side to trade based on exposure
   const getAutoTradeSide = useCallback((): "BUY" | "SELL" => {
+    const currentPosition = positionShares ?? 0;
+    const otherPosition = otherAssetPositionShares ?? 0;
+    // New rule: if both legs hold at least 20 shares, favor selling to reduce exposure on both.
+    if (currentPosition >= 20 && otherPosition >= 20) {
+      return "SELL";
+    }
+
     const exposureDiff = getExposureDifference();
     
     // If we have more than 20 shares of this asset compared to the other
     if (exposureDiff >= 20) {
-      console.log(`Overexposed by ${exposureDiff} shares, placing SELL order`);
       return "SELL"; // Sell to reduce exposure
     } 
     // If we have more than 20 shares less of this asset compared to the other
     else if (exposureDiff <= -20) {
-      console.log(`Underexposed by ${Math.abs(exposureDiff)} shares, placing BUY order`);
       return "BUY"; // Buy to increase exposure
     }
     // Within acceptable range, place BUY order by default
     else {
-      console.log(`Balanced (difference: ${exposureDiff} shares), placing BUY order`);
       return "BUY";
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [getExposureDifference]);
 
   // NEW: Auto-trading logic - place order when auto is true and no open orders exist
   useEffect(() => {
     // Only run in full view mode with auto enabled
-    if (viewMode !== "full" || !auto) {
+    if (autoMode === "server" || viewMode !== "full" || !auto) {
       autoPlacedRef.current = false; // Reset when auto is disabled
       return;
     }
@@ -493,11 +628,10 @@ export function OrderBookWidget({
       // If no open orders and we haven't placed an auto order yet
       if (!hasOpenOrders && !autoPlacedRef.current && placing === "idle") {
         // Determine which side to trade based on exposure
-        const tradeSide = getAutoTradeSide();
+        const tradeSide = autoTradeSide ?? getAutoTradeSide();
         if (tradeSide === "BUY" && !autoBuyAllowed) return;
         if (tradeSide === "SELL" && !autoSellAllowed) return;
 
-        console.log(`Auto-trading: Placing ${tradeSide} limit order for ${assetId}`);
         autoPlacedRef.current = true; // Mark as placed
         placeLimitOrder(tradeSide).catch(console.error);
       } else if (hasOpenOrders) {
@@ -505,6 +639,7 @@ export function OrderBookWidget({
         autoPlacedRef.current = false;
       }
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     data?.ready, 
     bestBid, 
@@ -514,15 +649,16 @@ export function OrderBookWidget({
     viewMode, 
     placing, 
     assetId,
+    autoTradeSide,
     getAutoTradeSide, // Add dependency
   ]);
 
   // NEW: Reset auto placement flag when auto prop changes
   useEffect(() => {
-    if (!auto) {
+    if (!auto || autoMode === "server") {
       autoPlacedRef.current = false;
     }
-  }, [auto]);
+  }, [auto, autoMode]);
 
   // Add exposure indicator to the UI
   const exposureDiff = useMemo(() => getExposureDifference(), [getExposureDifference]);
@@ -536,9 +672,14 @@ export function OrderBookWidget({
     try {
       const amountNum = Number(sharesRaw);
       if (!Number.isFinite(amountNum) || amountNum <= 0) return;
+      const bestAskNum = typeof bestAsk === "number" ? bestAsk : null;
+      const rawMarketAmount =
+        side === "BUY" && bestAskNum && bestAskNum > 0 ? amountNum * bestAskNum : amountNum;
+      const marketAmount =
+        side === "BUY" ? Math.max(rawMarketAmount - 0.02, 0.01) : rawMarketAmount;
       const confirmText =
         side === "BUY"
-          ? `Market BUY $${amountNum} USDC at best ask?`
+          ? `Market BUY $${marketAmount.toFixed(2)} USDC at best ask?`
           : `Market SELL ${amountNum} shares at best bid?`;
       if (!window.confirm(confirmText)) return;
 
@@ -548,7 +689,7 @@ export function OrderBookWidget({
         body: JSON.stringify({
           token_id: assetId,
           side,
-          amount: amountNum,
+          amount: marketAmount,
           fok_only: true,
         }),
       });
@@ -588,18 +729,7 @@ export function OrderBookWidget({
     setTimeout(() => setCopied(false), 900);
   }, [assetId]);
 
-  useEffect(() => {
-    if (viewMode === "full" && data?.ready && spreadRef.current && !hasScrolledRef.current) {
-      window.setTimeout(() => {
-        const row = spreadRef.current;
-        const viewport = row?.closest("[data-radix-scroll-area-viewport]") as HTMLElement | null;
-        if (row && viewport) {
-          viewport.scrollTop = row.offsetTop - viewport.clientHeight / 2 + row.offsetHeight / 2;
-          hasScrolledRef.current = true;
-        }
-      }, 100);
-    }
-  }, [data?.ready, viewMode]);
+ 
 
   // const placeLimitOrder = async (side: "BUY" | "SELL"): Promise<void> => {
   //   try {
@@ -681,6 +811,27 @@ export function OrderBookWidget({
             </div>
           </CardContent>
         </Card>
+        {tradeFlashLabels.map((flash, idx) => (
+          <div
+            key={`trade-${flash.timestamp}`}
+            className={`pointer-events-none absolute left-4 top-4 text-sm font-bold ${
+              flash.side === "BUY" ? "text-emerald-400" : "text-red-400"
+            } trade-flash`}
+            style={{ ["--flash-offset" as string]: `${idx * 16}px` }}
+          >
+            {flash.label}
+          </div>
+        ))}
+        <style>{`
+          @keyframes trade-flash-rise {
+            0% { opacity: 0; transform: translateY(calc(var(--flash-offset) + 6px)); }
+            15% { opacity: 1; transform: translateY(var(--flash-offset)); }
+            100% { opacity: 0; transform: translateY(calc(var(--flash-offset) - 10px)); }
+          }
+          .trade-flash {
+            animation: trade-flash-rise 3s ease-out forwards;
+          }
+        `}</style>
       </div>
     );
   }
@@ -915,6 +1066,27 @@ export function OrderBookWidget({
           )}
         </CardContent>
       </Card>
+      {tradeFlashLabels.map((flash, idx) => (
+        <div
+          key={`trade-${flash.timestamp}`}
+          className={`pointer-events-none absolute left-4 top-4 text-sm font-bold ${
+            flash.side === "BUY" ? "text-emerald-400" : "text-red-400"
+          } trade-flash`}
+          style={{ ["--flash-offset" as string]: `${idx * 16}px` }}
+        >
+          {flash.label}
+        </div>
+      ))}
+      <style>{`
+        @keyframes trade-flash-rise {
+          0% { opacity: 0; transform: translateY(calc(var(--flash-offset) + 6px)); }
+          15% { opacity: 1; transform: translateY(var(--flash-offset)); }
+          100% { opacity: 0; transform: translateY(calc(var(--flash-offset) - 10px)); }
+        }
+        .trade-flash {
+          animation: trade-flash-rise 3s ease-out forwards;
+        }
+      `}</style>
     </div>
   );
 }

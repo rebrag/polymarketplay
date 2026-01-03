@@ -19,6 +19,7 @@ from src.models import (
     WebSocketAppProto,
     WsBookMessage,
     WsPriceChangeMessage,
+    WsLastTradePriceMessage,
     WsTickSizeChangeMessage,
 )
 
@@ -45,6 +46,9 @@ class PriceChangeCallback(Protocol):
 
 class TickSizeCallback(Protocol):
     def __call__(self, msg: WsTickSizeChangeMessage) -> None: ...
+
+class LastTradeCallback(Protocol):
+    def __call__(self, msg: WsLastTradePriceMessage) -> None: ...
 
 
 Side = Literal["BUY", "SELL"]
@@ -545,31 +549,18 @@ class PolyClient:
 
         side_const = BUY if side == "BUY" else SELL
         client = self._get_trading_clob_client()
-
-        price: float | None = None
         try:
-            price = client.calculate_market_price(
-                token_id, side=side.lower(), amount=size, order_type=order_type
-            )  # type: ignore
+            creds = client.create_or_derive_api_creds()  # type: ignore
+            client.set_api_creds(creds)  # type: ignore
+            self._api_creds = creds
         except Exception:
-            price = None
-
-        if not price or price <= 0:
-            if side == "BUY":
-                best_ask = self.get_best_price(token_id, "SELL")
-                price = best_ask + 0.01
-            else:
-                best_bid = self.get_best_price(token_id, "BUY")
-                price = best_bid - 0.01
-
-        # Market order price must be within [0.01, 0.99] per CLOB rules.
-        price = max(0.01, min(0.99, float(price)))
+            # Fallback to existing creds if re-derive fails.
+            pass
 
         order = MarketOrderArgs(
             token_id=token_id,
             amount=size,
             side=side_const,
-            price=float(price),
             order_type=order_type,
         )
         signed = client.create_market_order(order)  # type: ignore
@@ -654,6 +645,7 @@ class PolySocket:
         self.on_book: BookCallback | None = None
         self.on_price_change: PriceChangeCallback | None = None
         self.on_tick_size_change: TickSizeCallback | None = None
+        self.on_last_trade: LastTradeCallback | None = None
 
     def start(self) -> None:
         self.keep_running = True
@@ -728,6 +720,8 @@ class PolySocket:
 
             elif etype == "tick_size_change" and self.on_tick_size_change:
                 self.on_tick_size_change(cast(WsTickSizeChangeMessage, ev))
+            elif etype == "last_trade_price" and self.on_last_trade:
+                self.on_last_trade(cast(WsLastTradePriceMessage, ev))
 
     def _on_error(self, ws: websocket.WebSocketApp, error: object) -> None:
         print(f"❌ WebSocket Error: {error}")

@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { ScrollArea } from "@/components/ui/scroll-area";
 
 interface NavbarProps {
   userAddress: string;
@@ -15,7 +16,6 @@ interface NavbarProps {
   positionsCount?: number | null;
   onPositionsClick?: () => void;
   onOrdersClick?: () => void;
-  onNotificationsClick?: () => void;
   onSettingsClick?: () => void;
   ordersCount?: number | null;
   notificationsCount?: number | null;
@@ -27,6 +27,19 @@ interface NavbarProps {
   ordersWsErrorInfo?: string | null;
   recentSearches?: string[];
   onSelectSearch?: (value: string) => void;
+  onLogsClick?: () => void;
+  logsCount?: number | null;
+  backendBooksCount?: number | null;
+  recentFills?: Array<{
+    orderID: string;
+    updatedAt?: number | string;
+    market?: string;
+    outcome?: string;
+    asset_id?: string;
+    side?: "BUY" | "SELL";
+    size?: number | string;
+    price?: number | string;
+  }>;
 }
 
 // interface BalanceData {
@@ -47,7 +60,7 @@ export function Navbar({
   positionsCount,
   onPositionsClick,
   onOrdersClick,
-  onNotificationsClick,
+  // onNotificationsClick,
   onSettingsClick,
   ordersCount,
   notificationsCount,
@@ -59,8 +72,26 @@ export function Navbar({
 //   ordersWsErrorInfo,
   recentSearches = [],
   onSelectSearch,
+  onLogsClick,
+  logsCount,
+  backendBooksCount,
+  recentFills = [],
 }: NavbarProps) {
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const notificationsRef = useRef<HTMLDivElement | null>(null);
+  const fills = recentFills;
+
+  useEffect(() => {
+    if (!notificationsOpen) return;
+    const handleClick = (event: MouseEvent) => {
+      if (!notificationsRef.current) return;
+      if (notificationsRef.current.contains(event.target as Node)) return;
+      setNotificationsOpen(false);
+    };
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [notificationsOpen]);
 //   const [data, setData] = useState<BalanceData>({ portfolioValue: 0, cash: 0 });
 
 //   useEffect(() => {
@@ -150,35 +181,87 @@ export function Navbar({
             {balance === null || balance === undefined ? "--" : `$${balance.toFixed(2)}`}
           </span>
         </div>
+        <div className="flex flex-col items-end">
+          <span className="text-[9px] text-slate-500 uppercase font-bold">Backend Books</span>
+          <span className="text-sm font-bold text-slate-200 font-mono">
+            {backendBooksCount === null || backendBooksCount === undefined ? "--" : backendBooksCount}
+          </span>
+        </div>
         <div className="flex items-center gap-2">
-          <Button
-            onClick={onNotificationsClick}
-            className={`h-7 w-10 px-0 text-[10px] uppercase font-bold border transition-colors flex items-center justify-center relative ${
-              notificationsCount
-                ? "border-blue-500/60 bg-blue-500/10 text-blue-200 hover:border-blue-400"
-                : "border-slate-800 bg-slate-950 text-slate-200 hover:text-white hover:border-slate-700"
-            }`}
-            aria-label="Notifications"
-          >
-            <svg
-              className="h-4 w-4"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.8"
-              strokeLinecap="round"
-              strokeLinejoin="round"
+          <div className="relative" ref={notificationsRef}>
+            <Button
+              onClick={() => setNotificationsOpen((open) => !open)}
+              className={`h-7 w-10 px-0 text-[10px] uppercase font-bold border transition-colors flex items-center justify-center relative ${
+                notificationsCount
+                  ? "border-blue-500/60 bg-blue-500/10 text-blue-200 hover:border-blue-400"
+                  : "border-slate-800 bg-slate-950 text-slate-200 hover:text-white hover:border-slate-700"
+              }`}
+              aria-label="Notifications"
             >
-              <path d="M15 17h5l-1.4-1.4A2 2 0 0 1 18 14.2V11a6 6 0 1 0-12 0v3.2a2 2 0 0 1-.6 1.4L4 17h5" />
-              <path d="M9 17a3 3 0 0 0 6 0" />
-            </svg>
-            {notificationsCount ? (
-              <>
-                <span className="absolute -top-1 -right-1 h-2 w-2 rounded-full bg-blue-500 animate-pulse" />
-                <span className="ml-1 text-[9px] text-blue-200 font-mono">{notificationsCount}</span>
-              </>
-            ) : null}
-          </Button>
+              <svg
+                className="h-4 w-4"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M15 17h5l-1.4-1.4A2 2 0 0 1 18 14.2V11a6 6 0 1 0-12 0v3.2a2 2 0 0 1-.6 1.4L4 17h5" />
+                <path d="M9 17a3 3 0 0 0 6 0" />
+              </svg>
+              {notificationsCount ? (
+                <>
+                  <span className="absolute -top-1 -right-1 h-2 w-2 rounded-full bg-blue-500 animate-pulse" />
+                  <span className="ml-1 text-[9px] text-blue-200 font-mono">{notificationsCount}</span>
+                </>
+              ) : null}
+            </Button>
+            {notificationsOpen && (
+              <div className="absolute right-0 top-10 z-40 w-[380px] rounded-md border border-slate-200 bg-white/90 text-slate-900 shadow-xl">
+                <div className="px-3 py-2 text-[10px] uppercase tracking-widest text-slate-500 border-b border-slate-200">
+                  Recent Fills
+                </div>
+                {fills.length === 0 ? (
+                  <div className="px-3 py-3 text-xs text-slate-500">No filled orders yet</div>
+                ) : (
+                  <ScrollArea className="max-h-[320px]">
+                    <div className="divide-y divide-slate-200">
+                      {fills.map((fill) => (
+                        <div
+                          key={`${fill.orderID}-${fill.updatedAt ?? ""}`}
+                          className="flex items-center justify-between px-3 py-2"
+                        >
+                          <div className="flex flex-col min-w-0">
+                            <span className="text-slate-900 font-semibold truncate max-w-[240px]">
+                              {fill.market || "Unknown market"}
+                            </span>
+                            <span className="text-[11px] text-slate-600 truncate max-w-[240px]">
+                              {fill.outcome || fill.asset_id}
+                            </span>
+                          </div>
+                          <div className="flex flex-col items-end gap-1">
+                            <span
+                              className={`text-[9px] uppercase px-2 py-0.5 rounded ${
+                                fill.side === "BUY"
+                                  ? "bg-blue-600/15 text-blue-700"
+                                  : "bg-red-600/15 text-red-700"
+                              }`}
+                            >
+                              {fill.side}
+                            </span>
+                            <span className="text-[10px] text-slate-600 font-mono">
+                              {Number(fill.size ?? 0).toFixed(2)} sh @ {(Number(fill.price ?? 0) * 100).toFixed(0)}¢
+                            </span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </ScrollArea>
+                )}
+              </div>
+            )}
+          </div>
           <div className="flex flex-col items-end gap-0.5">
             <Button
               onClick={onPositionsClick}
@@ -198,6 +281,12 @@ export function Navbar({
             className="h-7 px-3 text-[10px] uppercase font-bold border border-slate-800 bg-slate-950 text-slate-300 hover:text-white hover:border-slate-700 transition-colors"
           >
             Settings
+          </Button>
+          <Button
+            onClick={onLogsClick}
+            className="h-7 px-3 text-[10px] uppercase font-bold border border-slate-800 bg-slate-950 text-slate-300 hover:text-white hover:border-slate-700 transition-colors"
+          >
+            Logs {logsCount === null || logsCount === undefined ? "" : `(${logsCount})`}
           </Button>
           {/* <div className="flex flex-col items-start gap-1 text-[9px] uppercase font-bold text-slate-500">
             <span

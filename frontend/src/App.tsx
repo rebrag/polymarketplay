@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { OrderBookWidget, type UserPosition } from "./components/OrderBookWidget";
+import { BookPair } from "./components/BookPair";
 // import { Input } from "@/components/ui/input";
 // import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -7,14 +7,33 @@ import { Card, CardContent } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { RecentTradesTable, type Trade } from "./components/RecentTradesTable";
 import { Navbar } from "./components/Navbar";
 import { PositionsTable, type PositionRow } from "./components/PositionsTable";
 import { LiveEventsStrip } from "./components/LiveEventsStrip";
 import { OrdersPanel, type OrderView } from "./components/OrdersPanel";
+import { LogChart, type LogPoint } from "./components/LogChart";
+import { Event } from "./components/Event";
+
+const normalizeQuestion = (q: string | undefined): string =>
+  (q ?? "")
+    .replace(/_/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+
 
 interface Market {
   question: string;
+  gameStartTime?: string;
   slug?: string;
   outcomes: string[];
   clobTokenIds: string[];
@@ -39,8 +58,21 @@ interface TokenWidget {
   sourceSlug?: string;
 }
 
+interface LogEntry {
+  slug: string;
+  question: string;
+}
+
 interface BalanceInfo {
   balance: number;
+}
+
+interface AutoStatusPair {
+  pair_key: string;
+  assets: string[];
+  disabled_assets: string[];
+  enabled: boolean;
+  strategy?: string;
 }
 
 function toExpiration(order: OrderView): OrderView {
@@ -50,6 +82,10 @@ function toExpiration(order: OrderView): OrderView {
     ...order,
     expiration: Number.isFinite(exp) ? exp : 0,
   };
+}
+
+function clampOrders(list: OrderView[]): OrderView[] {
+  return [...list].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 50);
 }
 
 type UserSocketMessage =
@@ -64,6 +100,8 @@ function loadSettings(): {
   eventsWindowAfter: string;
   autoBuyMaxCents: string;
   autoSellMinCents: string;
+  autoSellMinShares: string;
+  defaultAutoStrategy: string;
 } {
   const fallback = {
     defaultShares: "10",
@@ -73,6 +111,8 @@ function loadSettings(): {
     eventsWindowAfter: "24",
     autoBuyMaxCents: "97",
     autoSellMinCents: "103",
+    autoSellMinShares: "20",
+    defaultAutoStrategy: "default",
   };
   try {
     const raw = localStorage.getItem("pm_settings");
@@ -86,6 +126,10 @@ function loadSettings(): {
       eventsWindowAfter: typeof parsed.eventsWindowAfter === "string" ? parsed.eventsWindowAfter : fallback.eventsWindowAfter,
       autoBuyMaxCents: typeof parsed.autoBuyMaxCents === "string" ? parsed.autoBuyMaxCents : fallback.autoBuyMaxCents,
       autoSellMinCents: typeof parsed.autoSellMinCents === "string" ? parsed.autoSellMinCents : fallback.autoSellMinCents,
+      autoSellMinShares:
+        typeof parsed.autoSellMinShares === "string" ? parsed.autoSellMinShares : fallback.autoSellMinShares,
+      defaultAutoStrategy:
+        typeof parsed.defaultAutoStrategy === "string" ? parsed.defaultAutoStrategy : fallback.defaultAutoStrategy,
     };
   } catch {
     return fallback;
@@ -97,7 +141,7 @@ function App() {
   const [url, setUrl] = useState("0x507e52ef684ca2dd91f90a9d26d149dd3288beae");
   const [minVolume, setMinVolume] = useState(settings.minVolume);
   const [loading, setLoading] = useState(false);
-  const [eventData, setEventData] = useState<EventData | null>(null);
+  const [eventDataList, setEventDataList] = useState<EventData[]>([]);
   const [widgets, setWidgets] = useState<TokenWidget[]>([]);
   const dismissedAssetsRef = useRef<Record<string, true>>({});
 
@@ -112,20 +156,20 @@ function App() {
   const [showOrders, setShowOrders] = useState(false);
   const [closingOrders, setClosingOrders] = useState(false);
   const closeOrdersTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [showNotifications, setShowNotifications] = useState(false);
-  const [closingNotifications, setClosingNotifications] = useState(false);
-  const closeNotificationsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [closingSettings, setClosingSettings] = useState(false);
   const closeSettingsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [viewMode, setViewMode] = useState<"main" | "logs">("main");
   const [searchHistory, setSearchHistory] = useState<string[]>([]);
   const cashSfxRef = useRef<HTMLAudioElement | null>(null);
   const prevCashRef = useRef<number | null>(null);
   const tradeSfxRef = useRef<HTMLAudioElement | null>(null);
   const [defaultShares, setDefaultShares] = useState(settings.defaultShares);
   const [defaultTtl, setDefaultTtl] = useState(settings.defaultTtl);
+  const [defaultAutoStrategy, setDefaultAutoStrategy] = useState(settings.defaultAutoStrategy);
   const [autoBuyMaxCents, setAutoBuyMaxCents] = useState(settings.autoBuyMaxCents);
   const [autoSellMinCents, setAutoSellMinCents] = useState(settings.autoSellMinCents);
+  const [autoSellMinShares, setAutoSellMinShares] = useState(settings.autoSellMinShares);
   const [eventsWindowBefore, setEventsWindowBefore] = useState(settings.eventsWindowBefore);
   const [eventsWindowAfter, setEventsWindowAfter] = useState(settings.eventsWindowAfter);
   const [liveEvents, setLiveEvents] = useState<EventData[]>([]);
@@ -143,20 +187,156 @@ function App() {
   const [draggedWidgetKey, setDraggedWidgetKey] = useState<string | null>(null);
   const [autoPairs, setAutoPairs] = useState<Set<string>>(new Set());
   const [autoDisabledAssets, setAutoDisabledAssets] = useState<Set<string>>(new Set());
+  const [autoPairStrategies, setAutoPairStrategies] = useState<Record<string, string>>({});
+  const [autoStrategyOptions, setAutoStrategyOptions] = useState<string[]>(["default"]);
   const [recentFills, setRecentFills] = useState<OrderView[]>([]);
   const [bookQuotes, setBookQuotes] = useState<Record<string, { bid: number | null; ask: number | null }>>({});
+  const bookQuotesBufferRef = useRef<Record<string, { bid: number | null; ask: number | null }>>({});
+  const bookQuotesFlushRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [backendBooksCount, setBackendBooksCount] = useState<number | null>(null);
   const [ordersWsReconnectSeq, setOrdersWsReconnectSeq] = useState(0);
   const ordersWsReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const ordersWsClosingRef = useRef(false);
+  const positionsInitRef = useRef(false);
   const [tradeNotices, setTradeNotices] = useState<
     { id: string; market: string; outcome: string; side: "BUY" | "SELL"; size: string; price: string; ts: number }[]
   >([]);
   const fetchAuthMetricsRef = useRef<() => void>(() => {});
+  const memStatsRef = useRef({
+    widgets: 0,
+    liveEvents: 0,
+    orders: 0,
+    recentFills: 0,
+    recentTrades: 0,
+    authPositions: 0,
+    positionHistory: 0,
+    bookQuotes: 0,
+    subscribedSlugs: 0,
+    autoPairs: 0,
+    autoDisabledAssets: 0,
+    tradeNotices: 0,
+    ordersWsEvents: 0,
+    searchHistory: 0,
+  });
 
   const [highlightedAsset, setHighlightedAsset] = useState<string | null>(null);
   const highlightTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const userSocketRef = useRef<WebSocket | null>(null);
+  const [logIndex, setLogIndex] = useState<LogEntry[]>([]);
+  const [logQuery, setLogQuery] = useState("");
+  const [logLoading, setLogLoading] = useState(false);
+  const [logError, setLogError] = useState<string | null>(null);
+  const [logGraphData, setLogGraphData] = useState<LogPoint[]>([]);
+  const [logGraphLoading, setLogGraphLoading] = useState(false);
+  const [logGraphError, setLogGraphError] = useState<string | null>(null);
+  const [logSelection, setLogSelection] = useState<LogEntry | null>(null);
+  const [logStartMs, setLogStartMs] = useState<number | null>(null);
+  const [minimizedEvents, setMinimizedEvents] = useState<Set<string>>(new Set());
+  const autoOpenSyncedRef = useRef(false);
+  const [autoStatusPairs, setAutoStatusPairs] = useState<AutoStatusPair[]>([]);
+  const logStartLookup = useMemo(() => {
+    const map = new Map<string, number>();
+    liveEvents.forEach((ev) => {
+      const slug = ev.slug;
+      const eventStart = ev.startDate ? new Date(ev.startDate).getTime() : null;
+      ev.markets?.forEach((m) => {
+        const key = `${slug}|${normalizeQuestion(m.question)}`;
+        const start = m.gameStartTime ? new Date(m.gameStartTime).getTime() : eventStart;
+        if (start && Number.isFinite(start)) {
+          map.set(key, start);
+        }
+      });
+    });
+    return map;
+  }, [liveEvents]);
+
+  const filteredLogs = useMemo(() => {
+    if (!logQuery.trim()) return logIndex;
+    const q = logQuery.toLowerCase();
+    return logIndex.filter(
+      (entry) =>
+        entry.slug.toLowerCase().includes(q) || entry.question.toLowerCase().includes(q)
+    );
+  }, [logIndex, logQuery]);
+
+  const fullModeKeys = useMemo(() => {
+    const visible = widgets.filter((w) => {
+      if (!w.sourceSlug) return true;
+      return !minimizedEvents.has(w.sourceSlug);
+    });
+    return new Set(visible.slice(0, 10).map((w) => w.uniqueKey));
+  }, [minimizedEvents, widgets]);
+
+  useEffect(() => {
+    memStatsRef.current = {
+      widgets: widgets.length,
+      liveEvents: liveEvents.length,
+      orders: orders.length,
+      recentFills: recentFills.length,
+      recentTrades: recentTrades.length,
+      authPositions: authPositions.length,
+      positionHistory: Object.keys(positionHistory).length,
+      bookQuotes: Object.keys(bookQuotes).length,
+      subscribedSlugs: subscribedSlugs.size,
+      autoPairs: autoPairs.size,
+      autoDisabledAssets: autoDisabledAssets.size,
+      tradeNotices: tradeNotices.length,
+      ordersWsEvents,
+      searchHistory: searchHistory.length,
+    };
+  }, [
+    widgets,
+    liveEvents,
+    orders,
+    recentFills,
+    recentTrades,
+    authPositions,
+    positionHistory,
+    bookQuotes,
+    subscribedSlugs,
+    autoPairs,
+    autoDisabledAssets,
+    tradeNotices,
+    ordersWsEvents,
+    searchHistory,
+  ]);
+
+  // useEffect(() => {
+  //   if (!import.meta.env.DEV) return;
+  //   const id = window.setInterval(() => {
+  //     const stats = memStatsRef.current;
+  //     console.log(
+  //       `[mem-debug] widgets=${stats.widgets} liveEvents=${stats.liveEvents} orders=${stats.orders} recentFills=${stats.recentFills} recentTrades=${stats.recentTrades} positions=${stats.authPositions} positionHistory=${stats.positionHistory} bookQuotes=${stats.bookQuotes} subscribedSlugs=${stats.subscribedSlugs} autoPairs=${stats.autoPairs} autoDisabledAssets=${stats.autoDisabledAssets} tradeNotices=${stats.tradeNotices} ordersWsEvents=${stats.ordersWsEvents} searches=${stats.searchHistory}`
+  //     );
+  //   }, 30000);
+  //   return () => window.clearInterval(id);
+  // }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    const fetchBooks = async () => {
+      try {
+        const res = await fetch("http://localhost:8000/debug/books");
+        if (!res.ok) return;
+        const data = (await res.json()) as { active_books?: number; tracked_assets?: number };
+        if (!mounted) return;
+        if (typeof data.tracked_assets === "number") {
+          setBackendBooksCount(data.tracked_assets);
+        } else if (typeof data.active_books === "number") {
+          setBackendBooksCount(data.active_books);
+        }
+      } catch {
+        // ignore
+      }
+    };
+    fetchBooks();
+    const id = window.setInterval(fetchBooks, 10000);
+    return () => {
+      mounted = false;
+      window.clearInterval(id);
+    };
+  }, []);
 
   const triggerHighlight = (assetId: string) => {
     setHighlightedAsset(assetId)
@@ -189,15 +369,16 @@ function App() {
   const pushTradeNotice = useCallback(
     (order: OrderView) => {
       const label =
-        order.market || order.outcome
+        assetLabels.get(order.asset_id) ??
+        (order.market || order.outcome
           ? {
               market: order.market || "Unknown market",
               outcome: order.outcome || order.asset_id.slice(0, 10),
             }
-          : assetLabels.get(order.asset_id) ?? {
+          : {
               market: "Unknown market",
               outcome: order.asset_id.slice(0, 10),
-            };
+            });
       const id = `${order.orderID}-${Date.now()}`;
       const notice = {
         id,
@@ -215,6 +396,18 @@ function App() {
     },
     [assetLabels]
   );
+
+  const recentFillsDisplay = useMemo(() => {
+    return recentFills.map((fill) => {
+      const label = assetLabels.get(fill.asset_id);
+      if (!label) return fill;
+      return {
+        ...fill,
+        market: label.market,
+        outcome: label.outcome,
+      };
+    });
+  }, [assetLabels, recentFills]);
 
   const handleCloseWidget = useCallback((assetId: string) => {
     dismissedAssetsRef.current = { ...dismissedAssetsRef.current, [assetId]: true };
@@ -266,25 +459,144 @@ function App() {
     });
   }, []);
 
+  const toggleEventMinimized = useCallback((slug: string) => {
+    setMinimizedEvents((prev) => {
+      const next = new Set(prev);
+      if (next.has(slug)) next.delete(slug);
+      else next.add(slug);
+      return next;
+    });
+  }, []);
+
+  const closeEventWindow = useCallback((slug: string) => {
+    setEventDataList((prev) => prev.filter((ev) => ev.slug !== slug));
+    setWidgets((prev) => prev.filter((w) => w.sourceSlug !== slug));
+    setMinimizedEvents((prev) => {
+      if (!prev.has(slug)) return prev;
+      const next = new Set(prev);
+      next.delete(slug);
+      return next;
+    });
+  }, []);
+
+  const killAutotrader = useCallback(async () => {
+    try {
+      await fetch("http://localhost:8000/auto/kill", { method: "POST" });
+    } catch {
+      // ignore kill failures
+    } finally {
+      setAutoPairs(new Set());
+      setAutoDisabledAssets(new Set());
+      setAutoPairStrategies({});
+      setAutoStatusPairs([]);
+    }
+  }, []);
+
+  const setAutoStrategy = useCallback((pairKey: string, strategy: string) => {
+    setAutoPairStrategies((prev) => ({ ...prev, [pairKey]: strategy }));
+  }, []);
+
+
   useEffect(() => {
+    let mounted = true;
+    const fetchAutoStatus = async () => {
+      try {
+        const res = await fetch("http://localhost:8000/auto/status");
+        if (!res.ok) return;
+        const data = (await res.json()) as {
+          pairs?: Array<AutoStatusPair>;
+        };
+        if (!mounted || !Array.isArray(data.pairs)) return;
+        const nextPairs = new Set<string>();
+        const nextDisabled = new Set<string>();
+        const nextStrategies: Record<string, string> = {};
+        data.pairs.forEach((pair) => {
+          if (!pair?.pair_key || pair.enabled === false) return;
+          nextPairs.add(pair.pair_key);
+          (pair.disabled_assets || []).forEach((asset) => nextDisabled.add(asset));
+          if (pair.strategy) {
+            nextStrategies[pair.pair_key] = pair.strategy;
+          }
+        });
+        setAutoPairs(nextPairs);
+        setAutoDisabledAssets(nextDisabled);
+        setAutoPairStrategies(nextStrategies);
+        setAutoStatusPairs(data.pairs.filter((pair) => pair?.pair_key));
+      } catch {
+        // ignore auto status failures
+      }
+    };
+    fetchAutoStatus();
     return () => {
+      mounted = false;
+    };
+  }, []);
+
+
+  useEffect(() => {
+    let mounted = true;
+    const loadStrategies = async () => {
+      try {
+        const res = await fetch("http://localhost:8000/auto/strategies");
+        if (!res.ok) return;
+        const data = (await res.json()) as { strategies?: string[] };
+        if (!mounted || !Array.isArray(data.strategies) || data.strategies.length === 0) return;
+        setAutoStrategyOptions(data.strategies);
+      } catch {
+        // ignore strategy load failures
+      }
+    };
+    loadStrategies();
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (autoOpenSyncedRef.current) return;
+    if (autoPairs.size === 0) return;
+    const slugsToOpen = new Set<string>();
+    widgets.forEach((w) => {
+      if (autoPairs.has(w.marketQuestion) && w.sourceSlug) {
+        slugsToOpen.add(w.sourceSlug);
+      }
+    });
+    if (slugsToOpen.size === 0) return;
+    setMinimizedEvents((prev) => {
+      let changed = false;
+      const next = new Set(prev);
+      slugsToOpen.forEach((slug) => {
+        if (next.has(slug)) {
+          next.delete(slug);
+          changed = true;
+        }
+      });
+      return changed ? next : prev;
+    });
+    autoOpenSyncedRef.current = true;
+  }, [autoPairs, widgets]);
+
+  useEffect(() => {
+  return () => {
       if (userSocketRef.current) userSocketRef.current.close();
       if (ordersWsReconnectTimerRef.current) window.clearTimeout(ordersWsReconnectTimerRef.current);
       ordersWsClosingRef.current = true;
       if (highlightTimeout.current) window.clearTimeout(highlightTimeout.current);
       if (closePositionsTimerRef.current) window.clearTimeout(closePositionsTimerRef.current);
       if (closeOrdersTimerRef.current) window.clearTimeout(closeOrdersTimerRef.current);
-      if (closeNotificationsTimerRef.current) window.clearTimeout(closeNotificationsTimerRef.current);
       if (closeSettingsTimerRef.current) window.clearTimeout(closeSettingsTimerRef.current);
+      if (bookQuotesFlushRef.current !== null) window.clearTimeout(bookQuotesFlushRef.current);
     };
   }, []);
 
-  const handleBookUpdate = useCallback((assetId: string, bid: number | null, ask: number | null) => {
-    setBookQuotes((prev) => {
-      const next = { ...prev };
-      next[assetId] = { bid, ask };
-      return next;
-    });
+const handleBookUpdate = useCallback((assetId: string, bid: number | null, ask: number | null) => {
+    bookQuotesBufferRef.current[assetId] = { bid, ask };
+    if (bookQuotesFlushRef.current !== null) return;
+    bookQuotesFlushRef.current = window.setTimeout(() => {
+      bookQuotesFlushRef.current = null;
+      setBookQuotes((prev) => ({ ...prev, ...bookQuotesBufferRef.current }));
+      bookQuotesBufferRef.current = {};
+    }, 100);
   }, []);
 
   useEffect(() => {
@@ -299,13 +611,11 @@ function App() {
     userSocketRef.current = ws;
 
     ws.onopen = () => {
-      console.log("Orders WS open");
       setOrdersWsStatus("open");
       setOrdersWsCloseInfo(null);
       setOrdersWsErrorInfo(null);
     };
     ws.onclose = (event) => {
-      console.log("Orders WS closed", event);
       setOrdersWsStatus("closed");
       setOrdersWsCloseInfo(`code=${event.code} reason=${event.reason || "none"}`);
       if (ordersWsClosingRef.current) return;
@@ -341,7 +651,7 @@ function App() {
         | { type: "update"; order: OrderView; event?: string; server_now?: number }
         | { type: "status"; status: string; pid?: number; server_now?: number }
         | { type: "error"; error: string };
-      if (typeof data.server_now === "number") {
+      if ("server_now" in data && typeof data.server_now === "number") {
         setOrdersServerNowSec(data.server_now);
         setOrdersServerNowLocalMs(Date.now());
       }
@@ -357,14 +667,14 @@ function App() {
         }));
         setOrders((prev) => {
           const optimistic = prev.filter((o) => o.orderID.startsWith("optimistic-"));
-          return [...next, ...optimistic];
+          return clampOrders([...next, ...optimistic]);
         });
       } else if (data.type === "opened") {
         const now = Date.now();
         setOrders((prev) => {
           if (prev.some((o) => o.orderID === data.order.orderID)) return prev;
           const filtered = prev.filter((o) => !o.orderID.startsWith("optimistic-"));
-          return [{ ...toExpiration(data.order), status: "open" as const, updatedAt: now }, ...filtered];
+          return clampOrders([{ ...toExpiration(data.order), status: "open" as const, updatedAt: now }, ...filtered]);
         });
       } else if (data.type === "closed") {
         const now = Date.now();
@@ -381,21 +691,17 @@ function App() {
               playTradeFilled();
               pushTradeNotice(data.order);
               setRecentFills((prev) => {
-                const next = [{ ...data.order, status: "closed", updatedAt: Date.now() }, ...prev];
+                const next = [{ ...data.order, status: "closed" as const, updatedAt: Date.now() }, ...prev];
                 return next.slice(0, 20);
               });
-              fetchAuthMetricsRef.current();
-              window.setTimeout(() => fetchAuthMetricsRef.current(), 1000);
             }
           } else {
             playTradeFilled();
             pushTradeNotice(data.order);
             setRecentFills((prev) => {
-              const next = [{ ...data.order, status: "closed", updatedAt: Date.now() }, ...prev];
+              const next = [{ ...data.order, status: "closed" as const, updatedAt: Date.now() }, ...prev];
               return next.slice(0, 20);
             });
-            fetchAuthMetricsRef.current();
-            window.setTimeout(() => fetchAuthMetricsRef.current(), 1000);
           }
         }
         setOrders((prev) => {
@@ -412,7 +718,7 @@ function App() {
               updatedAt: now,
             });
           }
-          return updated;
+          return clampOrders(updated);
         });
       } else if (data.type === "update") {
         const now = Date.now();
@@ -422,7 +728,7 @@ function App() {
               ? { ...o, updatedAt: now }
               : o
           );
-          return updated;
+          return clampOrders(updated);
         });
       } else if (data.type === "status") {
         if (data.status === "subscribed") {
@@ -441,6 +747,7 @@ function App() {
         userSocketRef.current = null;
       }
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ordersWsReconnectSeq]);
 
 
@@ -489,6 +796,8 @@ function App() {
         eventsWindowAfter: string;
         autoBuyMaxCents: string;
         autoSellMinCents: string;
+        autoSellMinShares: string;
+        defaultAutoStrategy: string;
       }>;
       if (typeof parsed.defaultShares === "string") setDefaultShares(parsed.defaultShares);
       if (typeof parsed.defaultTtl === "string") setDefaultTtl(parsed.defaultTtl);
@@ -497,6 +806,8 @@ function App() {
       if (typeof parsed.eventsWindowAfter === "string") setEventsWindowAfter(parsed.eventsWindowAfter);
       if (typeof parsed.autoBuyMaxCents === "string") setAutoBuyMaxCents(parsed.autoBuyMaxCents);
       if (typeof parsed.autoSellMinCents === "string") setAutoSellMinCents(parsed.autoSellMinCents);
+      if (typeof parsed.autoSellMinShares === "string") setAutoSellMinShares(parsed.autoSellMinShares);
+      if (typeof parsed.defaultAutoStrategy === "string") setDefaultAutoStrategy(parsed.defaultAutoStrategy);
     } catch {
       // ignore bad local storage
     }
@@ -511,6 +822,8 @@ function App() {
       eventsWindowAfter,
       autoBuyMaxCents,
       autoSellMinCents,
+      autoSellMinShares,
+      defaultAutoStrategy,
     };
     try {
       localStorage.setItem("pm_settings", JSON.stringify(payload));
@@ -525,6 +838,8 @@ function App() {
     eventsWindowAfter,
     autoBuyMaxCents,
     autoSellMinCents,
+    autoSellMinShares,
+    defaultAutoStrategy,
   ]);
 
   const pushHistory = useCallback((value: string) => {
@@ -632,7 +947,7 @@ function App() {
           userSocketRef.current.close();
           userSocketRef.current = null;
         }
-        setEventData(null);
+        setEventDataList([]);
         setWidgets([]);
         dismissedAssetsRef.current = {};
         setRecentTrades([]);
@@ -657,7 +972,10 @@ function App() {
       const ws = new WebSocket(wsUrl);
       userSocketRef.current = ws;
 
-      setEventData({ title: `Monitor: ${input.slice(0, 6)}...${input.slice(-4)}`, slug: "", markets: [] });
+      setEventDataList([
+        { title: `Monitor: ${input.slice(0, 6)}...${input.slice(-4)}`, slug: "", markets: [] },
+      ]);
+      setMinimizedEvents(new Set([""]));
 
       ws.onopen = () => setLoading(false);
 
@@ -711,7 +1029,10 @@ function App() {
               // to ensure 'userPosition' in widgets is accurate
               updated[t.asset] = t;
             });
-            return updated;
+            const entries = Object.entries(updated);
+            if (entries.length <= 50) return updated;
+            entries.sort((a, b) => (b[1]?.timestamp ?? 0) - (a[1]?.timestamp ?? 0));
+            return Object.fromEntries(entries.slice(0, 50));
           });
         }
       };
@@ -732,7 +1053,24 @@ function App() {
       if (!res.ok) throw new Error("Failed to resolve target");
 
       const data = (await res.json()) as EventData;
-      setEventData((prev) => (mode === "replace" ? data : prev ?? data));
+      setEventDataList((prev) => {
+        if (mode === "replace") {
+          return [data];
+        }
+        const exists = prev.some((item) => item.slug === data.slug);
+        return exists ? prev : [...prev, data];
+      });
+      if (data.slug) {
+        setMinimizedEvents((prev) => {
+          if (mode === "replace") {
+            return new Set([data.slug]);
+          }
+          if (prev.has(data.slug)) return prev;
+          const next = new Set(prev);
+          next.add(data.slug);
+          return next;
+        });
+      }
       if (data.slug) {
         setSubscribedSlugs((prev) => {
           const next = new Set(prev);
@@ -796,7 +1134,25 @@ function App() {
       return next;
     });
     setWidgets((prev) => prev.filter((w) => w.sourceSlug !== slug));
+    setEventDataList((prev) => prev.filter((ev) => ev.slug !== slug));
   };
+
+  useEffect(() => {
+    if (positionsInitRef.current) return;
+    if (!authPositions.length) return;
+    const slugs = new Set<string>();
+    authPositions.forEach((pos) => {
+      const valueNum = Number(pos.currentValue);
+      if (!Number.isFinite(valueNum) || valueNum <= 0.01) return;
+      const slug = pos.eventSlug || pos.slug;
+      if (slug) slugs.add(slug);
+    });
+    if (slugs.size === 0) return;
+    positionsInitRef.current = true;
+    slugs.forEach((slug) => {
+      void resolveInput("add", slug);
+    });
+  }, [authPositions, resolveInput]);
 
   const openPositions = () => {
     if (closePositionsTimerRef.current) window.clearTimeout(closePositionsTimerRef.current);
@@ -843,25 +1199,86 @@ function App() {
     }, 200);
   };
 
-  const openNotifications = () => {
-    if (closeNotificationsTimerRef.current) window.clearTimeout(closeNotificationsTimerRef.current);
-    setClosingNotifications(false);
-    setShowNotifications(true);
+  const openLogs = () => {
+    setViewMode("logs");
   };
 
-  const closeNotifications = () => {
-    setClosingNotifications(true);
-    if (closeNotificationsTimerRef.current) window.clearTimeout(closeNotificationsTimerRef.current);
-    closeNotificationsTimerRef.current = window.setTimeout(() => {
-      setShowNotifications(false);
-      setClosingNotifications(false);
-    }, 200);
+  const closeLogs = () => {
+    setViewMode("main");
+  };
+
+  useEffect(() => {
+    if (viewMode !== "logs") return;
+    const loadIndex = async () => {
+      setLogLoading(true);
+      setLogError(null);
+      try {
+        const res = await fetch("http://localhost:8000/logs/index");
+        if (!res.ok) throw new Error("Failed to load logs");
+        const data = (await res.json()) as LogEntry[];
+        setLogIndex(data);
+      } catch (err) {
+        setLogError(err instanceof Error ? err.message : "Failed to load logs");
+      } finally {
+        setLogLoading(false);
+      }
+    };
+    void loadIndex();
+  }, [viewMode]);
+
+  const loadLogGraph = async (entry: LogEntry) => {
+    setLogSelection(entry);
+    setLogGraphLoading(true);
+    setLogGraphError(null);
+    try {
+      const params = new URLSearchParams({
+        slug: entry.slug,
+        question: entry.question,
+        max_rows: "2000",
+      });
+      const res = await fetch(`http://localhost:8000/logs/market?${params.toString()}`);
+      if (!res.ok) throw new Error("Log not found");
+      const payload = (await res.json()) as { rows?: Array<Record<string, string>> };
+      const rows = payload.rows ?? [];
+      const times = rows
+        .map((row) => new Date(row.timestamp ?? "").getTime())
+        .filter((t) => Number.isFinite(t) && t > 0);
+      const t0 = times.length ? Math.min(...times) : Date.now();
+      const parsed = rows.map((row) => {
+        const ts = new Date(row.timestamp ?? "").getTime();
+        const t = Number.isFinite(ts) ? Math.max(0, Math.round((ts - t0) / 1000)) : 0;
+        const bid1 = Number(row.best_bid_1);
+        const ask1 = Number(row.best_ask_1);
+        const bid2 = Number(row.best_bid_2);
+        const ask2 = Number(row.best_ask_2);
+        return {
+          t,
+          tsMs: Number.isFinite(ts) ? ts : 0,
+          condition_1: row.condition_1 ?? "",
+          condition_2: row.condition_2 ?? "",
+          best_bid_1: Number.isFinite(bid1) ? bid1 : null,
+          best_ask_1: Number.isFinite(ask1) ? ask1 : null,
+          best_bid_2: Number.isFinite(bid2) ? bid2 : null,
+          best_ask_2: Number.isFinite(ask2) ? ask2 : null,
+        };
+      });
+      // Find game start time from liveEvents map
+      const lookupKey = `${entry.slug}|${normalizeQuestion(entry.question)}`;
+      const startMs = logStartLookup.get(lookupKey) ?? null;
+      setLogStartMs(Number.isFinite(startMs || NaN) ? (startMs as number) : null);
+      setLogGraphData(parsed);
+    } catch (err) {
+      setLogGraphError(err instanceof Error ? err.message : "Failed to load graph");
+      setLogGraphData([]);
+    } finally {
+      setLogGraphLoading(false);
+    }
   };
 
   return (
   <div className="h-screen w-full bg-black font-sans text-slate-200 overflow-hidden flex flex-col">
     {tradeNotices.length > 0 && (
-      <div className="fixed top-20 left-1/2 -translate-x-1/2 z-50 flex flex-col gap-3 items-center">
+      <div className="fixed top-32 left-1/2 -translate-x-1/2 z-50 flex flex-col gap-3 items-center">
         {tradeNotices.map((notice) => (
           <Card key={notice.id} className="border-slate-800 bg-slate-950/90 shadow-lg w-[380px]">
             <CardContent className="p-4 text-sm">
@@ -885,7 +1302,7 @@ function App() {
                 </Badge>
               </div>
               <div className="mt-2 text-[11px] text-slate-400 font-mono">
-                {Number(notice.size).toFixed(2)} sh @ {(Number(notice.price) * 100).toFixed(2)}¢
+                {Number(notice.size).toFixed(2)} sh @ {(Number(notice.price)*100).toFixed(0)}¢
               </div>
             </CardContent>
           </Card>
@@ -918,243 +1335,253 @@ function App() {
       })()}
       onPositionsClick={openPositions}
       onOrdersClick={openOrders}
-      onNotificationsClick={openNotifications}
       onSettingsClick={openSettings}
+      onLogsClick={openLogs}
+      logsCount={logIndex.length || null}
       ordersCount={orders.filter((o) => o.status === "open").length}
+      backendBooksCount={backendBooksCount}
       notificationsCount={recentFills.length}
+      recentFills={recentFillsDisplay}
       ordersWsStatus={ordersWsStatus}
       ordersWsEvents={ordersWsEvents}
       ordersWsLastType={ordersWsLastType}
       ordersWsServerPid={ordersWsServerPid}
       ordersWsCloseInfo={ordersWsCloseInfo}
       ordersWsErrorInfo={ordersWsErrorInfo}
-      ordersServerNowSec={ordersServerNowSec}
       recentSearches={searchHistory}
       onSelectSearch={handleSelectSearch}
     />
-    
-    {/* Live Events Strip */}
-    {liveEvents.length > 0 && (
-      <div className="px-4 pt-2">
-        <LiveEventsStrip
-          events={liveEvents.map((ev) => ({
-            id: ev.slug,
-            slug: ev.slug,
-            title: ev.title,
-            volume: (ev as unknown as { volume?: number }).volume,
-            startDate: (ev as unknown as { startDate?: string }).startDate,
-            endDate: (ev as unknown as { endDate?: string }).endDate,
-            markets: (ev.markets || []).map((m) => ({
-              question: m.question,
-              volume: m.volume,
-              gameStartTime: (m as { gameStartTime?: string }).gameStartTime,
-            })),
-            raw: ev,
-          }))}
-          subscribed={subscribedSlugs}
-          onAdd={handleAddSlug}
-          onRemove={handleRemoveSlug}
-        />
+
+    {viewMode === "logs" && (
+      <div className="flex-1 w-full overflow-hidden">
+        <div className="h-full w-full px-4 py-4">
+          <div className="flex items-center justify-between">
+            <div className="text-sm uppercase tracking-widest text-slate-400 font-bold">Logs</div>
+            <Button
+              onClick={closeLogs}
+              className="h-7 px-3 text-[10px] uppercase font-bold border border-slate-800 bg-slate-950 text-slate-300 hover:text-white hover:border-slate-700 transition-colors"
+            >
+              Back
+            </Button>
+          </div>
+          <div className="mt-4 grid h-[calc(100%-2.5rem)] grid-cols-[320px_minmax(0,1fr)] gap-4">
+            <div className="rounded-md border border-slate-800 bg-slate-950/95 p-3">
+              <Input
+                value={logQuery}
+                onChange={(e) => setLogQuery(e.target.value)}
+                placeholder="Search logs..."
+                className="h-8 bg-black border-slate-800 text-xs"
+              />
+              <div className="mt-3">
+                {logError ? (
+                  <div className="text-[11px] text-amber-400">{logError}</div>
+                ) : logLoading ? (
+                  <div className="text-[11px] text-slate-400">Loading logs...</div>
+                ) : (
+                  <ScrollArea className="h-[calc(100vh-240px)]">
+                    <div className="space-y-1">
+                      {filteredLogs.map((entry) => (
+                        <button
+                          key={`${entry.slug}::${entry.question}`}
+                          onClick={() => loadLogGraph(entry)}
+                          className={`w-full rounded-md px-2 py-1 text-left text-[11px] text-slate-200 hover:bg-slate-900 ${
+                            logSelection?.slug === entry.slug && logSelection?.question === entry.question
+                              ? "bg-slate-900/70"
+                              : ""
+                          }`}
+                        >
+                          <div className="truncate font-semibold">{entry.question.replace(/_/g, " ")}</div>
+                          <div className="text-[10px] text-slate-500">{entry.slug}</div>
+                        </button>
+                      ))}
+                      {filteredLogs.length === 0 && (
+                        <div className="text-[11px] text-slate-500">No logs match your search.</div>
+                      )}
+                    </div>
+                  </ScrollArea>
+                )}
+              </div>
+            </div>
+            <div className="rounded-md border border-slate-800 bg-slate-950/40 p-3">
+              <div className="text-[10px] uppercase tracking-widest text-slate-400 font-bold">
+                {logSelection ? logSelection.question.replace(/_/g, " ") : "Select a log"}
+              </div>
+              <div className="mt-3 h-[70vh] rounded-md border border-slate-800 bg-slate-950/85 p-2">
+                {logGraphError ? (
+                  <div className="text-[11px] text-amber-400">{logGraphError}</div>
+                ) : logGraphLoading ? (
+                  <div className="text-[11px] text-slate-400">Loading chart...</div>
+                ) : logGraphData.length === 0 ? (
+                  <div className="text-[11px] text-slate-500">Pick a log to view its chart.</div>
+                ) : (
+                  <LogChart data={logGraphData} startMs={logStartMs} loading={logGraphLoading} error={logGraphError} emptyMessage="Pick a log to view its chart." heightClass="h-full" />
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     )}
-
-    <ScrollArea className="flex-1 w-full">
-      {/* Horizontal Dashboard Space */}
-      <div className="p-4 max-w-none mx-auto space-y-4 w-full">
-        {/* Header Section: Event Title & Compact Trades Table */}
-        {eventData && (
-          <div className="flex flex-col gap-3 bg-slate-900/20 p-0 rounded-lg">
-            <div className="flex flex-col lg:flex-row gap-3 justify-between items-start">
-              <div className="flex-shrink-0">
-                <h2 className="text-xl font-bold text-white uppercase tracking-tighter">
-                  {eventData.title}
-                </h2>
-                <div className="flex items-center gap-4 mt-1">
-                  <Badge variant="outline" className="text-[10px] text-blue-400 border-blue-900 bg-blue-900/10">
-                    {widgets.length} BOOKS
-                  </Badge>
-                  <div className="flex items-center gap-2 min-w-[150px]">
-                    <span className="text-[10px] text-slate-500 font-mono">
-                      Min Vol ${Math.round(minVolume / 1000)}k+
-                    </span>
-                  </div>
-                </div>
-              </div>
-              <div className="w-full lg:w-auto flex items-center justify-end" />
-            </div>
-
-            {recentTrades.length > 0 ? (
-              <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
-                <div className="lg:col-span-2">
-                  <RecentTradesTable 
-                    trades={recentTrades} 
-                    onInteract={triggerHighlight} 
-                  />
-                </div>
-              </div>
-            ) : null}
+    
+    {viewMode === "main" && (
+      <>
+        {/* Live Events Strip */}
+        {liveEvents.length > 0 && (
+          <div className="px-4 pt-2">
+            <LiveEventsStrip
+              events={liveEvents.map((ev) => ({
+                id: ev.slug,
+                slug: ev.slug,
+                title: ev.title,
+                volume: (ev as unknown as { volume?: number }).volume,
+                startDate: (ev as unknown as { startDate?: string }).startDate,
+                endDate: (ev as unknown as { endDate?: string }).endDate,
+                markets: (ev.markets || []).map((m) => ({
+                  question: m.question,
+                  volume: m.volume,
+                  gameStartTime: (m as { gameStartTime?: string }).gameStartTime,
+                })),
+                raw: ev,
+              }))}
+              subscribed={subscribedSlugs}
+              onAdd={handleAddSlug}
+              onRemove={handleRemoveSlug}
+            />
           </div>
         )}
 
-        {/* High-Density Order Book Grid */}
-        <div className="grid grid-cols-1 sm:grid-cols-1 lg:grid-cols-2 xl:grid-cols-2 2xl:grid-cols-3 gap-4 pb-0">
-          {Object.entries(
-            widgets.reduce<Record<string, TokenWidget[]>>((acc, w) => {
-              const key = w.marketQuestion || "Unknown";
-              if (!acc[key]) acc[key] = [];
-              acc[key].push(w);
-              return acc;
-            }, {})
-          ).map(([pairKey, group]) => {
-            const isPair = group.length >= 2;
-            const isAutoOn = autoPairs.has(pairKey);
-            const buyLimit = Number(autoBuyMaxCents);
-            const sellLimit = Number(autoSellMinCents);
-            const buyThreshold = Number.isFinite(buyLimit) ? buyLimit : 97;
-            const sellThreshold = Number.isFinite(sellLimit) ? sellLimit : 103;
-            const assetIds = group.map((g) => g.assetId);
-            const pairBidSum =
-              assetIds.length >= 2
-                ? assetIds.reduce((sum, id) => sum + (bookQuotes[id]?.bid ?? NaN), 0)
-                : NaN;
-            const pairAskSum =
-              assetIds.length >= 2
-                ? assetIds.reduce((sum, id) => sum + (bookQuotes[id]?.ask ?? NaN), 0)
-                : NaN;
-            const buyAllowedForPair = Number.isFinite(pairBidSum)
-              ? pairBidSum * 100 <= buyThreshold
-              : false;
-            const sellAllowedForPair = Number.isFinite(pairAskSum)
-              ? pairAskSum * 100 >= sellThreshold
-              : false;
-            return (
-              <div
-                key={pairKey}
-                className={`relative rounded-md p-2 ${
-                  isPair ? (isAutoOn ? "bg-slate-800/70" : "bg-slate-900/50") : ""
-                }`}
-              >
-                {isPair && (
-                  <div className="absolute -top-2 right-2 flex items-center gap-2">
-                    <Button
-                      onClick={() => toggleAutoPair(pairKey)}
-                      className={`h-6 px-2 text-[10px] uppercase font-bold border ${
-                        isAutoOn ? "bg-emerald-600/80 border-emerald-500 text-white" : "bg-slate-950 border-slate-800 text-slate-300"
-                      }`}
-                    >
-                      🤖 Auto
-                    </Button>
-                    <Button
-                      onClick={() => handleClosePair(pairKey)}
-                      className="h-6 w-6 rounded-full border border-slate-800 bg-slate-950 text-slate-300 hover:text-white"
-                    >
-                      ✕
-                    </Button>
-                  </div>
-                )}
-                {group[0] && (
-                  <div className="flex items-center gap-2 pb-0 -mb-1">
-                    <span className="text-[10px] text-slate-500 uppercase font-bold truncate px-1">
-                      {group[0].marketQuestion}
-                    </span>
-                    <span className="text-[10px] text-slate-400 font-mono">
-                      ${Math.round(group[0].marketVolume).toLocaleString()}
-                    </span>
-                  </div>
-                )}
-                <div className="grid grid-cols-2 gap-2">
-                  {group.map((w) => {
-                    const index = widgets.findIndex((item) => item.uniqueKey === w.uniqueKey);
-            const match = positionHistory[w.assetId];
+        <ScrollArea className="flex-1 w-full">
+          {/* Horizontal Dashboard Space */}
+          <div className="p-4 max-w-none mx-auto space-y-4 w-full">
+            {/* Header Section: Event Title & Compact Trades Table */}
+            {eventDataList.map((eventData) => {
+              const eventGroups = widgets
+                .filter((w) => w.sourceSlug === eventData.slug)
+                .reduce<Record<string, TokenWidget[]>>((acc, w) => {
+                  const key = w.marketQuestion || "Unknown";
+                  if (!acc[key]) acc[key] = [];
+                  acc[key].push(w);
+                  return acc;
+                }, {});
+              const pairCount = Object.keys(eventGroups).length;
+              const minimized = minimizedEvents.has(eventData.slug);
 
-            let userPos: UserPosition | null = null;
-            if (match) {
-              const shares = Number(match.size);
-              const value = Number(match.usdcSize);
-              const price = shares > 0 ? value / shares : 0;
-              userPos = { side: match.side, price, shares };
-            }
-
-                    const heldPosition = authPositions.find((p) => p.asset === w.assetId);
-            const heldShares = heldPosition ? Number(heldPosition.size) : null;
-            const heldAvg = heldPosition ? Number(heldPosition.avgPrice) : null;
-                    const otherAssetId = group.find((g) => g.assetId !== w.assetId)?.assetId;
-                    const otherHeldPosition = otherAssetId
-                      ? authPositions.find((p) => p.asset === otherAssetId)
-                      : undefined;
-                    const otherHeldShares = otherHeldPosition ? Number(otherHeldPosition.size) : null;
-                    const openOrders = orders.filter((o) => o.asset_id === w.assetId && o.status === "open");
-                    const isAutoAssetOn = isAutoOn && !autoDisabledAssets.has(w.assetId);
-
-            // High-density optimization: first 10 books are "full", rest are "mini"
-            const isFullMode = index < 10;
-
-            return (
-              <div
-                key={w.uniqueKey}
-                        className={`flex flex-col gap-1 ${draggedWidgetKey === w.uniqueKey ? "opacity-60" : ""}`}
-                draggable
-                onDragStart={(event) => {
-                  setDraggedWidgetKey(w.uniqueKey);
-                  event.dataTransfer.effectAllowed = "move";
-                  event.dataTransfer.setData("text/plain", w.uniqueKey);
-                }}
-                onDragEnd={() => setDraggedWidgetKey(null)}
-                onDragOver={(event) => {
-                  event.preventDefault();
-                  event.dataTransfer.dropEffect = "move";
-                }}
-                onDrop={(event) => {
-                  event.preventDefault();
-                  const fromKey = event.dataTransfer.getData("text/plain");
-                  if (fromKey) swapWidgets(fromKey, w.uniqueKey);
-                  setDraggedWidgetKey(null);
-                }}
-              >
-                <span
-                  className="text-[9px] text-slate-500 uppercase font-bold truncate px-1 opacity-0 -mt-1"
-                  title={w.marketQuestion}
+              return (
+                <Event
+                  key={eventData.slug || eventData.title}
+                  title={eventData.title}
+                  pairCount={pairCount}
+                  minVolumeLabel={`Min Vol $${Math.round(minVolume / 1000)}k+`}
+                  minimized={minimized}
+                  onToggleMinimize={() => toggleEventMinimized(eventData.slug)}
+                  onClose={() => closeEventWindow(eventData.slug)}
                 >
-                  {w.marketQuestion}
-                </span>
-                <OrderBookWidget
-                  assetId={w.assetId}
-                  outcomeName={w.outcomeName}
-                  volume={w.marketVolume}
-                  userPosition={userPos}
-                  positionShares={Number.isFinite(heldShares ?? NaN) ? heldShares : null}
-                  positionAvgPrice={Number.isFinite(heldAvg ?? NaN) ? heldAvg : null}
-                  otherAssetPositionShares={
-                    Number.isFinite(otherHeldShares ?? NaN) ? otherHeldShares : null
-                  }
-                  openOrders={openOrders}
-                  ordersServerNowSec={ordersServerNowSec}
-                  ordersServerNowLocalMs={ordersServerNowLocalMs}
+                  {eventData.slug === "" && recentTrades.length > 0 ? (
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
+                      <div className="lg:col-span-2">
+                        <RecentTradesTable
+                          trades={recentTrades}
+                          onInteract={triggerHighlight}
+                        />
+                      </div>
+                    </div>
+                  ) : null}
+
+                  <div className="grid grid-cols-1 sm:grid-cols-1 lg:grid-cols-2 xl:grid-cols-2 2xl:grid-cols-3 gap-4 pb-0">
+                    {Object.entries(eventGroups).map(([pairKey, group]) => (
+                      <BookPair
+                        key={pairKey}
+                        pairKey={pairKey}
+                        group={group}
+                        widgets={widgets}
+                        bookQuotes={bookQuotes}
+                        autoPairs={autoPairs}
+                        autoDisabledAssets={autoDisabledAssets}
+                        autoBuyMaxCents={autoBuyMaxCents}
+                        autoSellMinCents={autoSellMinCents}
+                      autoSellMinShares={autoSellMinShares}
+                      autoStrategy={autoPairStrategies[pairKey] || defaultAutoStrategy || "default"}
+                      onSelectAutoStrategy={setAutoStrategy}
+                      autoStrategyOptions={autoStrategyOptions}
+                      positionHistory={positionHistory}
+                        authPositions={authPositions}
+                        orders={orders}
+                        highlightedAsset={highlightedAsset}
+                        defaultShares={defaultShares}
+                        defaultTtl={defaultTtl}
+                        draggedWidgetKey={draggedWidgetKey}
+                        setDraggedWidgetKey={setDraggedWidgetKey}
+                        swapWidgets={swapWidgets}
+                        toggleAutoPair={toggleAutoPair}
+                        toggleAutoAsset={toggleAutoAsset}
+                        handleClosePair={handleClosePair}
+                        handleCloseWidget={handleCloseWidget}
+                        handleBookUpdate={handleBookUpdate}
+                        fullModeKeys={fullModeKeys}
+                        ordersServerNowSec={ordersServerNowSec}
+                        ordersServerNowLocalMs={ordersServerNowLocalMs}
+                        apiBaseUrl="http://localhost:8000"
+                      />
+                    ))}
+                  </div>
+                </Event>
+              );
+            })}
+
+            {/* High-Density Order Book Grid */}
+            <div className="grid grid-cols-1 sm:grid-cols-1 lg:grid-cols-2 xl:grid-cols-2 2xl:grid-cols-3 gap-4 pb-0">
+              {Object.entries(
+                widgets
+                  .filter((w) => {
+                    if (!w.sourceSlug) return true;
+                    return !eventDataList.some((ev) => ev.slug === w.sourceSlug);
+                  })
+                  .reduce<Record<string, TokenWidget[]>>((acc, w) => {
+                    const key = w.marketQuestion || "Unknown";
+                    if (!acc[key]) acc[key] = [];
+                    acc[key].push(w);
+                    return acc;
+                  }, {})
+              ).map(([pairKey, group]) => (
+                <BookPair
+                  key={pairKey}
+                  pairKey={pairKey}
+                  group={group}
+                  widgets={widgets}
+                  bookQuotes={bookQuotes}
+                  autoPairs={autoPairs}
+                  autoDisabledAssets={autoDisabledAssets}
+                  autoBuyMaxCents={autoBuyMaxCents}
+                  autoSellMinCents={autoSellMinCents}
+                  autoSellMinShares={autoSellMinShares}
+                  autoStrategy={autoPairStrategies[pairKey] || defaultAutoStrategy || "default"}
+                  onSelectAutoStrategy={setAutoStrategy}
+                  autoStrategyOptions={autoStrategyOptions}
+                  positionHistory={positionHistory}
+                  authPositions={authPositions}
+                  orders={orders}
+                  highlightedAsset={highlightedAsset}
                   defaultShares={defaultShares}
                   defaultTtl={defaultTtl}
-                  auto={isAutoAssetOn}
-                  autoBuyAllowed={buyAllowedForPair}
-                  autoSellAllowed={sellAllowedForPair}
-                  onHeaderClick={() => {
-                    if (!isAutoOn) return;
-                    toggleAutoAsset(w.assetId);
-                  }}
-                  isHighlighted={highlightedAsset === w.assetId}
-                  viewMode={isFullMode ? "full" : "mini"}
-                  onClose={isPair ? undefined : handleCloseWidget}
-                  onBookUpdate={handleBookUpdate}
+                  draggedWidgetKey={draggedWidgetKey}
+                  setDraggedWidgetKey={setDraggedWidgetKey}
+                  swapWidgets={swapWidgets}
+                  toggleAutoPair={toggleAutoPair}
+                  toggleAutoAsset={toggleAutoAsset}
+                  handleClosePair={handleClosePair}
+                  handleCloseWidget={handleCloseWidget}
+                  handleBookUpdate={handleBookUpdate}
+                  fullModeKeys={fullModeKeys}
+                  ordersServerNowSec={ordersServerNowSec}
+                  ordersServerNowLocalMs={ordersServerNowLocalMs}
                   apiBaseUrl="http://localhost:8000"
                 />
-              </div>
-                    );
-                  })}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      </div>
-    </ScrollArea>
+              ))}
+            </div>
+          </div>
+        </ScrollArea>
+      </>
+    )}
     {showPositions && (
       <div
         className={`fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm transition-opacity duration-200 ${closingPositions ? "opacity-0" : "opacity-100"}`}
@@ -1238,66 +1665,6 @@ function App() {
         </div>
       </div>
     )}
-    {showNotifications && (
-      <div
-        className={`fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm transition-opacity duration-200 ${closingNotifications ? "opacity-0" : "opacity-100"}`}
-        onClick={closeNotifications}
-      >
-        <div
-          className={`relative w-[95vw] max-w-xl transition-all duration-200 ${closingNotifications ? "scale-95 opacity-0" : "scale-100 opacity-100"}`}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <div className="absolute right-3 top-3 z-10">
-            <Button
-              onClick={closeNotifications}
-              className="h-8 w-8 rounded-full border border-slate-800 bg-slate-950 text-slate-300 hover:text-white"
-            >
-              X
-            </Button>
-          </div>
-          <Card className="border-slate-800 bg-slate-950/70">
-            <CardContent className="p-4 space-y-3 text-xs">
-              <div className="text-[10px] uppercase tracking-widest text-slate-400">
-                Recent Fills
-              </div>
-              {recentFills.length === 0 ? (
-                <div className="text-slate-500">No filled orders yet</div>
-              ) : (
-                recentFills.map((fill) => (
-                  <div
-                    key={`${fill.orderID}-${fill.updatedAt}`}
-                    className="flex items-center justify-between border border-slate-800 rounded px-2 py-2"
-                  >
-                    <div className="flex flex-col min-w-0">
-                      <span className="text-slate-200 font-semibold truncate max-w-[320px]">
-                        {fill.market || "Unknown market"}
-                      </span>
-                      <span className="text-[11px] text-slate-400 truncate max-w-[320px]">
-                        {fill.outcome || fill.asset_id}
-                      </span>
-                    </div>
-                    <div className="flex flex-col items-end gap-1">
-                      <Badge
-                        className={`text-[9px] uppercase ${
-                          fill.side === "BUY"
-                            ? "bg-blue-600/20 text-blue-300"
-                            : "bg-red-600/20 text-red-300"
-                        }`}
-                      >
-                        {fill.side}
-                      </Badge>
-                      <span className="text-[10px] text-slate-400 font-mono">
-                        {Number(fill.size).toFixed(2)} sh @ {(Number(fill.price) * 100).toFixed(2)}¢
-                      </span>
-                    </div>
-                  </div>
-                ))
-              )}
-            </CardContent>
-          </Card>
-        </div>
-      </div>
-    )}
     {showSettings && (
       <div
         className={`fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm transition-opacity duration-200 ${closingSettings ? "opacity-0" : "opacity-100"}`}
@@ -1368,6 +1735,40 @@ function App() {
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-1">
+                <label className="text-[10px] text-slate-500 uppercase font-bold">Auto Sell Min Shares</label>
+                <Input
+                  value={autoSellMinShares}
+                  onChange={(e) => setAutoSellMinShares(e.target.value)}
+                  onFocus={(e) => e.currentTarget.select()}
+                  className="h-8 bg-black border-slate-800 font-mono text-sm"
+                />
+              </div>
+            </div>
+            <div className="space-y-1">
+              <label className="text-[10px] text-slate-500 uppercase font-bold">Default Auto Strategy</label>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button className="h-8 w-full justify-between border border-slate-800 bg-black text-xs uppercase font-bold text-slate-300 hover:text-white">
+                    {defaultAutoStrategy || "default"}
+                    <span className="text-[10px] text-slate-500">▼</span>
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent sideOffset={6} align="end">
+                  <DropdownMenuLabel>Auto Strategy</DropdownMenuLabel>
+                  <DropdownMenuSeparator />
+                  {autoStrategyOptions.map((strategy) => (
+                    <DropdownMenuItem
+                      key={strategy}
+                      onClick={() => setDefaultAutoStrategy(strategy)}
+                    >
+                      {strategy}
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1">
                 <label className="text-[10px] text-slate-500 uppercase font-bold">Events Window Before (h)</label>
                 <Input
                   value={eventsWindowBefore}
@@ -1386,6 +1787,46 @@ function App() {
                 />
               </div>
             </div>
+            <div className="border-t border-slate-800 pt-3 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] uppercase tracking-widest text-slate-400 font-bold">Auto Monitor</span>
+                <Button
+                  onClick={killAutotrader}
+                  className="h-7 px-2 text-[10px] uppercase font-bold border border-red-900/60 bg-red-900/20 text-red-200 hover:text-white hover:border-red-700"
+                >
+                  Kill Auto
+                </Button>
+              </div>
+              {autoStatusPairs.length === 0 ? (
+                <div className="text-[11px] text-slate-500">No active auto pairs.</div>
+              ) : (
+                <div className="space-y-2 max-h-[200px] overflow-auto pr-1">
+                  {autoStatusPairs.map((pair) => (
+                    <div key={pair.pair_key} className="rounded border border-slate-800 bg-slate-950/60 p-2">
+                      <div className="text-[11px] text-slate-200 font-semibold truncate">
+                        {pair.pair_key}
+                      </div>
+                      <div className="mt-1 space-y-1">
+                        {pair.assets.map((asset) => {
+                          const label = assetLabels.get(asset);
+                          const disabled = pair.disabled_assets.includes(asset);
+                          return (
+                            <div key={asset} className="flex items-center justify-between text-[10px]">
+                              <span className="text-slate-400 truncate max-w-[220px]">
+                                {label?.outcome || asset}
+                              </span>
+                              <span className={disabled ? "text-slate-500" : "text-emerald-400"}>
+                                {disabled ? "off" : "on"}
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </div>
@@ -1395,3 +1836,5 @@ function App() {
 }
 
 export default App;
+
+

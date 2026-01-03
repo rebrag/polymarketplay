@@ -9,8 +9,8 @@ WSS_USER_URL: str = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
 CLOB_URL = "https://clob.polymarket.com"
 
 # These are used primarily for edge_scanner.py
-POLY_TAG_ID: int = 450  # 306 for EPL Soccer, 450 for NFL
-ODDS_SPORT_KEY: str = "americanfootball_nfl"
+POLY_TAG_ID: int = 306  # 306 for EPL Soccer, 450 for NFL
+ODDS_SPORT_KEY: str = "soccer_epl"
 
 # File Paths
 OUTPUT_ROOT: Path = Path("output")

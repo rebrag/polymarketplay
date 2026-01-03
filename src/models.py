@@ -95,6 +95,16 @@ class WsTickSizeChangeMessage(TypedDict, total=False):
     asset_id: str
     tick_size: str
 
+class WsLastTradePriceMessage(TypedDict, total=False):
+    event_type: str
+    asset_id: str
+    fee_rate_bps: str
+    market: str
+    price: str
+    side: Literal["BUY", "SELL"]
+    size: str
+    timestamp: str
+
 class Token(TypedDict):
     token_id: str
     outcome: str
@@ -159,6 +169,12 @@ class WsBidAsk(TypedDict):
     size: float
     cum: float
 
+class WsLastTrade(TypedDict):
+    price: float
+    size: float
+    side: Literal["BUY", "SELL"]
+    timestamp: int
+
 class WsPayload(TypedDict):
     asset_id: str
     ready: bool
@@ -166,4 +182,5 @@ class WsPayload(TypedDict):
     bids: List[WsBidAsk]
     asks: List[WsBidAsk]
     tick_size: NotRequired[float]
+    last_trade: NotRequired[WsLastTrade]
     status: NotRequired[str] # Use NotRequired if this key is optional

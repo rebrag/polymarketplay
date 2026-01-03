@@ -6,6 +6,8 @@ export interface PositionRow {
   asset: string;
   oppositeAsset?: string;
   oppositeOutcome?: string;
+  slug?: string;
+  eventSlug?: string;
   size?: number | string;
   avgPrice?: number | string;
   currentValue?: number | string;
