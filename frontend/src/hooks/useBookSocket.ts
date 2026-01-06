@@ -1,0 +1,197 @@
+import { useEffect, useMemo, useRef } from "react";
+
+import type { BookState } from "@/lib/bookPayload";
+import { useBookStore } from "@/stores/bookStore";
+
+interface WidgetAssetMeta {
+  asset_id: string;
+  slug?: string;
+  question?: string;
+  outcome?: string;
+}
+
+interface TokenWidget {
+  assetId: string;
+  sourceSlug?: string;
+  marketQuestion?: string;
+  outcomeName?: string;
+}
+
+const SOCKET_URL = "ws://localhost:8000/ws/books/stream";
+const RECONNECT_BASE_MS = 500;
+const RECONNECT_MAX_MS = 5000;
+
+function buildAssetMeta(widgets: TokenWidget[]): WidgetAssetMeta[] {
+  return widgets.map((w) => ({
+    asset_id: w.assetId,
+    slug: w.sourceSlug,
+    question: w.marketQuestion,
+    outcome: w.outcomeName,
+  }));
+}
+
+export function useBookSocket(widgets: TokenWidget[]): void {
+  const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const reconnectAttemptsRef = useRef(0);
+  const assetsRef = useRef<Map<string, WidgetAssetMeta>>(new Map());
+  const pendingSubscribeRef = useRef<WidgetAssetMeta[]>([]);
+  const workerRef = useRef<Worker | null>(null);
+
+  const setBooksBulk = useBookStore((state) => state.setBooksBulk);
+  const bumpFrame = useBookStore((state) => state.bumpFrame);
+  const setStatusBulk = useBookStore((state) => state.setStatusBulk);
+  const clearBook = useBookStore((state) => state.clearBook);
+
+  const assetMeta = useMemo(() => buildAssetMeta(widgets), [widgets]);
+
+  useEffect(() => {
+    const nextMap = new Map<string, WidgetAssetMeta>();
+    assetMeta.forEach((meta) => {
+      if (meta.asset_id) nextMap.set(meta.asset_id, meta);
+    });
+
+    const prevMap = assetsRef.current;
+    const toAdd: WidgetAssetMeta[] = [];
+    const toRemove: string[] = [];
+
+    for (const [assetId, meta] of nextMap.entries()) {
+      if (!prevMap.has(assetId)) {
+        toAdd.push(meta);
+      }
+    }
+
+    for (const assetId of prevMap.keys()) {
+      if (!nextMap.has(assetId)) {
+        toRemove.push(assetId);
+      }
+    }
+
+    assetsRef.current = nextMap;
+    if (toAdd.length) {
+      pendingSubscribeRef.current = toAdd;
+      setStatusBulk(
+        toAdd.map((meta) => meta.asset_id),
+        "connecting"
+      );
+    }
+    if (toRemove.length) {
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "unsubscribe", assets: toRemove }));
+      }
+      toRemove.forEach((assetId) => clearBook(assetId));
+    }
+
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN && toAdd.length) {
+      ws.send(JSON.stringify({ type: "subscribe", assets: toAdd }));
+      pendingSubscribeRef.current = [];
+    }
+  }, [assetMeta, clearBook, setStatusBulk]);
+
+  useEffect(() => {
+    let active = true;
+
+  const worker = new Worker(new URL("../workers/bookWs.worker.ts", import.meta.url), {
+      type: "module",
+    });
+    workerRef.current = worker;
+    worker.onmessage = (event) => {
+      const payload = event.data as { type?: string; updates?: Record<string, BookState> };
+      if (!payload || payload.type !== "batch" || !payload.updates) return;
+      // if (import.meta.env.DEV) {
+      //   // eslint-disable-next-line no-console
+      //   console.log(`[books-ws] batch assets=${Object.keys(payload.updates).length}`);
+      // }
+      const updates = payload.updates;
+      const assetIds = Object.keys(updates);
+      if (!assetIds.length) return;
+      setBooksBulk(updates, "live");
+      bumpFrame();
+    };
+
+    const scheduleReconnect = () => {
+      if (!active) return;
+      if (reconnectTimerRef.current !== null) return;
+      const backoff = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** reconnectAttemptsRef.current);
+      const jitter = Math.floor(Math.random() * 200);
+      reconnectAttemptsRef.current += 1;
+      reconnectTimerRef.current = window.setTimeout(() => {
+        reconnectTimerRef.current = null;
+        connect();
+      }, backoff + jitter);
+    };
+
+    const connect = () => {
+      if (!active) return;
+      // if (import.meta.env.DEV) {
+      //   // eslint-disable-next-line no-console
+      //   console.log("[books-ws] connecting...");
+      // }
+      const ws = new WebSocket(SOCKET_URL);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        reconnectAttemptsRef.current = 0;
+        const assets = Array.from(assetsRef.current.values());
+        if (assets.length) {
+          // if (import.meta.env.DEV) {
+          //   // eslint-disable-next-line no-console
+          //   console.log(`[books-ws] open subscribe assets=${assets.length}`);
+          // }
+          ws.send(JSON.stringify({ type: "subscribe", assets }));
+          pendingSubscribeRef.current = [];
+        }
+      };
+
+      ws.onmessage = (event) => {
+        if (!active || typeof event.data !== "string") return;
+        // if (import.meta.env.DEV) {
+        //   // eslint-disable-next-line no-console
+        //   console.log(`[books-ws] message bytes=${event.data.length}`);
+        // }
+        workerRef.current?.postMessage({ type: "payload", payload: event.data });
+      };
+
+      ws.onclose = () => {
+        const assets = assetsRef.current.keys();
+        setStatusBulk(assets, "connecting");
+        // if (import.meta.env.DEV) {
+        //   // eslint-disable-next-line no-console
+        //   console.log("[books-ws] closed");
+        // }
+        scheduleReconnect();
+      };
+
+      ws.onerror = () => {
+        const assets = assetsRef.current.keys();
+        setStatusBulk(assets, "error");
+        // if (import.meta.env.DEV) {
+        //   // eslint-disable-next-line no-console
+        //   console.log("[books-ws] error");
+        // }
+      };
+    };
+
+    connect();
+
+    return () => {
+      active = false;
+      if (reconnectTimerRef.current !== null) {
+        window.clearTimeout(reconnectTimerRef.current);
+      }
+      worker.terminate();
+      workerRef.current = null;
+      const ws = wsRef.current;
+      if (ws) {
+        ws.onopen = null;
+        ws.onclose = null;
+        ws.onerror = null;
+        ws.onmessage = null;
+        ws.close();
+      }
+      wsRef.current = null;
+    };
+  }, [bumpFrame, setBooksBulk, setStatusBulk]);
+}

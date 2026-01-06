@@ -32,9 +32,7 @@ const chartConfig = {
 
 const formatTick = (value: number) => {
   if (!Number.isFinite(value)) return "";
-  if (value >= 3600) return `${Math.round(value / 3600)}h`;
-  if (value >= 60) return `${Math.round(value / 60)}m`;
-  return `${Math.round(value)}s`;
+  return formatElapsed(value * 1000);
 };
 
 const formatQuote = (value: number | null | undefined): string => {
@@ -98,6 +96,14 @@ function LogChartTooltip(props: LogTooltipProps) {
           </div>
         </div>
       </div>
+      <div className="rounded-md border border-slate-200 bg-white/95 px-3 py-2 shadow">
+        <div className="space-y-0.5">
+          <div className="text-[10px] uppercase text-slate-500">Time Since Start</div>
+          <div className="text-[11px] font-mono text-slate-900">
+            {elapsed ?? "--"}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -110,27 +116,23 @@ export function LogChart({
   startMs,
   heightClass = "h-[calc(100%-28px)]",
 }: LogChartProps) {
+  const fallbackStartMs = useMemo(() => {
+    if (startMs && Number.isFinite(startMs)) return startMs;
+    const times = data.map((row) => row.tsMs).filter((t) => Number.isFinite(t) && t > 0);
+    if (!times.length) return null;
+    return Math.min(...times);
+  }, [data, startMs]);
   const ticks = useMemo(() => {
     if (data.length === 0) return [];
-    const maxT = Math.max(...data.map((row) => row.t));
+    const times = data.map((row) => row.t).filter((t) => Number.isFinite(t));
+    if (!times.length) return [];
+    const maxT = Math.max(...times);
     if (!Number.isFinite(maxT) || maxT <= 0) return [0];
-    const steps = [30, 60, 300, 600, 900, 1200, 1800, 3600];
-    let step = steps[0];
-    for (const candidate of steps) {
-      const count = Math.floor(maxT / candidate) + 1;
-      if (count <= 5) {
-        step = candidate;
-        break;
-      }
-      step = candidate;
-    }
-    const minTicks = 4;
-    const tickMax = Math.max(maxT, step * (minTicks - 1));
-    const tks: number[] = [];
-    for (let t = 0; t <= tickMax; t += step) {
-      tks.push(t);
-    }
-    return tks.length > 1 ? tks : [0, maxT];
+    let end =
+      maxT >= 60 ? Math.floor(maxT / 60) * 60 : Math.max(1, Math.round(maxT));
+    if (end > maxT) end = maxT;
+    const tks = end === 0 ? [0] : [0, end];
+    return Array.from(new Set(tks));
   }, [data]);
 
   if (error) return <div className="text-[11px] text-amber-400">{error}</div>;
@@ -139,18 +141,25 @@ export function LogChart({
 
   return (
     <ChartContainer config={chartConfig} className={`w-full ${heightClass}`}>
-      <LineChart data={data} margin={{ top: 8, right: 12, left: -8, bottom: 0 }} isAnimationActive={false}>
+      <LineChart data={data} margin={{ top: 8, right: 36, left: 4, bottom: 0 }} isAnimationActive={false}>
         <XAxis
           dataKey="t"
-          tickLine
-          axisLine
-          tickMargin={6}
+          type="number"
+          scale="linear"
+          tickLine={false}
+          axisLine={false}
+          interval={0}
+          minTickGap={20}
+          tickMargin={8}
+          padding={{ right: 20 }}
           fontSize={10}
           ticks={ticks}
           tickFormatter={formatTick}
+          allowDuplicatedCategory={false}
+          domain={[0, "dataMax"]}
         />
-        <YAxis tickLine axisLine tickMargin={6} fontSize={10} domain={[0, 1]} />
-        <ChartTooltip cursor={false} content={<LogChartTooltip startMs={startMs} />} />
+        <YAxis tickLine={false} axisLine tickMargin={6} fontSize={10} domain={[0, 1]} />
+        <ChartTooltip cursor={false} content={<LogChartTooltip startMs={fallbackStartMs} />} />
         <Line type="monotone" dataKey="best_bid_1" stroke="var(--color-best_bid_1)" strokeWidth={1.5} dot={false} isAnimationActive={false} />
         <Line type="monotone" dataKey="best_ask_1" stroke="var(--color-best_ask_1)" strokeWidth={1.5} dot={false} isAnimationActive={false} />
         <Line type="monotone" dataKey="best_bid_2" stroke="var(--color-best_bid_2)" strokeWidth={1.5} dot={false} isAnimationActive={false} />

@@ -334,14 +334,31 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
       setCanScrollRight(el.scrollLeft < maxScrollLeft - 1);
     };
 
+    const rafUpdate = () => {
+      window.requestAnimationFrame(update);
+    };
+
     update();
     el.addEventListener("scroll", update, { passive: true });
     window.addEventListener("resize", update);
+    const observer = new ResizeObserver(rafUpdate);
+    observer.observe(el);
     return () => {
       el.removeEventListener("scroll", update);
       window.removeEventListener("resize", update);
+      observer.disconnect();
     };
-  }, [sorted.length]);
+  }, [sorted.length, filtered.length]);
+
+  useEffect(() => {
+    const el = trackRef.current;
+    if (!el) return;
+    window.requestAnimationFrame(() => {
+      const maxScrollLeft = el.scrollWidth - el.clientWidth;
+      setCanScrollLeft(el.scrollLeft > 0);
+      setCanScrollRight(el.scrollLeft < maxScrollLeft - 1);
+    });
+  }, [filtered.length]);
   useEffect(() => {
     const el = trackRef.current;
     if (!el || initialScrollDone.current) return;

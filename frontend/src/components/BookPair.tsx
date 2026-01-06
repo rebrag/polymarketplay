@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
+import { useBookStore } from "@/stores/bookStore";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -26,8 +27,6 @@ interface TokenWidget {
 interface BookPairProps {
   pairKey: string;
   group: TokenWidget[];
-  widgets: TokenWidget[];
-  bookQuotes: Record<string, { bid: number | null; ask: number | null }>;
   autoPairs: Set<string>;
   autoDisabledAssets: Set<string>;
   autoBuyMaxCents: string;
@@ -49,18 +48,15 @@ interface BookPairProps {
   toggleAutoAsset: (assetId: string) => void;
   handleClosePair: (pairKey: string) => void;
   handleCloseWidget: (assetId: string) => void;
-  handleBookUpdate: (assetId: string, bid: number | null, ask: number | null) => void;
   fullModeKeys: Set<string>;
   ordersServerNowSec?: number | null;
   ordersServerNowLocalMs?: number | null;
   apiBaseUrl?: string;
 }
 
-export function BookPair({
+function BookPairComponent({
   pairKey,
   group,
-  // widgets,
-  bookQuotes,
   autoPairs,
   autoDisabledAssets,
   autoBuyMaxCents,
@@ -82,12 +78,12 @@ export function BookPair({
   toggleAutoAsset,
   handleClosePair,
   handleCloseWidget,
-  handleBookUpdate,
   fullModeKeys,
   ordersServerNowSec,
   ordersServerNowLocalMs,
   apiBaseUrl = "http://localhost:8000",
 }: BookPairProps) {
+  const [, startTransition] = useTransition();
   const isPair = group.length >= 2;
   const isAutoOn = autoPairs.has(pairKey);
   const strategyLabel = autoStrategy || "default";
@@ -97,15 +93,37 @@ export function BookPair({
   const buyThreshold = Number.isFinite(buyLimit) ? buyLimit : 97;
   const sellThreshold = Number.isFinite(sellLimit) ? sellLimit : 103;
   const sellSharesThreshold = Number.isFinite(sellSharesLimit) ? sellSharesLimit : 20;
-  const assetIds = group.map((g) => g.assetId);
-  const pairBidSum =
-    assetIds.length >= 2
-      ? assetIds.reduce((sum, id) => sum + (bookQuotes[id]?.bid ?? NaN), 0)
-      : NaN;
-  const pairAskSum =
-    assetIds.length >= 2
-      ? assetIds.reduce((sum, id) => sum + (bookQuotes[id]?.ask ?? NaN), 0)
-      : NaN;
+  const assetIdsKey = group.map((g) => g.assetId).join("|");
+  const assetIds = useMemo(() => assetIdsKey.split("|").filter(Boolean), [assetIdsKey]);
+  const selectPairSums = useMemo(() => {
+    let cached: [number | null, number | null] | null = null;
+    return (state: ReturnType<typeof useBookStore.getState>) => {
+      if (assetIds.length < 2) {
+        if (cached && cached[0] === null && cached[1] === null) return cached;
+        cached = [null, null];
+        return cached;
+      }
+      let bidSum = 0;
+      let askSum = 0;
+      let bidOk = true;
+      let askOk = true;
+      assetIds.forEach((id) => {
+        const book = state.books[id];
+        const bid = book?.bids?.[0]?.price;
+        const ask = book?.asks?.[0]?.price;
+        if (typeof bid !== "number") bidOk = false;
+        if (typeof ask !== "number") askOk = false;
+        bidSum += typeof bid === "number" ? bid : 0;
+        askSum += typeof ask === "number" ? ask : 0;
+      });
+      const nextBid = bidOk ? bidSum : null;
+      const nextAsk = askOk ? askSum : null;
+      if (cached && cached[0] === nextBid && cached[1] === nextAsk) return cached;
+      cached = [nextBid, nextAsk];
+      return cached;
+    };
+  }, [assetIds]);
+  const [pairBidSum, pairAskSum] = useBookStore(selectPairSums);
   const buyAllowedForPair = Number.isFinite(pairBidSum)
     ? pairBidSum * 100 <= buyThreshold
     : false;
@@ -282,7 +300,7 @@ export function BookPair({
           </Button>
           <div className="flex items-center">
             <Button
-              onClick={() => toggleAutoPair(pairKey)}
+              onClick={() => startTransition(() => toggleAutoPair(pairKey))}
               className={`h-6 rounded-r-none px-2 text-[10px] uppercase font-bold border ${
                 isAutoOn ? "bg-emerald-600/80 border-emerald-500 text-white" : "bg-slate-950 border-slate-800 text-slate-300"
               }`}
@@ -305,7 +323,7 @@ export function BookPair({
                 {autoStrategyOptions.map((strategy) => (
                   <DropdownMenuItem
                     key={strategy}
-                    onClick={() => onSelectAutoStrategy(pairKey, strategy)}
+                    onClick={() => startTransition(() => onSelectAutoStrategy(pairKey, strategy))}
                   >
                     {strategy}
                   </DropdownMenuItem>
@@ -444,7 +462,6 @@ export function BookPair({
                 isHighlighted={highlightedAsset === w.assetId}
                 viewMode={isFullMode ? "full" : "mini"}
                 onClose={isPair ? undefined : handleCloseWidget}
-                onBookUpdate={handleBookUpdate}
                 apiBaseUrl={apiBaseUrl}
               />
             </div>
@@ -454,6 +471,141 @@ export function BookPair({
     </div>
   );
 }
+
+function findPosition(positions: PositionRow[], assetId: string): PositionRow | undefined {
+  return positions.find((p) => p.asset === assetId);
+}
+
+function equalPosition(a?: PositionRow, b?: PositionRow): boolean {
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+  const sizeA = Number(a.size);
+  const sizeB = Number(b.size);
+  const avgA = Number(a.avgPrice);
+  const avgB = Number(b.avgPrice);
+  return sizeA === sizeB && avgA === avgB && a.side === b.side;
+}
+
+function collectOpenOrders(orders: OrderView[], assetId: string): OrderView[] {
+  return orders.filter((o) => o.asset_id === assetId && o.status === "open");
+}
+
+function equalOpenOrders(a: OrderView[], b: OrderView[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    const left = a[i];
+    const right = b[i];
+    if (!right) return false;
+    if (
+      left.orderID !== right.orderID ||
+      left.updatedAt !== right.updatedAt ||
+      left.price !== right.price ||
+      left.size !== right.size ||
+      left.side !== right.side ||
+      left.status !== right.status
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function equalGroup(a: TokenWidget[], b: TokenWidget[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    const left = a[i];
+    const right = b[i];
+    if (!right) return false;
+    if (
+      left.assetId !== right.assetId ||
+      left.outcomeName !== right.outcomeName ||
+      left.marketQuestion !== right.marketQuestion ||
+      left.marketVolume !== right.marketVolume ||
+      left.sourceSlug !== right.sourceSlug ||
+      left.uniqueKey !== right.uniqueKey
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function hasHighlighted(group: TokenWidget[], highlighted: string | null): boolean {
+  if (!highlighted) return false;
+  return group.some((g) => g.assetId === highlighted);
+}
+
+function equalStrategies(a: string[], b: string[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+function equalFullMode(group: TokenWidget[], prev: Set<string>, next: Set<string>): boolean {
+  for (const item of group) {
+    const key = item.uniqueKey;
+    if (prev.has(key) !== next.has(key)) return false;
+  }
+  return true;
+}
+
+function equalDisabledAssets(
+  group: TokenWidget[],
+  prev: Set<string>,
+  next: Set<string>
+): boolean {
+  for (const item of group) {
+    if (prev.has(item.assetId) !== next.has(item.assetId)) return false;
+  }
+  return true;
+}
+
+export const BookPair = memo(BookPairComponent, (prev, next) => {
+  if (prev.pairKey !== next.pairKey) return false;
+  if (!equalGroup(prev.group, next.group)) return false;
+  if (prev.autoStrategy !== next.autoStrategy) return false;
+  if (prev.autoBuyMaxCents !== next.autoBuyMaxCents) return false;
+  if (prev.autoSellMinCents !== next.autoSellMinCents) return false;
+  if (prev.autoSellMinShares !== next.autoSellMinShares) return false;
+  if (prev.defaultShares !== next.defaultShares) return false;
+  if (prev.defaultTtl !== next.defaultTtl) return false;
+  if (prev.ordersServerNowSec !== next.ordersServerNowSec) return false;
+  if (prev.ordersServerNowLocalMs !== next.ordersServerNowLocalMs) return false;
+  if (prev.apiBaseUrl !== next.apiBaseUrl) return false;
+  if (!equalStrategies(prev.autoStrategyOptions, next.autoStrategyOptions)) return false;
+
+  if (prev.autoPairs.has(prev.pairKey) !== next.autoPairs.has(next.pairKey)) return false;
+  if (!equalDisabledAssets(prev.group, prev.autoDisabledAssets, next.autoDisabledAssets)) return false;
+  if (!equalFullMode(prev.group, prev.fullModeKeys, next.fullModeKeys)) return false;
+
+  const prevHighlighted = hasHighlighted(prev.group, prev.highlightedAsset);
+  const nextHighlighted = hasHighlighted(next.group, next.highlightedAsset);
+  if (prevHighlighted !== nextHighlighted) return false;
+  if (prevHighlighted && prev.highlightedAsset !== next.highlightedAsset) return false;
+
+  if (prev.draggedWidgetKey !== next.draggedWidgetKey) {
+    const prevInGroup = prev.group.some((g) => g.uniqueKey === prev.draggedWidgetKey);
+    const nextInGroup = next.group.some((g) => g.uniqueKey === next.draggedWidgetKey);
+    if (prevInGroup || nextInGroup) return false;
+  }
+
+  for (const item of prev.group) {
+    const prevPos = findPosition(prev.authPositions, item.assetId);
+    const nextPos = findPosition(next.authPositions, item.assetId);
+    if (!equalPosition(prevPos, nextPos)) return false;
+
+    const prevOrders = collectOpenOrders(prev.orders, item.assetId);
+    const nextOrders = collectOpenOrders(next.orders, item.assetId);
+    if (!equalOpenOrders(prevOrders, nextOrders)) return false;
+
+    if (prev.positionHistory[item.assetId] !== next.positionHistory[item.assetId]) return false;
+  }
+
+  return true;
+});
 
 
 

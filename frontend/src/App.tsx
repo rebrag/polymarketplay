@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BookPair } from "./components/BookPair";
+import { useBookSocket } from "./hooks/useBookSocket";
 // import { Input } from "@/components/ui/input";
 // import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -29,6 +29,18 @@ const normalizeQuestion = (q: string | undefined): string =>
     .replace(/\s+/g, " ")
     .trim()
     .toLowerCase();
+
+const datePattern = /\b\d{4}-\d{2}-\d{2}\b/;
+const extractDate = (slug: string): string => {
+  const match = slug.match(datePattern);
+  return match ? match[0] : "";
+};
+
+const extractSport = (slug: string): string => {
+  const base = slug.split("/")[0] ?? slug;
+  const chunk = base.split("-")[0] ?? base;
+  return chunk.split("_")[0] ?? "";
+};
 
 
 interface Market {
@@ -185,14 +197,12 @@ function App() {
   const [ordersWsErrorInfo, setOrdersWsErrorInfo] = useState<string | null>(null);
   const seenTradeIdsRef = useRef<Set<string>>(new Set());
   const [draggedWidgetKey, setDraggedWidgetKey] = useState<string | null>(null);
+
   const [autoPairs, setAutoPairs] = useState<Set<string>>(new Set());
   const [autoDisabledAssets, setAutoDisabledAssets] = useState<Set<string>>(new Set());
   const [autoPairStrategies, setAutoPairStrategies] = useState<Record<string, string>>({});
   const [autoStrategyOptions, setAutoStrategyOptions] = useState<string[]>(["default"]);
   const [recentFills, setRecentFills] = useState<OrderView[]>([]);
-  const [bookQuotes, setBookQuotes] = useState<Record<string, { bid: number | null; ask: number | null }>>({});
-  const bookQuotesBufferRef = useRef<Record<string, { bid: number | null; ask: number | null }>>({});
-  const bookQuotesFlushRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [backendBooksCount, setBackendBooksCount] = useState<number | null>(null);
   const [ordersWsReconnectSeq, setOrdersWsReconnectSeq] = useState(0);
   const ordersWsReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -210,7 +220,6 @@ function App() {
     recentTrades: 0,
     authPositions: 0,
     positionHistory: 0,
-    bookQuotes: 0,
     subscribedSlugs: 0,
     autoPairs: 0,
     autoDisabledAssets: 0,
@@ -225,6 +234,12 @@ function App() {
   const userSocketRef = useRef<WebSocket | null>(null);
   const [logIndex, setLogIndex] = useState<LogEntry[]>([]);
   const [logQuery, setLogQuery] = useState("");
+  const [logSortBy, setLogSortBy] = useState<"question" | "slug" | "date">("question");
+  const [logSortDir, setLogSortDir] = useState<"asc" | "desc">("asc");
+  const [logFilter, setLogFilter] = useState<"all" | "open">("all");
+  const [logDateFilter, setLogDateFilter] = useState<string>("all");
+  const [logSportFilter, setLogSportFilter] = useState<string>("all");
+  const [logMlOnly, setLogMlOnly] = useState(false);
   const [logLoading, setLogLoading] = useState(false);
   const [logError, setLogError] = useState<string | null>(null);
   const [logGraphData, setLogGraphData] = useState<LogPoint[]>([]);
@@ -233,6 +248,13 @@ function App() {
   const [logSelection, setLogSelection] = useState<LogEntry | null>(null);
   const [logStartMs, setLogStartMs] = useState<number | null>(null);
   const [minimizedEvents, setMinimizedEvents] = useState<Set<string>>(new Set());
+  const socketWidgets = useMemo(() => {
+    return widgets.filter((w) => {
+      if (!w.sourceSlug) return true;
+      return !minimizedEvents.has(w.sourceSlug);
+    });
+  }, [minimizedEvents, widgets]);
+  useBookSocket(socketWidgets);
   const autoOpenSyncedRef = useRef(false);
   const [autoStatusPairs, setAutoStatusPairs] = useState<AutoStatusPair[]>([]);
   const logStartLookup = useMemo(() => {
@@ -251,14 +273,73 @@ function App() {
     return map;
   }, [liveEvents]);
 
+  const logDates = useMemo(() => {
+    const dates = new Set<string>();
+    logIndex.forEach((entry) => {
+      const d = extractDate(entry.slug);
+      if (d) dates.add(d);
+    });
+    return Array.from(dates).sort().reverse();
+  }, [logIndex]);
+
+  const logSports = useMemo(() => {
+    const sports = new Set<string>();
+    logIndex.forEach((entry) => {
+      const sport = extractSport(entry.slug);
+      if (sport) sports.add(sport);
+    });
+    return Array.from(sports).sort();
+  }, [logIndex]);
+
   const filteredLogs = useMemo(() => {
-    if (!logQuery.trim()) return logIndex;
-    const q = logQuery.toLowerCase();
-    return logIndex.filter(
-      (entry) =>
-        entry.slug.toLowerCase().includes(q) || entry.question.toLowerCase().includes(q)
-    );
-  }, [logIndex, logQuery]);
+    let items = logIndex;
+    const q = logQuery.trim().toLowerCase();
+    if (q) {
+      items = items.filter(
+        (entry) =>
+          entry.slug.toLowerCase().includes(q) || entry.question.toLowerCase().includes(q)
+      );
+    }
+    if (logFilter === "open") {
+      items = items.filter((entry) => subscribedSlugs.has(entry.slug));
+    }
+    if (logDateFilter !== "all") {
+      items = items.filter((entry) => extractDate(entry.slug) === logDateFilter);
+    }
+    if (logSportFilter !== "all") {
+      items = items.filter((entry) => extractSport(entry.slug) === logSportFilter);
+    }
+    if (logMlOnly) {
+      items = items.filter((entry) => {
+        const name = entry.question.toUpperCase();
+        if (name.includes("O_U")) return false;
+        return !/[+-]\d+(\.\d+)?/.test(entry.question);
+      });
+    }
+    const sorted = [...items].sort((a, b) => {
+      if (logSortBy === "date") {
+        const left = extractDate(a.slug);
+        const right = extractDate(b.slug);
+        const cmp = left.localeCompare(right);
+        return logSortDir === "asc" ? cmp : -cmp;
+      }
+      const left = (logSortBy === "slug" ? a.slug : a.question).toLowerCase();
+      const right = (logSortBy === "slug" ? b.slug : b.question).toLowerCase();
+      const cmp = left.localeCompare(right);
+      return logSortDir === "asc" ? cmp : -cmp;
+    });
+    return sorted;
+  }, [
+    logDateFilter,
+    logFilter,
+    logIndex,
+    logQuery,
+    logSortBy,
+    logSortDir,
+    logSportFilter,
+    logMlOnly,
+    subscribedSlugs,
+  ]);
 
   const fullModeKeys = useMemo(() => {
     const visible = widgets.filter((w) => {
@@ -277,7 +358,6 @@ function App() {
       recentTrades: recentTrades.length,
       authPositions: authPositions.length,
       positionHistory: Object.keys(positionHistory).length,
-      bookQuotes: Object.keys(bookQuotes).length,
       subscribedSlugs: subscribedSlugs.size,
       autoPairs: autoPairs.size,
       autoDisabledAssets: autoDisabledAssets.size,
@@ -293,7 +373,6 @@ function App() {
     recentTrades,
     authPositions,
     positionHistory,
-    bookQuotes,
     subscribedSlugs,
     autoPairs,
     autoDisabledAssets,
@@ -307,7 +386,7 @@ function App() {
   //   const id = window.setInterval(() => {
   //     const stats = memStatsRef.current;
   //     console.log(
-  //       `[mem-debug] widgets=${stats.widgets} liveEvents=${stats.liveEvents} orders=${stats.orders} recentFills=${stats.recentFills} recentTrades=${stats.recentTrades} positions=${stats.authPositions} positionHistory=${stats.positionHistory} bookQuotes=${stats.bookQuotes} subscribedSlugs=${stats.subscribedSlugs} autoPairs=${stats.autoPairs} autoDisabledAssets=${stats.autoDisabledAssets} tradeNotices=${stats.tradeNotices} ordersWsEvents=${stats.ordersWsEvents} searches=${stats.searchHistory}`
+  //       `[mem-debug] widgets=${stats.widgets} liveEvents=${stats.liveEvents} orders=${stats.orders} recentFills=${stats.recentFills} recentTrades=${stats.recentTrades} positions=${stats.authPositions} positionHistory=${stats.positionHistory} subscribedSlugs=${stats.subscribedSlugs} autoPairs=${stats.autoPairs} autoDisabledAssets=${stats.autoDisabledAssets} tradeNotices=${stats.tradeNotices} ordersWsEvents=${stats.ordersWsEvents} searches=${stats.searchHistory}`
   //     );
   //   }, 30000);
   //   return () => window.clearInterval(id);
@@ -585,19 +664,9 @@ function App() {
       if (closePositionsTimerRef.current) window.clearTimeout(closePositionsTimerRef.current);
       if (closeOrdersTimerRef.current) window.clearTimeout(closeOrdersTimerRef.current);
       if (closeSettingsTimerRef.current) window.clearTimeout(closeSettingsTimerRef.current);
-      if (bookQuotesFlushRef.current !== null) window.clearTimeout(bookQuotesFlushRef.current);
     };
   }, []);
 
-const handleBookUpdate = useCallback((assetId: string, bid: number | null, ask: number | null) => {
-    bookQuotesBufferRef.current[assetId] = { bid, ask };
-    if (bookQuotesFlushRef.current !== null) return;
-    bookQuotesFlushRef.current = window.setTimeout(() => {
-      bookQuotesFlushRef.current = null;
-      setBookQuotes((prev) => ({ ...prev, ...bookQuotesBufferRef.current }));
-      bookQuotesBufferRef.current = {};
-    }, 100);
-  }, []);
 
   useEffect(() => {
     if (userSocketRef.current) {
@@ -1366,6 +1435,76 @@ const handleBookUpdate = useCallback((assetId: string, bid: number | null, ask: 
           </div>
           <div className="mt-4 grid h-[calc(100%-2.5rem)] grid-cols-[320px_minmax(0,1fr)] gap-4">
             <div className="rounded-md border border-slate-800 bg-slate-950/95 p-3">
+              <div className="mb-2 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Button
+                    onClick={() => {
+                      setLogSortDir((prev) => (prev === "asc" ? "desc" : "asc"));
+                    }}
+                    className="h-7 px-2 text-[10px] uppercase font-bold border border-slate-800 bg-slate-950 text-slate-300 hover:text-white hover:border-slate-700 transition-colors"
+                  >
+                    {logSortDir === "asc" ? "Asc" : "Desc"}
+                  </Button>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    onClick={() => {
+                      setLogMlOnly((prev) => !prev);
+                    }}
+                    className={`h-7 px-2 text-[10px] uppercase font-bold border transition-colors ${
+                      logMlOnly
+                        ? "border-emerald-700 bg-emerald-900/40 text-emerald-100"
+                        : "border-slate-800 bg-slate-950 text-slate-300 hover:text-white hover:border-slate-700"
+                    }`}
+                  >
+                    ML Only
+                  </Button>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button className="h-7 px-2 text-[10px] uppercase font-bold border border-slate-800 bg-slate-950 text-slate-300 hover:text-white hover:border-slate-700 transition-colors">
+                        Sport {logSportFilter === "all" ? "All" : logSportFilter}
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent sideOffset={6} align="end">
+                      <DropdownMenuLabel>Sport</DropdownMenuLabel>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem onClick={() => setLogSportFilter("all")}>
+                        All
+                      </DropdownMenuItem>
+                      {logSports.map((sport) => (
+                        <DropdownMenuItem
+                          key={sport}
+                          onClick={() => setLogSportFilter(sport)}
+                        >
+                          {sport}
+                        </DropdownMenuItem>
+                      ))}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button className="h-7 px-2 text-[10px] uppercase font-bold border border-slate-800 bg-slate-950 text-slate-300 hover:text-white hover:border-slate-700 transition-colors">
+                        Date {logDateFilter === "all" ? "All" : logDateFilter}
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent sideOffset={6} align="end">
+                      <DropdownMenuLabel>Date</DropdownMenuLabel>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem onClick={() => setLogDateFilter("all")}>
+                        All
+                      </DropdownMenuItem>
+                      {logDates.map((date) => (
+                        <DropdownMenuItem
+                          key={date}
+                          onClick={() => setLogDateFilter(date)}
+                        >
+                          {date}
+                        </DropdownMenuItem>
+                      ))}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
+              </div>
               <Input
                 value={logQuery}
                 onChange={(e) => setLogQuery(e.target.value)}
@@ -1378,11 +1517,10 @@ const handleBookUpdate = useCallback((assetId: string, bid: number | null, ask: 
                 ) : logLoading ? (
                   <div className="text-[11px] text-slate-400">Loading logs...</div>
                 ) : (
-                  <ScrollArea className="h-[calc(100vh-240px)]">
+                  <div className="h-[calc(100vh-240px)] overflow-y-auto [&::-webkit-scrollbar]:hidden">
                     <div className="space-y-1">
                       {filteredLogs.map((entry) => (
                         <button
-                          key={`${entry.slug}::${entry.question}`}
                           onClick={() => loadLogGraph(entry)}
                           className={`w-full rounded-md px-2 py-1 text-left text-[11px] text-slate-200 hover:bg-slate-900 ${
                             logSelection?.slug === entry.slug && logSelection?.question === entry.question
@@ -1398,7 +1536,7 @@ const handleBookUpdate = useCallback((assetId: string, bid: number | null, ask: 
                         <div className="text-[11px] text-slate-500">No logs match your search.</div>
                       )}
                     </div>
-                  </ScrollArea>
+                  </div>
                 )}
               </div>
             </div>
@@ -1450,7 +1588,7 @@ const handleBookUpdate = useCallback((assetId: string, bid: number | null, ask: 
           </div>
         )}
 
-        <ScrollArea className="flex-1 w-full">
+        <div className="flex-1 w-full overflow-y-auto [&::-webkit-scrollbar]:hidden">
           {/* Horizontal Dashboard Space */}
           <div className="p-4 max-w-none mx-auto space-y-4 w-full">
             {/* Header Section: Event Title & Compact Trades Table */}
@@ -1467,15 +1605,17 @@ const handleBookUpdate = useCallback((assetId: string, bid: number | null, ask: 
               const minimized = minimizedEvents.has(eventData.slug);
 
               return (
-                <Event
-                  key={eventData.slug || eventData.title}
-                  title={eventData.title}
-                  pairCount={pairCount}
-                  minVolumeLabel={`Min Vol $${Math.round(minVolume / 1000)}k+`}
-                  minimized={minimized}
-                  onToggleMinimize={() => toggleEventMinimized(eventData.slug)}
-                  onClose={() => closeEventWindow(eventData.slug)}
-                >
+                  <Event
+                    key={eventData.slug || eventData.title}
+                    title={eventData.title}
+                    slug={eventData.slug}
+                    pairCount={pairCount}
+                    minVolumeLabel={`Min Vol $${Math.round(minVolume / 1000)}k+`}
+                    minimized={minimized}
+                    onToggleMinimize={() => toggleEventMinimized(eventData.slug)}
+                    onClose={() => closeEventWindow(eventData.slug)}
+                    raw={eventData}
+                  >
                   {eventData.slug === "" && recentTrades.length > 0 ? (
                     <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
                       <div className="lg:col-span-2">
@@ -1493,8 +1633,6 @@ const handleBookUpdate = useCallback((assetId: string, bid: number | null, ask: 
                         key={pairKey}
                         pairKey={pairKey}
                         group={group}
-                        widgets={widgets}
-                        bookQuotes={bookQuotes}
                         autoPairs={autoPairs}
                         autoDisabledAssets={autoDisabledAssets}
                         autoBuyMaxCents={autoBuyMaxCents}
@@ -1516,7 +1654,6 @@ const handleBookUpdate = useCallback((assetId: string, bid: number | null, ask: 
                         toggleAutoAsset={toggleAutoAsset}
                         handleClosePair={handleClosePair}
                         handleCloseWidget={handleCloseWidget}
-                        handleBookUpdate={handleBookUpdate}
                         fullModeKeys={fullModeKeys}
                         ordersServerNowSec={ordersServerNowSec}
                         ordersServerNowLocalMs={ordersServerNowLocalMs}
@@ -1547,8 +1684,6 @@ const handleBookUpdate = useCallback((assetId: string, bid: number | null, ask: 
                   key={pairKey}
                   pairKey={pairKey}
                   group={group}
-                  widgets={widgets}
-                  bookQuotes={bookQuotes}
                   autoPairs={autoPairs}
                   autoDisabledAssets={autoDisabledAssets}
                   autoBuyMaxCents={autoBuyMaxCents}
@@ -1570,7 +1705,6 @@ const handleBookUpdate = useCallback((assetId: string, bid: number | null, ask: 
                   toggleAutoAsset={toggleAutoAsset}
                   handleClosePair={handleClosePair}
                   handleCloseWidget={handleCloseWidget}
-                  handleBookUpdate={handleBookUpdate}
                   fullModeKeys={fullModeKeys}
                   ordersServerNowSec={ordersServerNowSec}
                   ordersServerNowLocalMs={ordersServerNowLocalMs}
@@ -1579,7 +1713,7 @@ const handleBookUpdate = useCallback((assetId: string, bid: number | null, ask: 
               ))}
             </div>
           </div>
-        </ScrollArea>
+        </div>
       </>
     )}
     {showPositions && (

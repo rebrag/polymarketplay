@@ -19,7 +19,7 @@ router = APIRouter()
 ORDER_WS_PING_SECONDS: Final[float] = 15.0
 
 # Hard cap on how fast we push book updates to the browser per-asset socket.
-BOOK_MAX_HZ: Final[float] = 10.0
+BOOK_MAX_HZ: Final[float] = 5.0
 BOOK_MIN_SEND_INTERVAL_S: Final[float] = 1.0 / BOOK_MAX_HZ
 
 # If your registry doesn't support book subscriber queues, we fall back to polling.
@@ -204,80 +204,144 @@ async def websocket_endpoint(websocket: WebSocket, asset_id: str) -> None:
     await websocket.accept()
 
     try:
-        slug = websocket.query_params.get("slug")
-        question = websocket.query_params.get("market_question")
-        outcome = websocket.query_params.get("outcome")
-        if slug and question:
-            registry.set_asset_meta(asset_id, slug, question, outcome)
+        # metadata setup...
         book = registry.get_or_create(asset_id)
     except Exception:
         await _safe_close(websocket)
         return
 
-    # Prefer event-driven updates if your registry supports subscribers.
-    update_q: Queue[None] | None = None
-    has_subscribers = hasattr(registry, "register_subscriber") and hasattr(registry, "unregister_subscriber")
-
-    last_sent_msg_count = -1
-    last_sent_trade_ts = -1
-    last_send_mono = 0.0
-    dirty = False
-
     try:
-        if has_subscribers:
-            update_q = Queue(maxsize=1)
-            registry.register_subscriber(asset_id, update_q, asyncio.get_running_loop())
-
+        # We no longer need update_q to trigger sends. 
+        # We only need to know when to pull from the book.
         while True:
-            # If book isn't ready, don’t spin.
+            # 1. State Check: If book isn't ready, throttle and wait.
             if not getattr(book, "ready", True):
                 await websocket.send_json({"status": "loading", "asset_id": asset_id})
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.5) # Heavy throttle during loading
                 continue
 
-            if update_q is not None:
-                try:
-                    await asyncio.wait_for(update_q.get(), timeout=BOOK_MIN_SEND_INTERVAL_S)
-                    dirty = True
-                except asyncio.TimeoutError:
-                    pass
-                while not update_q.empty():
-                    try:
-                        update_q.get_nowait()
-                        dirty = True
-                    except Exception:
-                        break
-            else:
-                # Fallback polling, but still capped to our send interval.
-                await asyncio.sleep(BOOK_MIN_SEND_INTERVAL_S)
-
+            # 2. Extract current state from the "hot" BookManager
             msg_count = int(getattr(book, "msg_count", 0))
             last_trade = registry.get_last_trade(asset_id)
-            trade_ts = int(last_trade.get("timestamp", 0)) if last_trade else 0
-            if not dirty and msg_count == last_sent_msg_count and trade_ts == last_sent_trade_ts:
-                continue
-
-            last_send_mono = time.monotonic()
-            last_sent_msg_count = msg_count
-            last_sent_trade_ts = trade_ts
-            dirty = False
-
-            payload = _build_book_payload(asset_id, book, msg_count, last_trade) # type: ignore
+            
+            # 3. Build the payload (This is the CPU-intensive part for the browser)
+            payload = _build_book_payload(asset_id, book, msg_count, last_trade) #type: ignore
+            
+            # 4. Send to Frontend
             await websocket.send_json(payload)
-            await asyncio.sleep(0.1)
+            
+            # 5. THE FIX: Strict Fixed Interval
+            # By using a flat sleep, you guarantee the React Scheduler (Scheduler.js) 
+            # has exactly 100ms of "Quiet Time" to perform Garbage Collection 
+            # and clear the JS Heap between every single update.
+            await asyncio.sleep(0.1) 
 
     except WebSocketDisconnect:
         return
     except Exception as e:
         print(f"Socket Error: {e}")
     finally:
-        try:
-            if update_q is not None and has_subscribers:
-                registry.unregister_subscriber(asset_id, update_q)
-        except Exception:
-            pass
-        try:
-            registry.release(asset_id)
-        except Exception:
-            pass
+        registry.release(asset_id)
+        await _safe_close(websocket)
+
+
+@router.websocket("/ws/books/stream")
+async def websocket_books(websocket: WebSocket) -> None:
+    await websocket.accept()
+
+    subscribed: set[str] = set()
+    update_q: Queue[None] = Queue(maxsize=1)
+    loop = asyncio.get_running_loop()
+    last_sent_msg_count: dict[str, int] = {}
+    last_sent_trade_ts: dict[str, int] = {}
+
+    async def _receive_messages() -> None:
+        while True:
+            payload = await websocket.receive_json()
+            if not isinstance(payload, dict):
+                continue
+            msg_type = payload.get("type")
+            if msg_type == "subscribe":
+                items = payload.get("assets")
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if isinstance(item, str):
+                        asset_id = item
+                        slug = question = outcome = None
+                    elif isinstance(item, dict):
+                        asset_id = item.get("asset_id")
+                        slug = item.get("slug")
+                        question = item.get("question")
+                        outcome = item.get("outcome")
+                    else:
+                        continue
+                    if not isinstance(asset_id, str) or not asset_id:
+                        continue
+                    if asset_id in subscribed:
+                        continue
+                    subscribed.add(asset_id)
+                    if isinstance(slug, str) and isinstance(question, str):
+                        registry.set_asset_meta(asset_id, slug, question, outcome if isinstance(outcome, str) else None)
+                    try:
+                        registry.get_or_create(asset_id)
+                        registry.register_subscriber(asset_id, update_q, loop)
+                    except Exception:
+                        continue
+            elif msg_type == "unsubscribe":
+                items = payload.get("assets")
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if not isinstance(item, str) or not item:
+                        continue
+                    if item not in subscribed:
+                        continue
+                    subscribed.remove(item)
+                    registry.unregister_subscriber(item, update_q)
+                    last_sent_msg_count.pop(item, None)
+                    last_sent_trade_ts.pop(item, None)
+
+    receiver_task = asyncio.create_task(_receive_messages())
+
+    try:
+        while True:
+            if not subscribed:
+                await asyncio.sleep(BOOK_MIN_SEND_INTERVAL_S)
+                continue
+
+            try:
+                await asyncio.wait_for(update_q.get(), timeout=BOOK_MIN_SEND_INTERVAL_S)
+            except asyncio.TimeoutError:
+                pass
+
+            updates: list[WsPayload] = []
+            for asset_id in tuple(subscribed):
+                book = registry.active_books.get(asset_id)
+                if book is None:
+                    book = registry.get_or_create(asset_id)
+                if not getattr(book, "ready", True):
+                    continue
+                msg_count = int(getattr(book, "msg_count", 0))
+                last_trade = registry.get_last_trade(asset_id)
+                last_trade_ts = int(last_trade.get("timestamp", 0)) if last_trade else 0
+                if (
+                    last_sent_msg_count.get(asset_id) == msg_count
+                    and last_sent_trade_ts.get(asset_id) == last_trade_ts
+                ):
+                    continue
+                last_sent_msg_count[asset_id] = msg_count
+                last_sent_trade_ts[asset_id] = last_trade_ts
+                updates.append(_build_book_payload(asset_id, book, msg_count, last_trade)) #type: ignore
+
+            if updates:
+                await websocket.send_json({"type": "books", "updates": updates})
+    except WebSocketDisconnect:
+        return
+    except Exception as exc:
+        print(f"Books WS Error: {exc}")
+    finally:
+        receiver_task.cancel()
+        for asset_id in tuple(subscribed):
+            registry.unregister_subscriber(asset_id, update_q)
         await _safe_close(websocket)

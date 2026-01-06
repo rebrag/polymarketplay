@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
+import time
 
 from src.server.helpers import _to_float
 from src.server.models import (
@@ -15,6 +16,15 @@ from src.server.strategies import get_strategy_names
 
 router = APIRouter()
 
+def _best_price_from_book(token_id: str, side: str) -> float | None:
+    book = registry.active_books.get(token_id)
+    if book is None or not getattr(book, "ready", False):
+        return None
+    bids, asks = book.get_snapshot(limit=1)
+    if side == "BUY":
+        return bids[0][0] if bids else None
+    return asks[0][0] if asks else None
+
 
 @router.post("/orders/limit")
 def post_limit_order(req: LimitOrderRequest) -> dict[str, object]:
@@ -26,7 +36,15 @@ def post_limit_order(req: LimitOrderRequest) -> dict[str, object]:
     - For SELL, negative offset makes your ask more aggressive (ask lower).
     """
     try:
-        best_price = registry.poly_client.get_best_price(req.token_id, req.side)
+        best_price = _best_price_from_book(req.token_id, req.side)
+        if best_price is None:
+            try:
+                best_price = registry.poly_client.get_best_price(req.token_id, req.side)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"error": "best_price unavailable", "upstream": str(exc)},
+                )
         price = best_price + (req.price_offset_cents / 100.0)
         price = max(0.01, min(0.99, price))
 
@@ -34,14 +52,24 @@ def post_limit_order(req: LimitOrderRequest) -> dict[str, object]:
         if ttl < 0:
             raise HTTPException(status_code=400, detail="ttl_seconds must be >= 0 (or omitted for GTC)")
 
-        result = registry.poly_client.place_limit_order(
-            token_id=req.token_id,
-            side=req.side,
-            size=req.size,
-            price=price,
-            ttl_seconds=ttl + 60,
-        )
-        return {"ok": True, "placed_price": price, "result": result}
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                result = registry.poly_client.place_limit_order(
+                    token_id=req.token_id,
+                    side=req.side,
+                    size=req.size,
+                    price=price,
+                    ttl_seconds=ttl + 60,
+                )
+                return {"ok": True, "placed_price": price, "result": result}
+            except Exception as exc:
+                last_exc = exc
+                if attempt == 0 and "Request exception" in str(exc):
+                    time.sleep(0.25)
+                    continue
+                raise
+        raise last_exc  # type: ignore[misc]
     except HTTPException:
         raise
     except Exception as e:

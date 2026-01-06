@@ -17,14 +17,14 @@ async def lifespan(app: FastAPI):
             while not _mem_log_stop.is_set():
                 try:
                     print(
-                        "MEM_DEBUG active_books=%s tracked_assets=%s subs=%s orders_subs=%s market_threads=%s market_assets=%s user_events=%s",
-                        len(registry.active_books),
-                        len(registry._tracked_assets),
-                        sum(len(v) for v in registry._subs.values()),
-                        len(registry._order_subs),
-                        len(registry._market_threads),
-                        len(registry._market_assets),
-                        registry._user_event_count,
+                        "MEM_DEBUG "
+                        f"active_books={len(registry.active_books)} "
+                        f"tracked_assets={len(registry._tracked_assets)} "
+                        f"subs={sum(len(v) for v in registry._subs.values())} "
+                        f"orders_subs={len(registry._order_subs)} "
+                        f"market_threads={len(registry._market_threads)} "
+                        f"market_assets={len(registry._market_assets)} "
+                        f"user_events={registry._user_event_count}"
                     )
                 except Exception as exc:
                     print(f"MEM_DEBUG failed: {exc}")

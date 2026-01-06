@@ -442,7 +442,14 @@ class BookManager:
                                 ttl_seconds=ttl_seconds,
                             )
                         except Exception as e:
-                            print(f"Auto order failed (asset={asset} side={trade_side}): {e}")
+                            meta = self._asset_meta.get(asset, {})
+                            question = meta.get("question") or "unknown"
+                            outcome = meta.get("outcome") or "unknown"
+                            slug = meta.get("slug") or "unknown"
+                            print(
+                                "Auto order failed "
+                                f"(market={question} outcome={outcome} slug={slug} asset={asset} side={trade_side}): {e}"
+                            )
 
     def set_asset_meta(self, asset_id: str, slug: str | None, question: str | None, outcome: str | None) -> None:
         if not slug or not question:

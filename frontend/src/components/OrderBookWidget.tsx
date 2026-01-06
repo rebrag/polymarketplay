@@ -1,25 +1,11 @@
-import { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo, useTransition } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import { Table, TableBody, TableCell, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-
-interface OrderLevel {
-  price: number;
-  size: number;
-  cum: number;
-}
-
-interface BookState {
-  ready: boolean;
-  msg_count: number;
-  bids: OrderLevel[];
-  asks: OrderLevel[];
-  tick_size: number;
-  last_trade?: LastTrade;
-}
+import type { BookStatus } from "@/stores/bookStore";
+import { useBookStore } from "@/stores/bookStore";
 
 export interface UserPosition {
   price: number;
@@ -58,63 +44,12 @@ interface WidgetProps {
   autoMode?: "client" | "server";
   isHighlighted?: boolean;
   viewMode?: "full" | "mini";
-  onBookUpdate?: (assetId: string, bestBid: number | null, bestAsk: number | null) => void;
   onHeaderClick?: (assetId: string) => void;
   onClose?: (assetId: string) => void;
   apiBaseUrl?: string;
   onAutoSettingsChange?: (assetId: string, settings: { shares: number; ttl: number; level: number }) => void;
 }
 
-interface LastTrade {
-  price: number;
-  size: number;
-  side: "BUY" | "SELL";
-  timestamp: number;
-}
-/* ---------- Strict Runtime Guards ---------- */
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null;
-}
-
-function isOrderLevel(v: unknown): v is OrderLevel {
-  if (!isRecord(v)) return false;
-  return typeof v.price === "number" && typeof v.size === "number" && typeof v.cum === "number";
-}
-
-function parseBookState(payload: unknown): BookState | null {
-  if (!isRecord(payload)) return null;
-  if (payload.status === "loading") return null;
-
-  const { ready, msg_count, bids, asks, tick_size } = payload;
-  if (typeof ready !== "boolean" || typeof msg_count !== "number") return null;
-  if (!Array.isArray(bids) || !Array.isArray(asks)) return null;
-
-  let lastTrade: LastTrade | undefined;
-  const rawLast = (payload as { last_trade?: unknown }).last_trade;
-  if (isRecord(rawLast)) {
-    const price = Number(rawLast.price);
-    const size = Number(rawLast.size);
-    const timestamp = Number(rawLast.timestamp);
-    const side = String(rawLast.side || "").toUpperCase();
-    if (
-      Number.isFinite(price) &&
-      Number.isFinite(size) &&
-      Number.isFinite(timestamp) &&
-      (side === "BUY" || side === "SELL")
-    ) {
-      lastTrade = { price, size, timestamp, side } as LastTrade;
-    }
-  }
-
-  return {
-    ready,
-    msg_count,
-    bids: bids.filter(isOrderLevel),
-    asks: asks.filter(isOrderLevel),
-    tick_size: typeof tick_size === "number" ? tick_size : 0.01,
-    last_trade: lastTrade,
-  };
-}
 
 /* ---------- Utilities ---------- */
 async function copyToClipboard(text: string): Promise<void> {
@@ -166,7 +101,179 @@ function formatVol(num: number): string {
   return num.toFixed(0);
 }
 
-export function OrderBookWidget({
+export function OrderBookWidget(props: WidgetProps) {
+  if (props.viewMode === "mini") {
+    return <OrderBookWidgetMini {...props} />;
+  }
+  return <OrderBookWidgetFull {...props} />;
+}
+
+function OrderBookWidgetMini({
+  assetId,
+  outcomeName,
+  volume,
+  positionShares,
+  positionAvgPrice,
+  auto,
+  isHighlighted,
+  onHeaderClick,
+  onClose,
+}: WidgetProps) {
+  const [, startTransition] = useTransition();
+  const frame = useBookStore((state) => state.frame);
+  const [snapshot, setSnapshot] = useState<ReturnType<typeof useBookStore.getState>["books"][string] | null>(null);
+  const [status, setStatus] = useState<BookStatus>("connecting");
+  const lastTrade = snapshot?.last_trade ?? null;
+  const bestBid = snapshot?.bids?.[0]?.price ?? null;
+  const bestAsk = snapshot?.asks?.[0]?.price ?? null;
+  const tickSize = snapshot?.tick_size ?? 0.01;
+  const [copied, setCopied] = useState(false);
+  const lastTradeTsRef = useRef(0);
+  const [tradeFlashes, setTradeFlashes] = useState<
+    Array<{ value: number; side: "BUY" | "SELL"; timestamp: number }>
+  >([]);
+  const perfRef = useRef({ lastTs: 0, renders: 0 });
+
+  const tradeFlashLabels = useMemo(() => {
+    return tradeFlashes
+      .filter((flash) => Number.isFinite(flash.value) && flash.value > 0)
+      .map((flash) => {
+        const sign = flash.side === "BUY" ? "+" : "-";
+        return { ...flash, label: `${sign}$${flash.value.toFixed(0)}` };
+      });
+  }, [tradeFlashes]);
+
+  useEffect(() => {
+    perfRef.current.renders += 1;
+    const now = performance.now();
+    if (now - perfRef.current.lastTs < 2000) return;
+    perfRef.current.lastTs = now;
+    const win = window as unknown as { __perfCounters?: { widgets?: Record<string, unknown> } };
+    if (!win.__perfCounters) win.__perfCounters = {};
+    if (!win.__perfCounters.widgets) win.__perfCounters.widgets = {};
+    win.__perfCounters.widgets[assetId] = { renders: perfRef.current.renders, ts: Math.round(now) };
+    perfRef.current.renders = 0;
+  });
+
+  useEffect(() => {
+    if (!frame) return;
+    const state = useBookStore.getState();
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setSnapshot(state.books[assetId] ?? null);
+    setStatus(state.status[assetId] ?? "connecting");
+  }, [assetId, frame]);
+
+  useEffect(() => {
+    if (!lastTrade) return;
+    if (!Number.isFinite(lastTrade.timestamp) || lastTrade.timestamp <= 0) return;
+    if (lastTrade.timestamp === lastTradeTsRef.current) return;
+    lastTradeTsRef.current = lastTrade.timestamp;
+    const value = Math.max(0, lastTrade.price * lastTrade.size);
+    const flash = { value, side: lastTrade.side, timestamp: lastTrade.timestamp };
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setTradeFlashes((prev) => [flash, ...prev].slice(0, 5));
+    const timerId = window.setTimeout(() => {
+      setTradeFlashes((prev) => prev.filter((item) => item.timestamp !== lastTrade.timestamp));
+    }, 3000);
+    return () => {
+      window.clearTimeout(timerId);
+    };
+  }, [lastTrade]);
+
+  const holdingLabel =
+    positionShares && positionShares > 0
+      ? `${Number(positionShares).toFixed(2)} sh`
+      : null;
+  const avgLabel =
+    positionAvgPrice && positionAvgPrice > 0 ? `${formatCents(positionAvgPrice, tickSize)}¢` : null;
+
+  const handleCopyAssetId = useCallback(async (): Promise<void> => {
+    await copyToClipboard(assetId);
+    startTransition(() => setCopied(true));
+    setTimeout(() => startTransition(() => setCopied(false)), 900);
+  }, [assetId, startTransition]);
+
+  return (
+    <div className="relative">
+      {onClose && (
+        <button onClick={() => onClose(assetId)} className="absolute -top-3 right-3 z-20 h-7 w-7 rounded-full border border-slate-800 bg-slate-950 text-slate-300 hover:text-white">×</button>
+      )}
+      <Card
+        className={`border-slate-800 bg-slate-950 text-slate-200 w-full h-[140px] flex flex-col shrink-0 transition-all ${
+          isHighlighted ? "ring-2 ring-blue-500" : ""
+        } ${auto ? "ring-2 ring-amber-400/80" : ""}`}
+      >
+        <CardHeader
+          className="pb-2 pt-4 px-4 bg-slate-950 rounded-t-lg cursor-pointer"
+          onClick={() => {
+            if (!onHeaderClick) return;
+            startTransition(() => onHeaderClick(assetId));
+          }}
+        >
+          <div className="flex justify-between items-start gap-2">
+            <div className="flex flex-col overflow-hidden">
+              <CardTitle className="text-sm font-bold text-white truncate">{outcomeName}</CardTitle>
+              <div className="flex items-center gap-2 mt-1">
+                <button
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    handleCopyAssetId();
+                  }}
+                  className="text-[10px] text-slate-600 font-mono hover:text-slate-200"
+                >
+                  {assetId.slice(0, 8)}...
+                </button>
+                {copied && <span className="text-[10px] font-mono text-green-400">Copied</span>}
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className={`h-1.5 w-1.5 rounded-full ${status === "live" ? "bg-green-500" : "bg-red-500"}`} />
+              <span className="text-[10px] text-blue-400 font-mono">${formatVol(volume)}</span>
+            </div>
+          </div>
+          {holdingLabel && (
+            <div className="mt-2 text-[10px] font-mono text-emerald-400">
+              HOLD {holdingLabel}{avgLabel ? ` @ ${avgLabel}` : ""}
+            </div>
+          )}
+        </CardHeader>
+        <CardContent className="px-4 pb-4 pt-0 flex items-center justify-between gap-2 h-full">
+          <div className="flex-1 bg-green-950/20 border border-green-900/30 rounded p-2 flex flex-col items-center">
+            <span className="text-[10px] text-green-600 uppercase font-bold">Bid</span>
+            <span className="text-xl font-mono text-green-400">{bestBid !== null ? formatPrice(bestBid, tickSize) : "-"}</span>
+          </div>
+          <div className="flex-1 bg-red-950/20 border border-red-900/30 rounded p-2 flex flex-col items-center">
+            <span className="text-[10px] text-red-600 uppercase font-bold">Ask</span>
+            <span className="text-xl font-mono text-red-400">{bestAsk !== null ? formatPrice(bestAsk, tickSize) : "-"}</span>
+          </div>
+        </CardContent>
+      </Card>
+      {tradeFlashLabels.map((flash, idx) => (
+        <div
+          key={`trade-${flash.timestamp}`}
+          className={`pointer-events-none absolute left-4 top-4 text-sm font-bold ${
+            flash.side === "BUY" ? "text-emerald-400" : "text-red-400"
+          } trade-flash`}
+          style={{ ["--flash-offset" as string]: `${idx * 16}px` }}
+        >
+          {flash.label}
+        </div>
+      ))}
+      <style>{`
+        @keyframes trade-flash-rise {
+          0% { opacity: 0; transform: translateY(calc(var(--flash-offset) + 6px)); }
+          15% { opacity: 1; transform: translateY(var(--flash-offset)); }
+          100% { opacity: 0; transform: translateY(calc(var(--flash-offset) - 10px)); }
+        }
+        .trade-flash {
+          animation: trade-flash-rise 3s ease-out forwards;
+        }
+      `}</style>
+    </div>
+  );
+}
+
+function OrderBookWidgetFull({
   assetId,
   outcomeName,
   volume,
@@ -187,24 +294,21 @@ export function OrderBookWidget({
   autoTradeSide,
   autoMode = "client",
   isHighlighted,
-  viewMode = "full",
-  onBookUpdate,
   onHeaderClick,
   onClose,
   apiBaseUrl = "http://localhost:8000",
   sourceSlug,
   onAutoSettingsChange,
 }: WidgetProps) {
-  const [data, setData] = useState<BookState | null>(null);
-  const [status, setStatus] = useState<"connecting" | "live" | "error">("connecting");
+  const [, startTransition] = useTransition();
+  const frame = useBookStore((state) => state.frame);
+  const [data, setData] = useState<ReturnType<typeof useBookStore.getState>["books"][string] | null>(null);
+  const [status, setStatus] = useState<BookStatus>("connecting");
   const [copied, setCopied] = useState(false);
-  
-  const ws = useRef<WebSocket | null>(null);
+
   const spreadRef = useRef<HTMLTableRowElement>(null);
   const lastSpreadScrollRef = useRef(0);
   const autoPlacedRef = useRef(false); // Track if auto order has been placed
-  const lastParseErrorRef = useRef(0);
-  const parseErrorCountRef = useRef(0);
   const scrollTimerRef = useRef<number | null>(null);
   const lastTradeTsRef = useRef(0);
   // const tradeFlashTimerRef = useRef<number | null>(null);
@@ -231,9 +335,13 @@ export function OrderBookWidget({
   const bestBid = data?.bids?.[0]?.price ?? null;
   const bestAsk = data?.asks?.[0]?.price ?? null;
   const tickSize = data?.tick_size ?? 0.01;
+
   useEffect(() => {
-    onBookUpdate?.(assetId, bestBid, bestAsk);
-  }, [assetId, bestBid, bestAsk, onBookUpdate]);
+    if (!frame) return;
+    const state = useBookStore.getState();
+    setData(state.books[assetId] ?? null);
+    setStatus(state.status[assetId] ?? "connecting");
+  }, [assetId, frame]);
   const tradeFlashLabels = useMemo(() => {
     return tradeFlashes
       .filter((flash) => Number.isFinite(flash.value) && flash.value > 0)
@@ -321,83 +429,7 @@ export function OrderBookWidget({
   );
 
   useEffect(() => {
-    let isMounted = true;
-    let reconnectTimer: number | null = null;
-    let reconnectAttempts = 0;
-
-    const params = new URLSearchParams();
-    if (sourceSlug) params.set("slug", sourceSlug);
-    if (marketQuestion) params.set("market_question", marketQuestion);
-    if (outcomeName) params.set("outcome", outcomeName);
-
-    const scheduleReconnect = () => {
-      if (reconnectTimer !== null || !isMounted) return;
-      const backoff = Math.min(5000, 500 * Math.pow(2, reconnectAttempts));
-      const jitter = Math.floor(Math.random() * 250);
-      reconnectAttempts += 1;
-      reconnectTimer = window.setTimeout(() => {
-        reconnectTimer = null;
-        connect();
-      }, backoff + jitter);
-    };
-
-    const connect = () => {
-      if (!isMounted) return;
-      setStatus("connecting");
-      const socket = new WebSocket(`ws://localhost:8000/ws/${assetId}?${params.toString()}`);
-      ws.current = socket;
-
-      socket.onopen = () => {
-        reconnectAttempts = 0;
-        if (isMounted) setStatus("live");
-      };
-      socket.onclose = () => {
-        if (isMounted) setStatus("connecting");
-        scheduleReconnect();
-      };
-      socket.onerror = () => {
-        if (isMounted) setStatus("error");
-      };
-
-      socket.onmessage = (event) => {
-        if (!isMounted) return;
-        try {
-          if (typeof event.data !== "string") return;
-          const trimmed = event.data.trim();
-          if (!trimmed || (trimmed[0] !== "{" && trimmed[0] !== "[")) return;
-          const parsed: unknown = JSON.parse(trimmed);
-          const next = parseBookState(parsed);
-          if (next) setData(next);
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars
-        } catch (e) {
-          parseErrorCountRef.current += 1;
-          lastParseErrorRef.current = Date.now();
-        }
-      };
-    };
-
-    connect();
-
-    return () => {
-      isMounted = false;
-      if (reconnectTimer !== null) {
-        window.clearTimeout(reconnectTimer);
-      }
-      const socket = ws.current;
-      if (socket) {
-        socket.onopen = null;
-        socket.onclose = null;
-        socket.onerror = null;
-        socket.onmessage = null;
-        socket.close();
-      }
-      ws.current = null;
-    };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [assetId, marketQuestion, outcomeName, sourceSlug]);
-
-  useEffect(() => {
-    if (viewMode !== "full" || !data?.ready || !spreadRef.current) return;
+    if (!data?.ready || !spreadRef.current) return;
     const now = Date.now();
     if (now - lastSpreadScrollRef.current < 200) return;
     lastSpreadScrollRef.current = now;
@@ -406,7 +438,7 @@ export function OrderBookWidget({
     }
     scrollTimerRef.current = window.setTimeout(() => {
       const row = spreadRef.current;
-      const viewport = row?.closest("[data-radix-scroll-area-viewport]") as HTMLElement | null;
+      const viewport = row?.parentElement?.parentElement as HTMLElement | null;
       if (row && viewport) {
         viewport.scrollTop = row.offsetTop - viewport.clientHeight / 2 + row.offsetHeight / 2;
       }
@@ -418,7 +450,7 @@ export function OrderBookWidget({
         scrollTimerRef.current = null;
       }
     };
-  }, [data?.ready, data?.asks.length, data?.bids.length, viewMode]);
+  }, [data?.ready, data?.asks.length, data?.bids.length]);
 
   useEffect(() => {
     const last = data?.last_trade;
@@ -444,7 +476,6 @@ export function OrderBookWidget({
         return;
       }
       lastOrderTsRef.current = now;
-      setPlacing(side === "BUY" ? "buy" : "sell");
       const calculatedOffset = side === "BUY" ? buyOffsetCents : sellOffsetCents;
 
       const payload = {
@@ -455,15 +486,23 @@ export function OrderBookWidget({
         price_offset_cents: calculatedOffset,
       };
 
-      await fetch(`${apiBaseUrl}/orders/limit`, {
+      const request = fetch(`${apiBaseUrl}/orders/limit`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
+        keepalive: true,
       });
+      const placingTimer = window.setTimeout(() => {
+        startTransition(() => setPlacing(side === "BUY" ? "buy" : "sell"));
+      }, 120);
+      void request
+        .catch(() => {})
+        .finally(() => {
+          window.clearTimeout(placingTimer);
+          startTransition(() => setPlacing("idle"));
+        });
     } catch (e) {
       console.error("Order failed", { e });
-    } finally {
-      setPlacing("idle");
     }
   };
 
@@ -614,9 +653,8 @@ export function OrderBookWidget({
 
   // NEW: Auto-trading logic - place order when auto is true and no open orders exist
   useEffect(() => {
-    // Only run in full view mode with auto enabled
-    if (autoMode === "server" || viewMode !== "full" || !auto) {
-      autoPlacedRef.current = false; // Reset when auto is disabled
+    if (autoMode === "server" || !auto) {
+      autoPlacedRef.current = false;
       return;
     }
 
@@ -641,16 +679,15 @@ export function OrderBookWidget({
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
-    data?.ready, 
-    bestBid, 
-    bestAsk, 
-    openOrders.length, 
-    auto, 
-    viewMode, 
-    placing, 
+    data?.ready,
+    bestBid,
+    bestAsk,
+    openOrders.length,
+    auto,
+    placing,
     assetId,
     autoTradeSide,
-    getAutoTradeSide, // Add dependency
+    getAutoTradeSide,
   ]);
 
   // NEW: Reset auto placement flag when auto prop changes
@@ -725,9 +762,9 @@ export function OrderBookWidget({
 
   const handleCopyAssetId = useCallback(async (): Promise<void> => {
     await copyToClipboard(assetId);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 900);
-  }, [assetId]);
+    startTransition(() => setCopied(true));
+    setTimeout(() => startTransition(() => setCopied(false)), 900);
+  }, [assetId, startTransition]);
 
  
 
@@ -754,88 +791,7 @@ export function OrderBookWidget({
   //   }
   // };
 
-  if (viewMode === "mini") {
-    const holdingLabel =
-      positionShares && positionShares > 0 ? `${positionShares.toFixed(2)} sh` : null;
-    const avgLabel =
-      positionAvgPrice && positionAvgPrice > 0 ? `${formatCents(positionAvgPrice, tickSize)}¢` : null;
-    return (
-      <div className="relative">
-        {onClose && (
-          <button onClick={() => onClose(assetId)} className="absolute -top-3 right-3 z-20 h-7 w-7 rounded-full border border-slate-800 bg-slate-950 text-slate-300 hover:text-white">×</button>
-        )}
-        <Card
-          className={`border-slate-800 bg-slate-950 text-slate-200 w-full h-[140px] flex flex-col shrink-0 transition-all ${
-            isHighlighted ? "ring-2 ring-blue-500" : ""
-          } ${auto ? "ring-2 ring-amber-400/80" : ""}`}
-        >
-          <CardHeader
-            className="pb-2 pt-4 px-4 bg-slate-950 rounded-t-lg cursor-pointer"
-            onClick={() => onHeaderClick?.(assetId)}
-          >
-            <div className="flex justify-between items-start gap-2">
-              <div className="flex flex-col overflow-hidden">
-                <CardTitle className="text-sm font-bold text-white truncate">{outcomeName}</CardTitle>
-                <div className="flex items-center gap-2 mt-1">
-                  <button
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      handleCopyAssetId();
-                    }}
-                    className="text-[10px] text-slate-600 font-mono hover:text-slate-200"
-                  >
-                    {assetId.slice(0, 8)}...
-                  </button>
-                  {copied && <span className="text-[10px] font-mono text-green-400">Copied</span>}
-                </div>
-              </div>
-              <div className="flex items-center gap-1.5">
-                <span className={`h-1.5 w-1.5 rounded-full ${status === "live" ? "bg-green-500" : "bg-red-500"}`} />
-                <span className="text-[10px] text-blue-400 font-mono">${formatVol(volume)}</span>
-              </div>
-            </div>
-            {holdingLabel && (
-              <div className="mt-2 text-[10px] font-mono text-emerald-400">
-                HOLD {holdingLabel}{avgLabel ? ` @ ${avgLabel}` : ""}
-              </div>
-            )}
-          </CardHeader>
-          <CardContent className="px-4 pb-4 pt-0 flex items-center justify-between gap-2 h-full">
-            <div className="flex-1 bg-green-950/20 border border-green-900/30 rounded p-2 flex flex-col items-center">
-              <span className="text-[10px] text-green-600 uppercase font-bold">Bid</span>
-              <span className="text-xl font-mono text-green-400">{bestBid !== null ? formatPrice(bestBid, tickSize) : "-"}</span>
-            </div>
-            <div className="flex-1 bg-red-950/20 border border-red-900/30 rounded p-2 flex flex-col items-center">
-              <span className="text-[10px] text-red-600 uppercase font-bold">Ask</span>
-              <span className="text-xl font-mono text-red-400">{bestAsk !== null ? formatPrice(bestAsk, tickSize) : "-"}</span>
-            </div>
-          </CardContent>
-        </Card>
-        {tradeFlashLabels.map((flash, idx) => (
-          <div
-            key={`trade-${flash.timestamp}`}
-            className={`pointer-events-none absolute left-4 top-4 text-sm font-bold ${
-              flash.side === "BUY" ? "text-emerald-400" : "text-red-400"
-            } trade-flash`}
-            style={{ ["--flash-offset" as string]: `${idx * 16}px` }}
-          >
-            {flash.label}
-          </div>
-        ))}
-        <style>{`
-          @keyframes trade-flash-rise {
-            0% { opacity: 0; transform: translateY(calc(var(--flash-offset) + 6px)); }
-            15% { opacity: 1; transform: translateY(var(--flash-offset)); }
-            100% { opacity: 0; transform: translateY(calc(var(--flash-offset) - 10px)); }
-          }
-          .trade-flash {
-            animation: trade-flash-rise 3s ease-out forwards;
-          }
-        `}</style>
-      </div>
-    );
-  }
-
+  
   return (
     <div className="relative">
       {onClose && (
@@ -897,9 +853,9 @@ export function OrderBookWidget({
             </div>
           ) : (
             <>
-              <ScrollArea className="flex-1 w-full">
-                <Table className="table-fixed">
-                  <TableBody className="text-xs font-mono">
+            <div className="flex-1 w-full overflow-y-auto overscroll-contain [&::-webkit-scrollbar]:hidden">
+              <Table className="table-fixed">
+                <TableBody className="text-xs font-mono">
                     {data.asks.slice().reverse().map((row, i) => {
                       const isBestAsk = i === data.asks.length - 1;
                       const priceKey = formatOrderKey(row.price, tickSize);
@@ -991,7 +947,7 @@ export function OrderBookWidget({
                     })}
                   </TableBody>
                 </Table>
-              </ScrollArea>
+            </div>
 
                 <div className="mt-0 grid grid-cols-2 gap-2">
                   <div className="space-y-1">
