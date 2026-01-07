@@ -9,10 +9,10 @@ from typing import Final, Iterable
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from src.models import GammaMarket, WsBidAsk, WsPayload
-from src.server.order_utils import normalize_open_orders
-from src.server.state import registry
-from src.utils import filter_markets_by_asset, get_game_data
+from polymarket_bot.models import GammaMarket, WsBidAsk, WsPayload
+from polymarket_bot.server.order_utils import normalize_open_orders
+from polymarket_bot.server.state import registry
+from polymarket_bot.utils import filter_markets_by_asset, get_game_data
 
 router = APIRouter()
 

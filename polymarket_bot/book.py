@@ -2,7 +2,7 @@ import threading
 import asyncio
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, List, Tuple, cast
-from src.models import WsBookMessage, WsPriceChangeMessage, WsTickSizeChangeMessage
+from polymarket_bot.models import WsBookMessage, WsPriceChangeMessage, WsTickSizeChangeMessage
 
 type PriceSize = Tuple[float, float]
 

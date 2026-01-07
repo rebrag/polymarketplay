@@ -4,9 +4,9 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException
 
-from src.models import GammaEvent, GammaMarket
-from src.server.state import registry
-from src.utils import get_game_data
+from polymarket_bot.models import GammaEvent, GammaMarket
+from polymarket_bot.server.state import registry
+from polymarket_bot.utils import get_game_data
 
 router = APIRouter()
 

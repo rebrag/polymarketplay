@@ -10,9 +10,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Literal, Set, cast
 
-from src.book import OrderBook
-from src.clients import PolyClient, PolySocket, UserSocket
-from src.models import (
+from polymarket_bot.book import OrderBook
+from polymarket_bot.clients import PolyClient, PolySocket, UserSocket
+from polymarket_bot.models import (
     Order,
     WsBookMessage,
     WsLastTrade,
@@ -20,9 +20,9 @@ from src.models import (
     WsPriceChangeMessage,
     WsTickSizeChangeMessage,
 )
-from src.server.helpers import _to_float, _to_int, _to_side
-from src.server.models import AutoPairConfig
-from src.server.strategies import OrderIntent, PairContext, get_strategy
+from polymarket_bot.server.helpers import _to_float, _to_int, _to_side
+from polymarket_bot.server.models import AutoPairConfig
+from polymarket_bot.server.strategies import OrderIntent, PairContext, get_strategy
 
 
 class BookManager:

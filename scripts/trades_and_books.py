@@ -13,11 +13,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-# --- IMPORTS FROM SRC ---
-from src.config import GIAYN_ADDRESS,REST_URL,GAMMA_URL,OUTPUT_ROOT,TRADES_CSV_PATH
-from src.models import TradeActivity,GammaEvent,WsBookMessage,WsPriceChangeMessage
-from src.clients import PolyClient, PolySocket
-from src.book import OrderBook
+# --- IMPORTS FROM PROJECT ---
+from polymarket_bot.config import GIAYN_ADDRESS,REST_URL,GAMMA_URL,OUTPUT_ROOT,TRADES_CSV_PATH
+from polymarket_bot.models import TradeActivity,GammaEvent,WsBookMessage,WsPriceChangeMessage
+from polymarket_bot.clients import PolyClient, PolySocket
+from polymarket_bot.book import OrderBook
 
 # --- CONSTANTS ---
 POLL_SECONDS = 2.0

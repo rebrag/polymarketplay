@@ -14,9 +14,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-from src.clients import PolyClient
-from src.config import GIAYN_ADDRESS, CLOB_URL
-from src.models import TradeActivity
+from polymarket_bot.clients import PolyClient
+from polymarket_bot.config import GIAYN_ADDRESS, CLOB_URL
+from polymarket_bot.models import TradeActivity
 
 # --- CONFIG ---
 load_dotenv()

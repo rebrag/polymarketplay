@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException
 
 from py_clob_client.clob_types import OpenOrderParams  # type: ignore
-from src.server.state import logger, registry
+from polymarket_bot.server.state import logger, registry
 
 router = APIRouter()
 

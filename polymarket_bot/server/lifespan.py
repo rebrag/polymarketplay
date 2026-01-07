@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from src.server.state import registry
+from polymarket_bot.server.state import registry
 
 _mem_log_stop = threading.Event()
 

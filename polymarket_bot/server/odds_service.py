@@ -4,8 +4,8 @@ import os
 import time
 from typing import cast
 
-from src.clients import OddsApiClient
-from src.config import ODDS_SPORT_KEY
+from polymarket_bot.clients import OddsApiClient
+from polymarket_bot.config import ODDS_SPORT_KEY
 
 _odds_cache: dict[str, tuple[float, list[dict[str, object]]]] = {}
 _odds_clients: dict[str, OddsApiClient] = {}

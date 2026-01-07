@@ -3,16 +3,16 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 import time
 
-from src.server.helpers import _to_float
-from src.server.models import (
+from polymarket_bot.server.helpers import _to_float
+from polymarket_bot.server.models import (
     AutoPairConfig,
     AutoPairPayload,
     CancelOrderRequest,
     LimitOrderRequest,
     MarketOrderRequest,
 )
-from src.server.state import logger, registry
-from src.server.strategies import get_strategy_names
+from polymarket_bot.server.state import logger, registry
+from polymarket_bot.server.strategies import get_strategy_names
 
 router = APIRouter()
 

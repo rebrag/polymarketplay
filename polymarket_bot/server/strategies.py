@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Protocol
 
-from src.server.models import AutoPairConfig
+from polymarket_bot.server.models import AutoPairConfig
 
 
 @dataclass(frozen=True)

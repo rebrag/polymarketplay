@@ -10,11 +10,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-from src.clients import PolyClient, OddsApiClient
-from src.engine import PolymarketEngine
-from src.utils import get_fair_prob
+from polymarket_bot.clients import PolyClient, OddsApiClient
+from polymarket_bot.engine import PolymarketEngine
+from polymarket_bot.utils import get_fair_prob
 # FIX: Import the new generic config variables
-from src.config import POLY_TAG_ID, ODDS_SPORT_KEY
+from polymarket_bot.config import POLY_TAG_ID, ODDS_SPORT_KEY
 
 load_dotenv()
 ODDS_API_KEY = os.getenv('ODDS_KEY', '')

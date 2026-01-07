@@ -2,8 +2,8 @@ import json
 import requests
 from typing import List, Any, Dict, cast, Optional
 from urllib.parse import urlparse # <--- New Import
-from src.config import GAMMA_URL
-from src.models import GammaEvent, GammaMarket
+from polymarket_bot.config import GAMMA_URL
+from polymarket_bot.models import GammaEvent, GammaMarket
 
 def normalize_point(point: float | str | None) -> str:
     if point is None:

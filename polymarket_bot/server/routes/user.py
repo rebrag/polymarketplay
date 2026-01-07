@@ -4,9 +4,9 @@ from typing import Literal
 
 from fastapi import APIRouter, HTTPException
 
-from src.models import BalanceAllowanceResponse, GammaMarket, UserActivityResponse
-from src.server.state import logger, registry
-from src.utils import filter_markets_by_asset, get_game_data
+from polymarket_bot.models import BalanceAllowanceResponse, GammaMarket, UserActivityResponse
+from polymarket_bot.server.state import logger, registry
+from polymarket_bot.utils import filter_markets_by_asset, get_game_data
 
 router = APIRouter()
 

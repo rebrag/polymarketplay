@@ -7,7 +7,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
 
-from src.server.helpers import _safe_path_segment
+from polymarket_bot.server.helpers import _safe_path_segment
 
 router = APIRouter()
 

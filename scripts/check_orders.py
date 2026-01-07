@@ -2,8 +2,8 @@ import os
 import sys
 from dotenv import load_dotenv
 from py_clob_client.client import ClobClient # type: ignore
-from src.clients import PolyClient
-from src.config import CLOB_URL
+from polymarket_bot.clients import PolyClient
+from polymarket_bot.config import CLOB_URL
 
 def main():
     load_dotenv()

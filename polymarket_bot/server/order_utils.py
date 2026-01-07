@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from src.models import Order
-from src.server.helpers import _to_int, _to_side
+from polymarket_bot.models import Order
+from polymarket_bot.server.helpers import _to_int, _to_side
 
 
 def normalize_open_orders(raw_orders: list[dict[str, object]]) -> list[Order]:

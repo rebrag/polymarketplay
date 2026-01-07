@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
-from src.config import ODDS_SPORT_KEY
-from src.server.helpers import _extract_team_from_question, _normalize_name, _ratio, _to_float
-from src.server.odds_service import get_cached_odds, get_cached_odds_sports
+from polymarket_bot.config import ODDS_SPORT_KEY
+from polymarket_bot.server.helpers import _extract_team_from_question, _normalize_name, _ratio, _to_float
+from polymarket_bot.server.odds_service import get_cached_odds, get_cached_odds_sports
 
 router = APIRouter()
 

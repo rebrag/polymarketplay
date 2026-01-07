@@ -27,7 +27,7 @@ def quick_test() -> None:
         # 3. FIX: For COLLATERAL, token_id must be None or omitted
         params = BalanceAllowanceParams(
             asset_type=AssetType.COLLATERAL,
-            token_id=None # Setting this to None fixes the 400 error
+            token_id=None #type: ignore - Setting this to None fixes the 400 error
         )
         params.signature_type = -1 
 
@@ -38,8 +38,8 @@ def quick_test() -> None:
         data = cast(Dict[str, str], raw_resp)
 
         print("\n✅ SUCCESS!")
-        print(f"💰 Cash Balance: ${data['balance']}")
-        print(f"🔓 Allowance:    ${data['allowance']}")
+        print(f"💰 Cash Balance: ${float(float(data['balance'])/1000000)}")
+        # print(f"🔓 Allowance:    ${data['allowance']}") #polymarket clob might have changed the name of allowance
 
     except Exception as e:
         print(f"❌ Critical Error: {e}")

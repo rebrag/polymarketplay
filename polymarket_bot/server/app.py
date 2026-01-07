@@ -4,8 +4,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.server.lifespan import lifespan
-from src.server.routes import debug, events, logs, odds, orders, user, ws
+from polymarket_bot.server.lifespan import lifespan
+from polymarket_bot.server.routes import debug, events, logs, odds, orders, user, ws
 
 load_dotenv()
 

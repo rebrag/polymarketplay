@@ -1,12 +1,12 @@
 import sys
 from pathlib import Path
 
-# Setup root path to find src/
+# Setup root path to find polymarket_bot
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-from src.clients import PolyClient
+from polymarket_bot.clients import PolyClient
 
 def main():
     client = PolyClient()

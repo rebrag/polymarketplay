@@ -5,8 +5,8 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich import box
-from src.clients import PolyClient, PolySocket
-from src.book import OrderBook
+from polymarket_bot.clients import PolyClient, PolySocket
+from polymarket_bot.book import OrderBook
 
 TARGET_SLUG = "lol-lng-jdg-2025-12-21"
 TARGET_OUTCOME = "LNG Esports"

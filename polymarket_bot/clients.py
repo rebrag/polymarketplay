@@ -10,8 +10,8 @@ import websocket
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Literal, Protocol, TypedDict, cast
 
-from src.config import GAMMA_URL, REST_URL, WSS_URL, WSS_USER_URL
-from src.models import (
+from polymarket_bot.config import GAMMA_URL, REST_URL, WSS_URL, WSS_USER_URL
+from polymarket_bot.models import (
     BalanceAllowanceResponse,
     GammaEvent,
     Order,

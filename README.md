@@ -8,7 +8,7 @@ This project is a quantitative trading tool designed to:
 
 ## 📂 Project Structure
 
-This project is designed with a "Scripts & Source" architecture. The heavy lifting is done in the `src/` directory, while `scripts/` contains the executable tools you will actually run.
+This project is designed with a "Scripts & Source" architecture. The heavy lifting is done in the `polymarket_bot/` directory, while `scripts/` contains the executable tools you will actually run.
 
 ```text
 ├── scripts/                 # <--- 🚀 RUN THESE FILES
@@ -19,7 +19,7 @@ This project is designed with a "Scripts & Source" architecture. The heavy lifti
 │   ├── check_orders.py      # Checks your current open orders
 │   └── lookup_game.py       # Quick utility to find Market IDs/Slugs
 │
-├── src/                     # Core logic (Do not edit unless developing)
+├── polymarket_bot/          # Core logic (Do not edit unless developing)
 │   ├── clients.py           # API Wrappers (HTTP & WebSocket)
 │   ├── engine.py            # Matching engine for market reconciliation
 │   ├── book.py              # Local OrderBook management
@@ -37,7 +37,7 @@ A Polymarket Account (with USDC on Polygon)
 (Optional) An API Key from The Odds API for edge scanning
 
 2. Installation
-Clone the repo and install the project in editable mode. This ensures all scripts can find the src module automatically without path hacks.
+Clone the repo and install the project in editable mode. This ensures all scripts can find the polymarket_bot module automatically without path hacks.
 
 ```
 # 1. Clone the repository
@@ -107,11 +107,7 @@ This software involves financial risk. The py-clob-client executes real transact
 
 Always test with small sizes first.
 
-Secure your .env file. Never commit your Private Key to GitHub.
-
 The authors are not responsible for financial losses incurred by using this software.
 
 🤝 Contributing
 Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
-
-Please ensure strict typing (mypy --strict) is maintained when modifying src/.

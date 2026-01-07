@@ -9,7 +9,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from rich.console import Console
 from rich.panel import Panel
 from rich.tree import Tree
-from src.utils import get_game_data
+from polymarket_bot.utils import get_game_data
 
 def main():
     console = Console()

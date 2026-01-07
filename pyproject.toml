@@ -10,9 +10,11 @@ dependencies = [
     "python-dotenv",
     "websocket-client",
     "py-clob-client",
-    "thefuzz"
+    "thefuzz",
+    "fastapi",
+    "uvicorn[standard]"
 ]
 
 [tool.setuptools.packages.find]
-where = ["."]  # Scans for 'src' and other packages
-include = ["src*"]
+where = ["."]  # Scans for project packages
+include = ["polymarket_bot*", "scripts*"]

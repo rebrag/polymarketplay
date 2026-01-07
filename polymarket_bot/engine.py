@@ -3,8 +3,8 @@ import re
 from typing import List, Optional, Tuple, TypedDict, Any, cast
 from thefuzz import fuzz # type: ignore
 
-from src.models import GammaEvent
-from src.utils import normalize_point
+from polymarket_bot.models import GammaEvent
+from polymarket_bot.utils import normalize_point
 
 class EngineMarket(TypedDict):
     question: str
