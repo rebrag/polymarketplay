@@ -30,6 +30,10 @@ function toNumber(val: number | string | undefined): number {
 }
 
 export function PositionsTable({ positions, onSelect }: PositionsTableProps) {
+  const logRender = import.meta.env.DEV;
+  if (logRender) {
+    console.time("render:PositionsTable");
+  }
   const normalized = positions
     .map((p) => ({
       ...p,
@@ -43,7 +47,7 @@ export function PositionsTable({ positions, onSelect }: PositionsTableProps) {
     .sort((a, b) => b.valueNum - a.valueNum)
     .slice(0, 12);
 
-  return (
+  const content = (
     <div className="rounded-md border border-slate-800 bg-slate-900/50 w-full">
       <div className="px-3 py-2 border-b border-slate-800 bg-slate-950 flex items-center justify-between">
         <span className="text-[10px] uppercase font-bold text-slate-400">Positions</span>
@@ -105,4 +109,8 @@ export function PositionsTable({ positions, onSelect }: PositionsTableProps) {
       </ScrollArea>
     </div>
   );
+  if (logRender) {
+    console.timeEnd("render:PositionsTable");
+  }
+  return content;
 }

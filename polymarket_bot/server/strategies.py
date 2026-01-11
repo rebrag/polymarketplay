@@ -38,10 +38,11 @@ class DefaultStrategy:
         other_asset = ctx.assets[1] if asset_id == ctx.assets[0] else ctx.assets[0]
         current_shares = ctx.positions.get(asset_id, 0.0)
         other_shares = ctx.positions.get(other_asset, 0.0)
-        if current_shares >= 25:
-            return []
+        both_over_10 = current_shares >= 10 and other_shares >= 10
         exposure_diff = current_shares - other_shares
-        trade_side = "SELL" if ctx.both_over or exposure_diff >= config.auto_sell_min_shares else "BUY"
+        trade_side = "SELL" if both_over_10 or exposure_diff >= config.auto_sell_min_shares else "BUY"
+        if trade_side == "BUY" and current_shares >= 15:
+            return []
         if trade_side == "BUY" and not ctx.buy_allowed:
             return []
         if trade_side == "SELL" and not ctx.sell_allowed:

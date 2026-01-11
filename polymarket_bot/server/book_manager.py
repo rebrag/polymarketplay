@@ -164,14 +164,14 @@ class BookManager:
                         "side": cast(Literal["BUY", "SELL"], side_val),
                         "timestamp": ts_val,
                     }
-                    print(
-                        "Last trade received (asset_id=%s side=%s price=%s size=%s ts=%s)",
-                        asset_id_str,
-                        side_val,
-                        price_val,
-                        size_val,
-                        ts_val,
-                    )
+                    # print(
+                    #     "Last trade received (asset_id=%s side=%s price=%s size=%s ts=%s)",
+                    #     asset_id_str,
+                    #     side_val,
+                    #     price_val,
+                    #     size_val,
+                    #     ts_val,
+                    # )
                     self.notify_updated(asset_id_str)
 
                 self._socket.on_book = _on_book
@@ -341,6 +341,12 @@ class BookManager:
         buy_price = min(best_ask - tick, best_bid + level * tick)
         sell_price = max(best_bid + tick, best_ask - level * tick)
         return buy_price if side == "BUY" else sell_price
+
+    def get_price_for_level(self, token_id: str, side: str, level: int) -> float | None:
+        book = self.active_books.get(token_id)
+        if book is None or not getattr(book, "ready", False):
+            return None
+        return self._price_for_level(book, side, level)
 
     def _run_auto_loop(self) -> None:
         while not self._auto_stop.is_set():

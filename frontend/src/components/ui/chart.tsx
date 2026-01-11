@@ -1,7 +1,6 @@
 "use client";
 
 import * as React from "react";
-import type { TooltipProps } from "recharts";
 import { Tooltip, ResponsiveContainer } from "recharts";
 import { cn } from "@/lib/utils";
 
@@ -19,10 +18,10 @@ const ChartContainer = React.forwardRef<
   HTMLDivElement,
   React.HTMLAttributes<HTMLDivElement> & { config: ChartConfig }
 >(({ className, config, children, ...props }, ref) => {
-  const style: React.CSSProperties = {};
+  const style = {} as React.CSSProperties & Record<string, string>;
   Object.entries(config).forEach(([key, value]) => {
     if (value.color) {
-      style[`--color-${key}` as keyof React.CSSProperties] = value.color;
+      style[`--color-${key}`] = value.color;
     }
   });
   return (
@@ -42,11 +41,18 @@ ChartContainer.displayName = "ChartContainer";
 
 const ChartTooltip = Tooltip;
 
-function ChartTooltipContent({
-  active,
-  payload,
-  label,
-}: TooltipProps<number, string>) {
+type ChartTooltipPayload = {
+  dataKey?: string | number;
+  value?: number | string;
+};
+
+type ChartTooltipProps = {
+  active?: boolean;
+  payload?: ChartTooltipPayload[];
+  label?: string | number;
+};
+
+function ChartTooltipContent({ active, payload, label }: ChartTooltipProps) {
   const config = React.useContext(ChartContext) ?? {};
   if (!active || !payload?.length) return null;
   return (

@@ -43,6 +43,7 @@ class LimitOrderRequest(BaseModel):
     size: float = Field(gt=0)
     ttl_seconds: int = Field(default=0)
     price_offset_cents: int = Field(default=0, ge=-50, le=50)
+    level: int | None = None
 
 
 class MarketOrderRequest(BaseModel):

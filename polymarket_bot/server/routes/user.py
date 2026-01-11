@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import time
+from fastapi import APIRouter, HTTPException
+from py_clob_client.exceptions import PolyApiException
+
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException
@@ -65,12 +69,30 @@ def get_balance_allowance(
 
 @router.get("/user/balance")
 def get_balance() -> dict[str, str]:
-    try:
-        data = registry.poly_client.get_balance_allowance()
-        return {"balance": data["balance"]}
-    except Exception as e:
-        logger.exception("Balance fetch failed")
-        raise HTTPException(status_code=500, detail=str(e))
+    retries = 3
+    
+    for attempt in range(retries):
+        try:
+            # The client caches parameters, so we can retry the call directly
+            data = registry.poly_client.get_balance_allowance()
+            return {"balance": data["balance"]}
+            
+        except PolyApiException as e:
+            # "Request exception!" is the wrapper message for the disconnect error
+            if "Request exception" in str(e) and attempt < retries - 1:
+                time.sleep(0.2)  # Short backoff to allow socket pool to reset
+                continue
+            
+            # If it's a different API error or we ran out of retries
+            logger.exception(f"Balance fetch failed on attempt {attempt + 1}")
+            raise HTTPException(status_code=500, detail="Upstream PolyMarket Error")
+            
+        except Exception as e:
+            logger.exception("Unexpected error fetching balance")
+            raise HTTPException(status_code=500, detail="Internal Server Error")
+
+    # Should be unreachable, but satisfies static analysis
+    raise HTTPException(status_code=500, detail="Unknown Error")
 
 
 @router.get("/user/positions")

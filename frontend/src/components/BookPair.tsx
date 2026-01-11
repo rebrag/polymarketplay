@@ -35,6 +35,8 @@ interface BookPairProps {
   autoStrategy: string;
   onSelectAutoStrategy: (pairKey: string, strategy: string) => void;
   autoStrategyOptions: string[];
+  assetLevels?: Record<string, number>;
+  onLevelChange?: (assetId: string, level: number) => void;
   positionHistory: Record<string, Trade>;
   authPositions: PositionRow[];
   orders: OrderView[];
@@ -65,6 +67,8 @@ function BookPairComponent({
   autoStrategy,
   onSelectAutoStrategy,
   autoStrategyOptions,
+  assetLevels,
+  onLevelChange,
   positionHistory,
   authPositions,
   orders,
@@ -124,12 +128,10 @@ function BookPairComponent({
     };
   }, [assetIds]);
   const [pairBidSum, pairAskSum] = useBookStore(selectPairSums);
-  const buyAllowedForPair = Number.isFinite(pairBidSum)
-    ? pairBidSum * 100 <= buyThreshold
-    : false;
-  const sellAllowedForPair = Number.isFinite(pairAskSum)
-    ? pairAskSum * 100 >= sellThreshold
-    : false;
+  const buyAllowedForPair =
+    typeof pairBidSum === "number" ? pairBidSum * 100 <= buyThreshold : false;
+  const sellAllowedForPair =
+    typeof pairAskSum === "number" ? pairAskSum * 100 >= sellThreshold : false;
   const [graphOpen, setGraphOpen] = useState(false);
   const [graphLoading, setGraphLoading] = useState(false);
   const [graphError, setGraphError] = useState<string | null>(null);
@@ -138,8 +140,16 @@ function BookPairComponent({
   const [autoSettingsByAsset, setAutoSettingsByAsset] = useState<
     Record<string, { shares: number; ttl: number; level: number }>
   >({});
+  const missingAutoLevels = useMemo(() => {
+    if (!isAutoOn) return false;
+    return assetIds.some(
+      (assetId) => !Number.isFinite(autoSettingsByAsset[assetId]?.level ?? NaN)
+    );
+  }, [assetIds, autoSettingsByAsset, isAutoOn]);
   const lastAutoPayloadRef = useRef<string | null>(null);
-  const lastAutoEnabledRef = useRef(false);
+  const pendingEnableRef = useRef(false);
+  const sendAutoConfigRef = useRef<typeof sendAutoConfig>(() => Promise.resolve());
+  const autoConfigLoadingRef = useRef(false);
   const disabledAssetsKey = useMemo(
     () => Array.from(autoDisabledAssets).sort().join("|"),
     [autoDisabledAssets]
@@ -207,14 +217,27 @@ function BookPairComponent({
 
   const handleAutoSettingsChange = useCallback(
     (assetId: string, settings: { shares: number; ttl: number; level: number }) => {
-      setAutoSettingsByAsset((prev) => ({ ...prev, [assetId]: settings }));
+      setAutoSettingsByAsset((prev) => {
+        const existing = prev[assetId];
+        if (
+          existing &&
+          existing.shares === settings.shares &&
+          existing.ttl === settings.ttl &&
+          existing.level === settings.level
+        ) {
+          return prev;
+        }
+        return { ...prev, [assetId]: settings };
+      });
+      onLevelChange?.(assetId, settings.level);
     },
-    []
+    [onLevelChange]
   );
 
   const sendAutoConfig = useCallback(
     async (enabled: boolean) => {
       if (!assetIds.length) return;
+      if (enabled && missingAutoLevels) return;
       const settings = assetIds.map((assetId) => {
         const cached = autoSettingsByAsset[assetId];
         const shares = Number.isFinite(cached?.shares ?? NaN) ? (cached?.shares as number) : Number(defaultShares) || 0;
@@ -264,23 +287,82 @@ function BookPairComponent({
       defaultShares,
       defaultTtl,
       apiBaseUrl,
+      missingAutoLevels,
     ]
   );
+  useEffect(() => {
+    sendAutoConfigRef.current = sendAutoConfig;
+  }, [sendAutoConfig]);
+
+  useEffect(() => {
+    if (!isAutoOn || autoConfigLoadingRef.current) return;
+    autoConfigLoadingRef.current = true;
+    let mounted = true;
+    const loadAutoConfig = async () => {
+      try {
+        const res = await fetch(
+          `${apiBaseUrl}/auto/pair?pair_key=${encodeURIComponent(pairKey)}`
+        );
+        if (!res.ok) return;
+        const data = (await res.json()) as {
+          pair?: {
+            asset_settings?: Array<{
+              asset_id?: string;
+              shares?: number;
+              ttl_seconds?: number;
+              level?: number;
+            }>;
+          };
+        };
+        if (!mounted || !data.pair?.asset_settings) return;
+        const next: Record<string, { shares: number; ttl: number; level: number }> = {};
+        data.pair.asset_settings.forEach((setting) => {
+          if (!setting?.asset_id) return;
+          next[setting.asset_id] = {
+            shares: Number.isFinite(setting.shares ?? NaN) ? (setting.shares as number) : Number(defaultShares) || 0,
+            ttl: Number.isFinite(setting.ttl_seconds ?? NaN) ? (setting.ttl_seconds as number) : Number(defaultTtl) || 0,
+            level: Number.isFinite(setting.level ?? NaN) ? (setting.level as number) : 0,
+          };
+        });
+        if (Object.keys(next).length === 0) return;
+        setAutoSettingsByAsset((prev) => ({ ...prev, ...next }));
+        Object.entries(next).forEach(([assetId, setting]) => {
+          onLevelChange?.(assetId, setting.level);
+        });
+      } catch {
+        // ignore fetch failures
+      } finally {
+        autoConfigLoadingRef.current = false;
+      }
+    };
+    void loadAutoConfig();
+    return () => {
+      mounted = false;
+      autoConfigLoadingRef.current = false;
+    };
+  }, [apiBaseUrl, defaultShares, defaultTtl, isAutoOn, onLevelChange, pairKey]);
 
   useEffect(() => {
     if (!isAutoOn) {
-      if (lastAutoEnabledRef.current) {
-        lastAutoEnabledRef.current = false;
-        void sendAutoConfig(false);
-      }
+      pendingEnableRef.current = false;
+      void sendAutoConfigRef.current(false);
       return;
     }
-    lastAutoEnabledRef.current = true;
+    pendingEnableRef.current = true;
+    if (missingAutoLevels) return;
+    pendingEnableRef.current = false;
     const id = window.setTimeout(() => {
-      void sendAutoConfig(true);
+      void sendAutoConfigRef.current(true);
     }, 150);
     return () => window.clearTimeout(id);
-  }, [isAutoOn, disabledAssetsKey, autoSettingsByAsset, buyThreshold, sellThreshold, sellSharesThreshold, sendAutoConfig]);
+  }, [isAutoOn, missingAutoLevels]);
+
+  useEffect(() => {
+    if (!isAutoOn || !pendingEnableRef.current) return;
+    if (missingAutoLevels) return;
+    pendingEnableRef.current = false;
+    void sendAutoConfigRef.current(true);
+  }, [isAutoOn, missingAutoLevels]);
 
   return (
     <div
@@ -404,6 +486,7 @@ function BookPairComponent({
 
           const isFullMode = fullModeKeys.has(w.uniqueKey);
 
+          const showPlaceholder = isAutoOn && !Number.isFinite(autoSettingsByAsset[w.assetId]?.level ?? NaN);
           return (
             <div
               key={w.uniqueKey}
@@ -432,38 +515,52 @@ function BookPairComponent({
               >
                 {w.marketQuestion}
               </span>
-              <OrderBookWidget
-                assetId={w.assetId}
-                outcomeName={w.outcomeName}
-                marketQuestion={w.marketQuestion}
-                sourceSlug={w.sourceSlug}
-                volume={w.marketVolume}
-                userPosition={userPos}
-                positionShares={Number.isFinite(heldShares ?? NaN) ? heldShares : null}
-                positionAvgPrice={Number.isFinite(heldAvg ?? NaN) ? heldAvg : null}
-                otherAssetPositionShares={
-                  Number.isFinite(otherHeldShares ?? NaN) ? otherHeldShares : null
-                }
-                openOrders={openOrders}
-                ordersServerNowSec={ordersServerNowSec}
-                ordersServerNowLocalMs={ordersServerNowLocalMs}
-                defaultShares={defaultShares}
-                defaultTtl={defaultTtl}
-                auto={isAutoAssetOn}
-                autoBuyAllowed={buyAllowedForPair}
-                autoSellAllowed={sellAllowedForPair}
-                autoTradeSide={autoTradeSide}
-                autoMode="server"
-                onAutoSettingsChange={handleAutoSettingsChange}
-                onHeaderClick={() => {
-                  if (!isAutoOn) return;
-                  toggleAutoAsset(w.assetId);
-                }}
-                isHighlighted={highlightedAsset === w.assetId}
-                viewMode={isFullMode ? "full" : "mini"}
-                onClose={isPair ? undefined : handleCloseWidget}
-                apiBaseUrl={apiBaseUrl}
-              />
+              {showPlaceholder ? (
+                <div className="h-[470px] w-full rounded-md border border-slate-800 bg-slate-950/60 flex items-center justify-center">
+                  <div className="flex flex-col items-center gap-2 text-[10px] uppercase text-slate-500">
+                    <div className="h-5 w-5 animate-spin rounded-full border-2 border-slate-800 border-t-blue-500" />
+                    Loading auto level...
+                  </div>
+                </div>
+              ) : (
+                <OrderBookWidget
+                  assetId={w.assetId}
+                  outcomeName={w.outcomeName}
+                  marketQuestion={w.marketQuestion}
+                  sourceSlug={w.sourceSlug}
+                  volume={w.marketVolume}
+                  userPosition={userPos}
+                  positionShares={Number.isFinite(heldShares ?? NaN) ? heldShares : null}
+                  positionAvgPrice={Number.isFinite(heldAvg ?? NaN) ? heldAvg : null}
+                  otherAssetPositionShares={
+                    Number.isFinite(otherHeldShares ?? NaN) ? otherHeldShares : null
+                  }
+                  openOrders={openOrders}
+                  ordersServerNowSec={ordersServerNowSec}
+                  ordersServerNowLocalMs={ordersServerNowLocalMs}
+                  defaultShares={defaultShares}
+                  defaultTtl={defaultTtl}
+                  auto={isAutoAssetOn}
+                  autoBuyAllowed={buyAllowedForPair}
+                  autoSellAllowed={sellAllowedForPair}
+                  autoTradeSide={autoTradeSide}
+                  autoMode="server"
+                  initialLevel={
+                    isAutoOn
+                      ? autoSettingsByAsset[w.assetId]?.level
+                      : assetLevels?.[w.assetId]
+                  }
+                  onAutoSettingsChange={handleAutoSettingsChange}
+                  onHeaderClick={() => {
+                    if (!isAutoOn) return;
+                    toggleAutoAsset(w.assetId);
+                  }}
+                  isHighlighted={highlightedAsset === w.assetId}
+                  viewMode={isFullMode ? "full" : "mini"}
+                  onClose={isPair ? undefined : handleCloseWidget}
+                  apiBaseUrl={apiBaseUrl}
+                />
+              )}
             </div>
           );
         })}
@@ -483,7 +580,7 @@ function equalPosition(a?: PositionRow, b?: PositionRow): boolean {
   const sizeB = Number(b.size);
   const avgA = Number(a.avgPrice);
   const avgB = Number(b.avgPrice);
-  return sizeA === sizeB && avgA === avgB && a.side === b.side;
+  return sizeA === sizeB && avgA === avgB;
 }
 
 function collectOpenOrders(orders: OrderView[], assetId: string): OrderView[] {

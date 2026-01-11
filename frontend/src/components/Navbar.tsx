@@ -30,6 +30,7 @@ interface NavbarProps {
   onLogsClick?: () => void;
   logsCount?: number | null;
   backendBooksCount?: number | null;
+  backendLatencyMs?: number | null;
   recentFills?: Array<{
     orderID: string;
     updatedAt?: number | string;
@@ -75,6 +76,7 @@ export function Navbar({
   onLogsClick,
   logsCount,
   backendBooksCount,
+  backendLatencyMs,
   recentFills = [],
 }: NavbarProps) {
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -185,6 +187,12 @@ export function Navbar({
           <span className="text-[9px] text-slate-500 uppercase font-bold">Backend Books</span>
           <span className="text-sm font-bold text-slate-200 font-mono">
             {backendBooksCount === null || backendBooksCount === undefined ? "--" : backendBooksCount}
+          </span>
+        </div>
+        <div className="flex flex-col items-end">
+          <span className="text-[9px] text-slate-500 uppercase font-bold">PM Latency</span>
+          <span className="text-sm font-bold text-slate-200 font-mono">
+            {backendLatencyMs === null || backendLatencyMs === undefined ? "--" : `${Math.round(backendLatencyMs)} ms`}
           </span>
         </div>
         <div className="flex items-center gap-2">

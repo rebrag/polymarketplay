@@ -5,7 +5,7 @@ type WorkerMessage =
   | { type: "payload"; payload: string }
   | { type: "flush" };
 
-const FLUSH_INTERVAL_MS = 80;
+const FLUSH_INTERVAL_MS = 200;
 
 let pending: Record<string, BookState> = {};
 let flushTimer: number | null = null;

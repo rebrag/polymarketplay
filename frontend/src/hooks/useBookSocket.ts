@@ -37,6 +37,8 @@ export function useBookSocket(widgets: TokenWidget[]): void {
   const assetsRef = useRef<Map<string, WidgetAssetMeta>>(new Map());
   const pendingSubscribeRef = useRef<WidgetAssetMeta[]>([]);
   const workerRef = useRef<Worker | null>(null);
+  const pendingUpdatesRef = useRef<Record<string, BookState> | null>(null);
+  const applyTimerRef = useRef<number | null>(null);
 
   const setBooksBulk = useBookStore((state) => state.setBooksBulk);
   const bumpFrame = useBookStore((state) => state.bumpFrame);
@@ -44,6 +46,7 @@ export function useBookSocket(widgets: TokenWidget[]): void {
   const clearBook = useBookStore((state) => state.clearBook);
 
   const assetMeta = useMemo(() => buildAssetMeta(widgets), [widgets]);
+  const shouldConnect = assetMeta.length > 0;
 
   useEffect(() => {
     const nextMap = new Map<string, WidgetAssetMeta>();
@@ -93,22 +96,58 @@ export function useBookSocket(widgets: TokenWidget[]): void {
   useEffect(() => {
     let active = true;
 
-  const worker = new Worker(new URL("../workers/bookWs.worker.ts", import.meta.url), {
+    if (!shouldConnect) {
+      const ws = wsRef.current;
+      if (ws) {
+        ws.onopen = null;
+        ws.onclose = null;
+        ws.onerror = null;
+        ws.onmessage = null;
+        ws.close();
+      }
+      wsRef.current = null;
+      if (workerRef.current) {
+        workerRef.current.terminate();
+        workerRef.current = null;
+      }
+      pendingUpdatesRef.current = null;
+      if (applyTimerRef.current !== null) {
+        window.clearTimeout(applyTimerRef.current);
+        applyTimerRef.current = null;
+      }
+      if (reconnectTimerRef.current !== null) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+      return () => {
+        active = false;
+      };
+    }
+
+    const worker = new Worker(new URL("../workers/bookWs.worker.ts", import.meta.url), {
       type: "module",
     });
     workerRef.current = worker;
     worker.onmessage = (event) => {
       const payload = event.data as { type?: string; updates?: Record<string, BookState> };
       if (!payload || payload.type !== "batch" || !payload.updates) return;
-      // if (import.meta.env.DEV) {
-      //   // eslint-disable-next-line no-console
-      //   console.log(`[books-ws] batch assets=${Object.keys(payload.updates).length}`);
-      // }
       const updates = payload.updates;
       const assetIds = Object.keys(updates);
       if (!assetIds.length) return;
-      setBooksBulk(updates, "live");
-      bumpFrame();
+      if (!pendingUpdatesRef.current) {
+        pendingUpdatesRef.current = { ...updates };
+      } else {
+        Object.assign(pendingUpdatesRef.current, updates);
+      }
+      if (applyTimerRef.current !== null) return;
+      applyTimerRef.current = window.setTimeout(() => {
+        applyTimerRef.current = null;
+        const pending = pendingUpdatesRef.current;
+        pendingUpdatesRef.current = null;
+        if (!pending) return;
+        setBooksBulk(pending, "live");
+        bumpFrame();
+      }, 200);
     };
 
     const scheduleReconnect = () => {
@@ -125,10 +164,6 @@ export function useBookSocket(widgets: TokenWidget[]): void {
 
     const connect = () => {
       if (!active) return;
-      // if (import.meta.env.DEV) {
-      //   // eslint-disable-next-line no-console
-      //   console.log("[books-ws] connecting...");
-      // }
       const ws = new WebSocket(SOCKET_URL);
       wsRef.current = ws;
 
@@ -136,10 +171,6 @@ export function useBookSocket(widgets: TokenWidget[]): void {
         reconnectAttemptsRef.current = 0;
         const assets = Array.from(assetsRef.current.values());
         if (assets.length) {
-          // if (import.meta.env.DEV) {
-          //   // eslint-disable-next-line no-console
-          //   console.log(`[books-ws] open subscribe assets=${assets.length}`);
-          // }
           ws.send(JSON.stringify({ type: "subscribe", assets }));
           pendingSubscribeRef.current = [];
         }
@@ -147,30 +178,18 @@ export function useBookSocket(widgets: TokenWidget[]): void {
 
       ws.onmessage = (event) => {
         if (!active || typeof event.data !== "string") return;
-        // if (import.meta.env.DEV) {
-        //   // eslint-disable-next-line no-console
-        //   console.log(`[books-ws] message bytes=${event.data.length}`);
-        // }
         workerRef.current?.postMessage({ type: "payload", payload: event.data });
       };
 
       ws.onclose = () => {
         const assets = assetsRef.current.keys();
         setStatusBulk(assets, "connecting");
-        // if (import.meta.env.DEV) {
-        //   // eslint-disable-next-line no-console
-        //   console.log("[books-ws] closed");
-        // }
         scheduleReconnect();
       };
 
       ws.onerror = () => {
         const assets = assetsRef.current.keys();
         setStatusBulk(assets, "error");
-        // if (import.meta.env.DEV) {
-        //   // eslint-disable-next-line no-console
-        //   console.log("[books-ws] error");
-        // }
       };
     };
 
@@ -180,6 +199,11 @@ export function useBookSocket(widgets: TokenWidget[]): void {
       active = false;
       if (reconnectTimerRef.current !== null) {
         window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+      if (applyTimerRef.current !== null) {
+        window.clearTimeout(applyTimerRef.current);
+        applyTimerRef.current = null;
       }
       worker.terminate();
       workerRef.current = null;
@@ -193,5 +217,5 @@ export function useBookSocket(widgets: TokenWidget[]): void {
       }
       wsRef.current = null;
     };
-  }, [bumpFrame, setBooksBulk, setStatusBulk]);
+  }, [bumpFrame, setBooksBulk, setStatusBulk, shouldConnect]);
 }

@@ -149,6 +149,10 @@ function loadSettings(): {
 }
 
 function App() {
+  const logRender = import.meta.env.DEV;
+  if (logRender) {
+    console.time("render:App");
+  }
   const settings = useMemo(() => loadSettings(), []);
   const [url, setUrl] = useState("0x507e52ef684ca2dd91f90a9d26d149dd3288beae");
   const [minVolume, setMinVolume] = useState(settings.minVolume);
@@ -192,6 +196,9 @@ function App() {
   const [ordersWsStatus, setOrdersWsStatus] = useState<"connecting" | "open" | "closed" | "error">("connecting");
   const [ordersWsEvents, setOrdersWsEvents] = useState(0);
   const [ordersWsLastType, setOrdersWsLastType] = useState<string | null>(null);
+  const ordersWsEventsRef = useRef(0);
+  const ordersWsLastTypeRef = useRef<string | null>(null);
+  const ordersWsUiUpdateRef = useRef(0);
   const [ordersWsServerPid, setOrdersWsServerPid] = useState<number | null>(null);
   const [ordersWsCloseInfo, setOrdersWsCloseInfo] = useState<string | null>(null);
   const [ordersWsErrorInfo, setOrdersWsErrorInfo] = useState<string | null>(null);
@@ -204,6 +211,17 @@ function App() {
   const [autoStrategyOptions, setAutoStrategyOptions] = useState<string[]>(["default"]);
   const [recentFills, setRecentFills] = useState<OrderView[]>([]);
   const [backendBooksCount, setBackendBooksCount] = useState<number | null>(null);
+  const [backendLatencyMs, setBackendLatencyMs] = useState<number | null>(null);
+  const [assetLevels, setAssetLevels] = useState<Record<string, number>>(() => {
+    try {
+      const raw = localStorage.getItem("pm_asset_levels");
+      if (!raw) return {};
+      const parsed = JSON.parse(raw) as Record<string, number>;
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      return {};
+    }
+  });
   const [ordersWsReconnectSeq, setOrdersWsReconnectSeq] = useState(0);
   const ordersWsReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const ordersWsClosingRef = useRef(false);
@@ -234,9 +252,9 @@ function App() {
   const userSocketRef = useRef<WebSocket | null>(null);
   const [logIndex, setLogIndex] = useState<LogEntry[]>([]);
   const [logQuery, setLogQuery] = useState("");
-  const [logSortBy, setLogSortBy] = useState<"question" | "slug" | "date">("question");
+  const [logSortBy] = useState<"question" | "slug" | "date">("question");
   const [logSortDir, setLogSortDir] = useState<"asc" | "desc">("asc");
-  const [logFilter, setLogFilter] = useState<"all" | "open">("all");
+  const [logFilter] = useState<"all" | "open">("all");
   const [logDateFilter, setLogDateFilter] = useState<string>("all");
   const [logSportFilter, setLogSportFilter] = useState<string>("all");
   const [logMlOnly, setLogMlOnly] = useState(false);
@@ -248,12 +266,11 @@ function App() {
   const [logSelection, setLogSelection] = useState<LogEntry | null>(null);
   const [logStartMs, setLogStartMs] = useState<number | null>(null);
   const [minimizedEvents, setMinimizedEvents] = useState<Set<string>>(new Set());
+  const [activeEventSlug, setActiveEventSlug] = useState<string | null>(null);
   const socketWidgets = useMemo(() => {
-    return widgets.filter((w) => {
-      if (!w.sourceSlug) return true;
-      return !minimizedEvents.has(w.sourceSlug);
-    });
-  }, [minimizedEvents, widgets]);
+    if (activeEventSlug === null) return [];
+    return widgets.filter((w) => (w.sourceSlug ?? "") === activeEventSlug);
+  }, [activeEventSlug, widgets]);
   useBookSocket(socketWidgets);
   const autoOpenSyncedRef = useRef(false);
   const [autoStatusPairs, setAutoStatusPairs] = useState<AutoStatusPair[]>([]);
@@ -290,6 +307,21 @@ function App() {
     });
     return Array.from(sports).sort();
   }, [logIndex]);
+  const updateAssetLevel = useCallback((assetId: string, level: number) => {
+    if (!assetId || !Number.isFinite(level)) return;
+    setAssetLevels((prev) => {
+      if (prev[assetId] === level) return prev;
+      return { ...prev, [assetId]: level };
+    });
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("pm_asset_levels", JSON.stringify(assetLevels));
+    } catch {
+      // ignore storage failures
+    }
+  }, [assetLevels]);
 
   const filteredLogs = useMemo(() => {
     let items = logIndex;
@@ -340,14 +372,16 @@ function App() {
     logMlOnly,
     subscribedSlugs,
   ]);
+  const visiblePositions = useMemo(() => {
+    return authPositions.filter((p) => {
+      const value = Number(p.currentValue);
+      return Number.isFinite(value) && value > 0.01;
+    });
+  }, [authPositions]);
 
   const fullModeKeys = useMemo(() => {
-    const visible = widgets.filter((w) => {
-      if (!w.sourceSlug) return true;
-      return !minimizedEvents.has(w.sourceSlug);
-    });
-    return new Set(visible.slice(0, 10).map((w) => w.uniqueKey));
-  }, [minimizedEvents, widgets]);
+    return new Set(widgets.map((w) => w.uniqueKey));
+  }, [widgets]);
 
   useEffect(() => {
     memStatsRef.current = {
@@ -411,6 +445,27 @@ function App() {
     };
     fetchBooks();
     const id = window.setInterval(fetchBooks, 10000);
+    return () => {
+      mounted = false;
+      window.clearInterval(id);
+    };
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    const fetchLatency = async () => {
+      try {
+        const res = await fetch("http://localhost:8000/metrics/latency");
+        if (!res.ok) return;
+        const data = (await res.json()) as { latency_ms?: number };
+        if (!mounted) return;
+        setBackendLatencyMs(typeof data.latency_ms === "number" ? data.latency_ms : null);
+      } catch {
+        // ignore
+      }
+    };
+    fetchLatency();
+    const id = window.setInterval(fetchLatency, 5000);
     return () => {
       mounted = false;
       window.clearInterval(id);
@@ -541,11 +596,23 @@ function App() {
   const toggleEventMinimized = useCallback((slug: string) => {
     setMinimizedEvents((prev) => {
       const next = new Set(prev);
-      if (next.has(slug)) next.delete(slug);
-      else next.add(slug);
+      if (next.has(slug)) {
+        next.delete(slug);
+        eventDataList.forEach((ev) => {
+          if (ev.slug && ev.slug !== slug) {
+            next.add(ev.slug);
+          }
+        });
+        setActiveEventSlug(slug);
+      } else {
+        next.add(slug);
+        if (activeEventSlug === slug) {
+          setActiveEventSlug(null);
+        }
+      }
       return next;
     });
-  }, []);
+  }, [activeEventSlug, eventDataList]);
 
   const closeEventWindow = useCallback((slug: string) => {
     setEventDataList((prev) => prev.filter((ev) => ev.slug !== slug));
@@ -556,7 +623,10 @@ function App() {
       next.delete(slug);
       return next;
     });
-  }, []);
+    if (activeEventSlug === slug) {
+      setActiveEventSlug(null);
+    }
+  }, [activeEventSlug]);
 
   const killAutotrader = useCallback(async () => {
     try {
@@ -719,13 +789,23 @@ function App() {
         | { type: "closed"; order: OrderView; event?: string; server_now?: number; trade_id?: string; trade_status?: string }
         | { type: "update"; order: OrderView; event?: string; server_now?: number }
         | { type: "status"; status: string; pid?: number; server_now?: number }
-        | { type: "error"; error: string };
+        | { type: "error"; error: string }
+        | { type: "ping"; server_now?: number };
       if ("server_now" in data && typeof data.server_now === "number") {
         setOrdersServerNowSec(data.server_now);
         setOrdersServerNowLocalMs(Date.now());
       }
-      setOrdersWsEvents((prev) => prev + 1);
-      setOrdersWsLastType(data.type);
+      if (data.type === "ping") {
+        return;
+      }
+      ordersWsEventsRef.current += 1;
+      ordersWsLastTypeRef.current = data.type;
+      const now = Date.now();
+      if (now - ordersWsUiUpdateRef.current >= 1000) {
+        ordersWsUiUpdateRef.current = now;
+        setOrdersWsEvents(ordersWsEventsRef.current);
+        setOrdersWsLastType(ordersWsLastTypeRef.current);
+      }
 
       if (data.type === "snapshot") {
         const now = Date.now();
@@ -977,7 +1057,7 @@ function App() {
 
   useEffect(() => {
     void fetchAuthMetrics();
-    const interval = window.setInterval(() => void fetchAuthMetrics(), 10000);
+    const interval = window.setInterval(() => void fetchAuthMetrics(), 30000);
     return () => window.clearInterval(interval);
   }, [fetchAuthMetrics]);
 
@@ -1004,7 +1084,7 @@ function App() {
     return () => window.clearInterval(interval);
   }, [eventsWindowBefore, eventsWindowAfter]);
 
-  const resolveInput = async (mode: "replace" | "add", override?: string) => {
+  const resolveInput = useCallback(async (mode: "replace" | "add", override?: string) => {
     const input = (override ?? url).trim();
     if (!input) return;
     pushHistory(input);
@@ -1044,7 +1124,8 @@ function App() {
       setEventDataList([
         { title: `Monitor: ${input.slice(0, 6)}...${input.slice(-4)}`, slug: "", markets: [] },
       ]);
-      setMinimizedEvents(new Set([""]));
+      setMinimizedEvents(new Set());
+      setActiveEventSlug("");
 
       ws.onopen = () => setLoading(false);
 
@@ -1130,13 +1211,15 @@ function App() {
         return exists ? prev : [...prev, data];
       });
       if (data.slug) {
-        setMinimizedEvents((prev) => {
-          if (mode === "replace") {
-            return new Set([data.slug]);
-          }
-          if (prev.has(data.slug)) return prev;
-          const next = new Set(prev);
-          next.add(data.slug);
+        setActiveEventSlug(data.slug);
+        setMinimizedEvents(() => {
+          const slugs = eventDataList.map((ev) => ev.slug).filter(Boolean);
+          const next = new Set<string>();
+          slugs.forEach((slug) => {
+            if (slug && slug !== data.slug) {
+              next.add(slug);
+            }
+          });
           return next;
         });
       }
@@ -1177,7 +1260,7 @@ function App() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [eventDataList, fetchUserMetrics, minVolume, pushHistory, url]);
 
   const handleResolve = () => {
     void resolveInput("replace");
@@ -1344,7 +1427,7 @@ function App() {
     }
   };
 
-  return (
+  const content = (
   <div className="h-screen w-full bg-black font-sans text-slate-200 overflow-hidden flex flex-col">
     {tradeNotices.length > 0 && (
       <div className="fixed top-32 left-1/2 -translate-x-1/2 z-50 flex flex-col gap-3 items-center">
@@ -1409,6 +1492,7 @@ function App() {
       logsCount={logIndex.length || null}
       ordersCount={orders.filter((o) => o.status === "open").length}
       backendBooksCount={backendBooksCount}
+      backendLatencyMs={backendLatencyMs}
       notificationsCount={recentFills.length}
       recentFills={recentFillsDisplay}
       ordersWsStatus={ordersWsStatus}
@@ -1642,14 +1726,16 @@ function App() {
                       onSelectAutoStrategy={setAutoStrategy}
                       autoStrategyOptions={autoStrategyOptions}
                       positionHistory={positionHistory}
-                        authPositions={authPositions}
-                        orders={orders}
-                        highlightedAsset={highlightedAsset}
-                        defaultShares={defaultShares}
-                        defaultTtl={defaultTtl}
-                        draggedWidgetKey={draggedWidgetKey}
-                        setDraggedWidgetKey={setDraggedWidgetKey}
-                        swapWidgets={swapWidgets}
+                      authPositions={authPositions}
+                      orders={orders}
+                      highlightedAsset={highlightedAsset}
+                      defaultShares={defaultShares}
+                      defaultTtl={defaultTtl}
+                      assetLevels={assetLevels}
+                      onLevelChange={updateAssetLevel}
+                      draggedWidgetKey={draggedWidgetKey}
+                      setDraggedWidgetKey={setDraggedWidgetKey}
+                      swapWidgets={swapWidgets}
                         toggleAutoPair={toggleAutoPair}
                         toggleAutoAsset={toggleAutoAsset}
                         handleClosePair={handleClosePair}
@@ -1698,6 +1784,8 @@ function App() {
                   highlightedAsset={highlightedAsset}
                   defaultShares={defaultShares}
                   defaultTtl={defaultTtl}
+                  assetLevels={assetLevels}
+                  onLevelChange={updateAssetLevel}
                   draggedWidgetKey={draggedWidgetKey}
                   setDraggedWidgetKey={setDraggedWidgetKey}
                   swapWidgets={swapWidgets}
@@ -1734,10 +1822,7 @@ function App() {
             </Button>
           </div>
           <PositionsTable
-            positions={authPositions.filter((p) => {
-              const value = Number(p.currentValue);
-              return Number.isFinite(value) && value > 0.01;
-            })}
+            positions={visiblePositions}
             onSelect={(pos) => {
               const assetsToAdd: Array<{ assetId: string; outcomeName: string }> = [
                 { assetId: pos.asset, outcomeName: pos.outcome || "Outcome" },
@@ -1966,7 +2051,11 @@ function App() {
       </div>
     )}
   </div>
-);
+  );
+  if (logRender) {
+    console.timeEnd("render:App");
+  }
+  return content;
 }
 
 export default App;

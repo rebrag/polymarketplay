@@ -16,6 +16,14 @@ from polymarket_bot.server.strategies import get_strategy_names
 
 router = APIRouter()
 
+
+def _log_submit_latency(action: str, token_id: str, side: str, duration_ms: float) -> None:
+    print(
+        "ORDER_LATENCY "
+        f"action={action} side={side} latency_ms={duration_ms:.2f}"
+    )
+
+
 def _best_price_from_book(token_id: str, side: str) -> float | None:
     book = registry.active_books.get(token_id)
     if book is None or not getattr(book, "ready", False):
@@ -45,7 +53,12 @@ def post_limit_order(req: LimitOrderRequest) -> dict[str, object]:
                     status_code=503,
                     detail={"error": "best_price unavailable", "upstream": str(exc)},
                 )
-        price = best_price + (req.price_offset_cents / 100.0)
+        price: float | None = None
+        if req.level is not None:
+            price = registry.get_price_for_level(req.token_id, req.side, req.level)
+        if price is None:
+            price_offset = req.price_offset_cents or 0
+            price = best_price + (price_offset / 100.0)
         price = max(0.01, min(0.99, price))
 
         ttl = req.ttl_seconds
@@ -55,12 +68,19 @@ def post_limit_order(req: LimitOrderRequest) -> dict[str, object]:
         last_exc: Exception | None = None
         for attempt in range(2):
             try:
+                start = time.perf_counter()
                 result = registry.poly_client.place_limit_order(
                     token_id=req.token_id,
                     side=req.side,
                     size=req.size,
                     price=price,
                     ttl_seconds=ttl + 60,
+                )
+                _log_submit_latency(
+                    "limit",
+                    req.token_id,
+                    req.side,
+                    (time.perf_counter() - start) * 1000.0,
                 )
                 return {"ok": True, "placed_price": price, "result": result}
             except Exception as exc:
@@ -111,6 +131,38 @@ def set_auto_pair(req: AutoPairPayload) -> dict[str, object]:
     return {"ok": True, "enabled": False}
 
 
+@router.get("/auto/pair")
+def get_auto_pair(pair_key: str) -> dict[str, object]:
+    with registry._auto_lock:
+        config = registry._auto_pairs.get(pair_key)
+    if config is None:
+        raise HTTPException(status_code=404, detail="Auto pair not found")
+    settings = [
+        {
+            "asset_id": s.asset_id,
+            "shares": s.shares,
+            "ttl_seconds": s.ttl_seconds,
+            "level": s.level,
+            "enabled": s.enabled,
+        }
+        for s in config.asset_settings.values()
+    ]
+    return {
+        "ok": True,
+        "pair": {
+            "pair_key": config.pair_key,
+            "assets": config.assets,
+            "disabled_assets": config.disabled_assets,
+            "auto_buy_max_cents": config.auto_buy_max_cents,
+            "auto_sell_min_cents": config.auto_sell_min_cents,
+            "auto_sell_min_shares": config.auto_sell_min_shares,
+            "strategy": config.strategy,
+            "enabled": config.enabled,
+            "asset_settings": settings,
+        },
+    }
+
+
 @router.get("/auto/status")
 def get_auto_status() -> dict[str, object]:
     with registry._auto_lock:
@@ -145,10 +197,17 @@ def list_auto_strategies() -> dict[str, object]:
 def post_market_order(req: MarketOrderRequest) -> dict[str, object]:
     try:
         if req.fok_only:
+            start = time.perf_counter()
             result = registry.poly_client.place_market_order(
                 token_id=req.token_id,
                 side=req.side,
                 size=req.amount,
+            )
+            _log_submit_latency(
+                "market_fok",
+                req.token_id,
+                req.side,
+                (time.perf_counter() - start) * 1000.0,
             )
             logger.info(
                 "Market order response (mode=fok token_id=%s side=%s amount=%s)",
@@ -181,12 +240,19 @@ def post_market_order(req: MarketOrderRequest) -> dict[str, object]:
                 total_liquidity = sum(_to_float(b.get("size", 0)) for b in bids if isinstance(b, dict))
 
         if best_price is not None and total_liquidity < size_shares:
+            start = time.perf_counter()
             result = registry.poly_client.place_limit_order(
                 token_id=req.token_id,
                 side=req.side,
                 size=size_shares,
                 price=best_price,
                 ttl_seconds=None,
+            )
+            _log_submit_latency(
+                "market_limit_fallback",
+                req.token_id,
+                req.side,
+                (time.perf_counter() - start) * 1000.0,
             )
             return {
                 "ok": True,
@@ -196,10 +262,17 @@ def post_market_order(req: MarketOrderRequest) -> dict[str, object]:
                 "result": result,
             }
 
+        start = time.perf_counter()
         result = registry.poly_client.place_market_order(
             token_id=req.token_id,
             side=req.side,
             size=req.amount,
+        )
+        _log_submit_latency(
+            "market",
+            req.token_id,
+            req.side,
+            (time.perf_counter() - start) * 1000.0,
         )
         logger.info(
             "Market order response (token_id=%s side=%s amount=%s)",
@@ -220,12 +293,19 @@ def post_market_order(req: MarketOrderRequest) -> dict[str, object]:
                 size_shares = req.amount
                 if req.side == "BUY" and best_price > 0:
                     size_shares = req.amount / best_price
+                start = time.perf_counter()
                 result = registry.poly_client.place_limit_order(
                     token_id=req.token_id,
                     side=req.side,
                     size=size_shares,
                     price=best_price,
                     ttl_seconds=None,
+                )
+                _log_submit_latency(
+                    "market_limit_fallback",
+                    req.token_id,
+                    req.side,
+                    (time.perf_counter() - start) * 1000.0,
                 )
                 print(
                     f"Market order fallback response (token_id={req.token_id} side={req.side} amount={req.amount}): {result}"

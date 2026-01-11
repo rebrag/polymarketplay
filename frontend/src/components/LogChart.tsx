@@ -141,7 +141,7 @@ export function LogChart({
 
   return (
     <ChartContainer config={chartConfig} className={`w-full ${heightClass}`}>
-      <LineChart data={data} margin={{ top: 8, right: 36, left: 4, bottom: 0 }} isAnimationActive={false}>
+      <LineChart data={data} margin={{ top: 8, right: 36, left: 4, bottom: 0 }}>
         <XAxis
           dataKey="t"
           type="number"

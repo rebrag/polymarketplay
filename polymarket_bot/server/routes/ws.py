@@ -19,7 +19,7 @@ router = APIRouter()
 ORDER_WS_PING_SECONDS: Final[float] = 15.0
 
 # Hard cap on how fast we push book updates to the browser per-asset socket.
-BOOK_MAX_HZ: Final[float] = 5.0
+BOOK_MAX_HZ: Final[float] = 2.0
 BOOK_MIN_SEND_INTERVAL_S: Final[float] = 1.0 / BOOK_MAX_HZ
 
 # If your registry doesn't support book subscriber queues, we fall back to polling.

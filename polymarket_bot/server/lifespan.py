@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from polymarket_bot.server.metrics import latency_monitor
 from polymarket_bot.server.state import registry
 
 _mem_log_stop = threading.Event()
@@ -19,9 +20,9 @@ async def lifespan(app: FastAPI):
                     print(
                         "MEM_DEBUG "
                         f"active_books={len(registry.active_books)} "
-                        f"tracked_assets={len(registry._tracked_assets)} "
-                        f"subs={sum(len(v) for v in registry._subs.values())} "
-                        f"orders_subs={len(registry._order_subs)} "
+                        # f"tracked_assets={len(registry._tracked_assets)} "
+                        # f"subs={sum(len(v) for v in registry._subs.values())} "
+                        # f"orders_subs={len(registry._order_subs)} "
                         f"market_threads={len(registry._market_threads)} "
                         f"market_assets={len(registry._market_assets)} "
                         f"user_events={registry._user_event_count}"
@@ -39,10 +40,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"User WS startup failed: {e}")
     _start_mem_logger()
+    latency_monitor.start()
     yield
     print("Shutting down: Closing all WebSockets...")
     registry.disable_auto_trading()
     _mem_log_stop.set()
+    latency_monitor.stop()
     asset_ids = list(registry.active_books.keys())
     for aid in asset_ids:
         registry.release(aid)
