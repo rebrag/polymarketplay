@@ -3,3 +3,5 @@ python-dotenv
 websocket-client
 py-clob-client
 thefuzz
+fastapi
+uvicorn[standard]

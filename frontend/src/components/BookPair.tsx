@@ -150,10 +150,6 @@ function BookPairComponent({
   const pendingEnableRef = useRef(false);
   const sendAutoConfigRef = useRef<typeof sendAutoConfig>(() => Promise.resolve());
   const autoConfigLoadingRef = useRef(false);
-  const disabledAssetsKey = useMemo(
-    () => Array.from(autoDisabledAssets).sort().join("|"),
-    [autoDisabledAssets]
-  );
   const handleToggleGraph = async () => {
     const next = !graphOpen;
     setGraphOpen(next);

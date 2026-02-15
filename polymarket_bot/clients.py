@@ -35,7 +35,6 @@ from py_clob_client.clob_types import (
     OrderType,
 )  # type: ignore
 from py_clob_client.order_builder.constants import BUY, SELL
-from typings.py_clob_client import *
 
 class BookCallback(Protocol):
     def __call__(self, msg: WsBookMessage) -> None: ...

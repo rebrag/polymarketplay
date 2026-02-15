@@ -1,1 +1,2 @@
-src
+polymarket_bot
+scripts
