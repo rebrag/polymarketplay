@@ -8,7 +8,7 @@ import time
 from asyncio import AbstractEventLoop, Queue
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Literal, Set, cast
+from typing import Dict, Literal, Set, TypedDict, cast
 
 from polymarket_bot.book import OrderBook
 from polymarket_bot.clients import PolyClient, PolySocket, UserSocket
@@ -25,12 +25,18 @@ from polymarket_bot.server.models import AutoPairConfig
 from polymarket_bot.server.strategies import OrderIntent, PairContext, get_strategy
 
 
+class AssetMeta(TypedDict):
+    slug: str
+    question: str
+    outcome: str
+    game_start_ts: float | None
+
+
 class BookManager:
     def __init__(self) -> None:
         self.active_books: Dict[str, OrderBook] = {}
         self.client_counts: Dict[str, int] = {}
         self.poly_client = PolyClient()
-
         self._subs: Dict[str, Set[Queue[None]]] = {}
         self._loops: Dict[str, AbstractEventLoop] = {}
         self._tracked_assets: set[str] = set()
@@ -47,7 +53,7 @@ class BookManager:
         self._last_user_event_ts: float | None = None
         self._last_user_event_type: str | None = None
         self._user_event_count = 0
-        self._asset_meta: Dict[str, dict[str, str]] = {}
+        self._asset_meta: Dict[str, AssetMeta] = {}
         self._market_assets: Dict[str, set[str]] = {}
         self._market_threads: Dict[str, threading.Thread] = {}
         self._market_stops: Dict[str, threading.Event] = {}
@@ -457,13 +463,37 @@ class BookManager:
                                 f"(market={question} outcome={outcome} slug={slug} asset={asset} side={trade_side}): {e}"
                             )
 
-    def set_asset_meta(self, asset_id: str, slug: str | None, question: str | None, outcome: str | None) -> None:
+    def _parse_game_start_ts(self, game_start_time: str | None) -> float | None:
+        if not game_start_time:
+            return None
+        text = game_start_time.strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+
+    def set_asset_meta(
+        self,
+        asset_id: str,
+        slug: str | None,
+        question: str | None,
+        outcome: str | None,
+        game_start_time: str | None = None,
+    ) -> None:
         if not slug or not question:
             return
-        meta = {
+        meta: AssetMeta = {
             "slug": slug,
             "question": question,
             "outcome": outcome or "",
+            "game_start_ts": self._parse_game_start_ts(game_start_time),
         }
         self._asset_meta[asset_id] = meta
         key = self._market_key(slug, question)
@@ -507,6 +537,11 @@ class BookManager:
                     return ""
                 return f"{num:.6f}".rstrip("0").rstrip(".")
 
+            def _fmt_elapsed(seconds: float | None) -> str:
+                if seconds is None:
+                    return ""
+                return f"{seconds:.3f}".rstrip("0").rstrip(".")
+
             seen_non_empty = False
             last_snapshot: tuple[float | None, float | None, float | None, float | None] | None = None
             last_logged_snapshot: tuple[float | None, float | None, float | None, float | None] | None = None
@@ -516,10 +551,13 @@ class BookManager:
                 assets = list(self._market_assets.get(key, set()))
                 rows: list[tuple[str, str, str]] = []
                 raw_rows: list[tuple[str, float | None, float | None]] = []
+                game_start_ts: float | None = None
                 for aid in assets:
                     meta = self._asset_meta.get(aid)
                     if not meta:
                         continue
+                    if game_start_ts is None:
+                        game_start_ts = meta.get("game_start_ts")
                     outcome = meta.get("outcome", "")
                     book = self.active_books.get(aid)
                     best_bid = ""
@@ -580,7 +618,7 @@ class BookManager:
                         if is_new:
                             writer.writerow(
                                 [
-                                    "timestamp",
+                                    "time_since_gameStartTime",
                                     "condition_1",
                                     "best_bid_1",
                                     "best_ask_1",
@@ -591,7 +629,7 @@ class BookManager:
                             )
                         writer.writerow(
                             [
-                                datetime.now(timezone.utc).isoformat(),
+                                _fmt_elapsed(loop_start - game_start_ts if game_start_ts is not None else None),
                                 first[0],
                                 first[1],
                                 first[2],

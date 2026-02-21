@@ -27,6 +27,7 @@ from polymarket_bot.models import (
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
     ApiCreds,
+    BookParams,
     BalanceAllowanceParams as ClobBalanceAllowanceParams,
     AssetType as ClobAssetType,
     MarketOrderArgs,
@@ -360,6 +361,62 @@ class PolyClient:
             "bids": _levels("bids"),
             "asks": _levels("asks"),
         } # type: ignore
+
+    def get_order_book_snapshots(self, token_ids: list[str]) -> list[WsBookMessage]:
+        """
+        Fetches point-in-time order book snapshots in batch via REST.
+        """
+        if not token_ids:
+            return []
+        try:
+            client = self._get_public_clob_client()
+            params = [BookParams(token_id=tid) for tid in token_ids if tid]
+            if not params:
+                return []
+            raw_books = client.get_order_books(params)  # type: ignore[arg-type]
+        except Exception as e:
+            print(f"Batch order book REST fetch failed: {e}")
+            return []
+
+        out: list[WsBookMessage] = []
+        for raw in raw_books if isinstance(raw_books, list) else []:
+            book: dict[str, Any] | None
+            if isinstance(raw, dict):
+                book = cast(dict[str, Any], raw)
+            else:
+                book = getattr(raw, "__dict__", None)
+                if not isinstance(book, dict):
+                    continue
+
+            token_id = str(book.get("asset_id") or book.get("token_id") or "")
+            if not token_id:
+                continue
+
+            def _levels(key: str) -> list[dict[str, str]]:
+                levels = book.get(key, [])
+                if not isinstance(levels, list):
+                    return []
+                rows: list[dict[str, str]] = []
+                for lvl in levels:
+                    if isinstance(lvl, dict):
+                        price = str(lvl.get("price", "0"))
+                        size = str(lvl.get("size", "0"))
+                        rows.append({"price": price, "size": size})
+                    else:
+                        price = str(getattr(lvl, "price", "0"))
+                        size = str(getattr(lvl, "size", "0"))
+                        rows.append({"price": price, "size": size})
+                return rows
+
+            out.append(
+                {
+                    "event_type": "book",
+                    "asset_id": token_id,
+                    "bids": _levels("bids"),
+                    "asks": _levels("asks"),
+                }  # type: ignore
+            )
+        return out
 
     def _require_env(self, name: str) -> str:
         val = os.getenv(name)

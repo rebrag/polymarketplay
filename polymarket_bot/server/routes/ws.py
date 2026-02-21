@@ -266,6 +266,7 @@ async def websocket_books(websocket: WebSocket) -> None:
                 if not isinstance(items, list):
                     continue
                 for item in items:
+                    game_start_time = None
                     if isinstance(item, str):
                         asset_id = item
                         slug = question = outcome = None
@@ -274,6 +275,7 @@ async def websocket_books(websocket: WebSocket) -> None:
                         slug = item.get("slug")
                         question = item.get("question")
                         outcome = item.get("outcome")
+                        game_start_time = item.get("gameStartTime")
                     else:
                         continue
                     if not isinstance(asset_id, str) or not asset_id:
@@ -282,7 +284,13 @@ async def websocket_books(websocket: WebSocket) -> None:
                         continue
                     subscribed.add(asset_id)
                     if isinstance(slug, str) and isinstance(question, str):
-                        registry.set_asset_meta(asset_id, slug, question, outcome if isinstance(outcome, str) else None)
+                        registry.set_asset_meta(
+                            asset_id,
+                            slug,
+                            question,
+                            outcome if isinstance(outcome, str) else None,
+                            game_start_time if isinstance(game_start_time, str) else None,
+                        )
                     try:
                         registry.get_or_create(asset_id)
                         registry.register_subscriber(asset_id, update_q, loop)

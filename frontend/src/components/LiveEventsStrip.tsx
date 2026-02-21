@@ -16,7 +16,13 @@ interface LiveEvent {
   volume?: number;
   startDate?: string;
   endDate?: string;
-  markets?: { question: string; volume?: number; gameStartTime?: string }[];
+  markets?: {
+    question: string;
+    volume?: number;
+    gameStartTime?: string;
+    outcomes?: string[];
+    clobTokenIds?: string[];
+  }[];
   raw?: object;
 }
 
@@ -62,6 +68,15 @@ interface LiveEventsStripProps {
   onRemove: (slug: string) => void;
 }
 
+interface MoneylineToken {
+  tokenId: string;
+  outcome: string;
+}
+
+interface MoneylinePricesResponse {
+  items?: Array<{ token_id?: string; best_ask?: number | null; best_bid?: number | null }>;
+}
+
 function formatVol(value: number | undefined): string {
   if (!value || value <= 0) return "--";
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
@@ -72,6 +87,10 @@ function formatVol(value: number | undefined): string {
 function shortTitle(title: string): string {
   if (title.length <= 32) return title;
   return `${title.slice(0, 29)}...`;
+}
+
+function normalizeMarketQuestion(value: string): string {
+  return value.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
 function normalizeTeamName(name: string): string {
@@ -152,6 +171,49 @@ function getEventGameStart(ev: LiveEvent): string | undefined {
   return earliest;
 }
 
+function getMoneylineTokens(ev: LiveEvent): MoneylineToken[] {
+  const markets = ev.markets ?? [];
+  if (!markets.length) return [];
+  const titleNorm = normalizeMarketQuestion(ev.title);
+  const byExactTitle = markets.filter((m) => normalizeMarketQuestion(m.question) === titleNorm);
+  const byQuestion = byExactTitle.length ? byExactTitle : markets;
+  const preferred = byQuestion.filter((m) => {
+    const q = normalizeMarketQuestion(m.question);
+    if (q.includes("spread")) return false;
+    if (q.includes(" o/u ")) return false;
+    if (q.includes(" over/under")) return false;
+    if (q.includes("total points")) return false;
+    return true;
+  });
+  const pool = preferred.length ? preferred : byQuestion;
+  for (const market of pool) {
+    const outcomes = market.outcomes ?? [];
+    const tokenIds = market.clobTokenIds ?? [];
+    if (outcomes.length < 2 || tokenIds.length < 2) continue;
+    const rows: MoneylineToken[] = [];
+    for (let i = 0; i < outcomes.length && i < tokenIds.length; i += 1) {
+      const tokenId = String(tokenIds[i] ?? "");
+      const outcome = String(outcomes[i] ?? "");
+      if (!tokenId || !outcome) continue;
+      rows.push({ tokenId, outcome });
+    }
+    if (rows.length >= 2) return rows.slice(0, 2);
+  }
+  return [];
+}
+
+function shortOutcome(name: string): string {
+  const trimmed = name.trim();
+  if (!trimmed) return "N/A";
+  const token = trimmed.split(/\s+/)[0] ?? trimmed;
+  return token.toUpperCase().slice(0, 4);
+}
+
+function formatCents(price: number | null | undefined): string {
+  if (price === null || price === undefined || !Number.isFinite(price)) return "100c";
+  return `${Math.round(price * 100)}c`;
+}
+
 function getStatus(ev: LiveEvent): "live" | "upcoming" | "unknown" {
   const now = Date.now();
   const gameStart = getEventGameStart(ev);
@@ -159,6 +221,23 @@ function getStatus(ev: LiveEvent): "live" | "upcoming" | "unknown" {
   if (start !== null && now < start) return "upcoming";
   if (start !== null && now >= start) return "live";
   return "unknown";
+}
+
+function isClosedByMoneylinePrices(
+  moneyline: MoneylineToken[],
+  askLookup: Record<string, number | null>
+): boolean {
+  if (moneyline.length < 2) return false;
+  const cents = moneyline
+    .map((row) => {
+      const v = askLookup[row.tokenId];
+      if (typeof v === "number" && Number.isFinite(v)) return Math.round(v * 100);
+      return 100;
+    });
+  if (cents.length < 2) return false;
+  const min = Math.min(...cents);
+  const max = Math.max(...cents);
+  return min <= 1 && max >= 99;
 }
 
 function getDisplayTime(ev: LiveEvent): string | null {
@@ -255,6 +334,7 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
   const [canScrollLeft, setCanScrollLeft] = useState(false);
   const [canScrollRight, setCanScrollRight] = useState(false);
   const [copiedRaw, setCopiedRaw] = useState(false);
+  const [moneylineAsks, setMoneylineAsks] = useState<Record<string, number | null>>({});
 
   const handleFetchOdds = async () => {
     setOddsLoading(true);
@@ -383,6 +463,51 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
     }
   }, [minVolume, tagFilter]);
 
+  const visibleMoneylineTokens = useMemo(() => {
+    const ids: string[] = [];
+    filtered.slice(0, 500).forEach((ev) => {
+      getMoneylineTokens(ev).forEach((row) => ids.push(row.tokenId));
+    });
+    return Array.from(new Set(ids));
+  }, [filtered]);
+
+  useEffect(() => {
+    if (!visibleMoneylineTokens.length) {
+      setMoneylineAsks({});
+      return;
+    }
+    let cancelled = false;
+    const refresh = async () => {
+      if (document.visibilityState === "hidden") return;
+      try {
+        const res = await fetch("http://localhost:8000/books/batch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token_ids: visibleMoneylineTokens }),
+        });
+        if (!res.ok) return;
+        const payload = (await res.json()) as MoneylinePricesResponse;
+        if (cancelled) return;
+        const next: Record<string, number | null> = {};
+        (payload.items ?? []).forEach((item) => {
+          const tokenId = String(item.token_id ?? "");
+          if (!tokenId) return;
+          const ask = item.best_ask;
+          next[tokenId] = typeof ask === "number" && Number.isFinite(ask) ? ask : null;
+        });
+        setMoneylineAsks(next);
+      } catch {
+        // no-op
+      }
+    };
+    void refresh();
+    const interval = window.setInterval(() => void refresh(), 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [visibleMoneylineTokens]);
+
   return (
     <div className="relative rounded-md border border-slate-800 bg-slate-950/70 px-3 py-2">
       <div className="flex items-center justify-between mb-2">
@@ -504,57 +629,79 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
         >
           {filtered.slice(0, 500).map((ev) => {
             const isOn = subscribed.has(ev.slug);
-            const status = getStatus(ev);
             const displayTime = getDisplayTime(ev);
             const oddsInfo = oddsEvents.length > 0 ? getOddsOutcomes(ev, oddsEvents) : null;
             const rawJson = JSON.stringify(ev.raw ?? ev, null, 2);
+            const moneyline = getMoneylineTokens(ev);
+            const status = isClosedByMoneylinePrices(moneyline, moneylineAsks) ? "closed" : getStatus(ev);
             return (
               <div
                 key={ev.slug}
                 title={rawJson}
-                className="flex min-w-[220px] items-start justify-between gap-3 rounded-md border border-slate-800 bg-slate-900/50 px-3 py-2"
+                className="flex h-[110px] min-w-[220px] max-w-[220px] flex-col rounded-md border border-slate-800 bg-slate-900/50 px-3 py-2"
               >
-                <div className="flex flex-col">
-                  <span className="text-[10px] uppercase font-bold text-slate-400">
-                    {displayTime ? displayTime : "Upcoming"}
-                    {status === "live" && (
-                      <>
-                        <span className="ml-2 text-red-400">LIVE</span>
-                        <span className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-red-500 align-middle" />
-                      </>
-                    )}
-                  </span>
-                  <span className="text-[11px] text-slate-200 font-semibold">{shortTitle(ev.title)}</span>
-                  <span className="text-[10px] text-slate-500 font-mono">{formatVol(ev.volume)} vol</span>
-                  {oddsInfo && (
-                    <span className="text-[10px] text-amber-400 font-mono">
-                      {oddsInfo
-                        .map((item) => `${item.name}: ${(item.implied * 100).toFixed(1)}%`)
-                        .join(" A? ")}
+                <div className="flex min-h-0 items-start justify-between gap-3">
+                  <div className="flex min-w-0 flex-1 flex-col">
+                    <span className="h-4 truncate text-[10px] uppercase font-bold text-slate-400">
+                      {displayTime ? displayTime : "Upcoming"}
+                      {status === "live" && (
+                        <>
+                          <span className="ml-2 text-red-400">LIVE</span>
+                          <span className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-red-500 align-middle" />
+                        </>
+                      )}
+                      {status === "closed" && (
+                        <>
+                          <span className="ml-2 text-slate-300">CLOSED</span>
+                          <span className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-slate-400 align-middle" />
+                        </>
+                      )}
                     </span>
-                  )}
+                    <span className="truncate text-[11px] font-semibold text-slate-200">{shortTitle(ev.title)}</span>
+                    <span className="h-4 text-[10px] text-slate-500 font-mono">{formatVol(ev.volume)} vol</span>
+                    {oddsInfo && (
+                      <span className="truncate text-[10px] text-amber-400 font-mono">
+                        {oddsInfo
+                          .map((item) => `${item.name}: ${(item.implied * 100).toFixed(1)}%`)
+                          .join(" A? ")}
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex h-full flex-col items-end justify-between gap-2">
+                    <button
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        navigator.clipboard.writeText(rawJson).catch(() => {});
+                      }}
+                      className="h-5 rounded border border-slate-700 bg-slate-950/90 px-2 py-0.5 text-[9px] uppercase font-semibold text-slate-400 hover:text-slate-200 hover:border-slate-500"
+                    >
+                      Copy
+                    </button>
+                    <Button
+                      onClick={() => (isOn ? onRemove(ev.slug) : onAdd(ev.slug))}
+                      className={`h-7 w-[72px] px-0 text-[10px] uppercase font-bold ${
+                        isOn
+                          ? "bg-slate-800 border border-slate-700 hover:bg-slate-700"
+                          : "bg-blue-600 hover:bg-blue-500"
+                      }`}
+                    >
+                      {isOn ? "Remove" : "Add"}
+                    </Button>
+                  </div>
                 </div>
-                <div className="flex flex-col items-end gap-2">
-                  <button
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      navigator.clipboard.writeText(rawJson).catch(() => {});
-                    }}
-                    className="rounded border border-slate-700 bg-slate-950/90 px-2 py-0.5 text-[9px] uppercase font-semibold text-slate-400 hover:text-slate-200 hover:border-slate-500"
-                  >
-                    Copy
-                  </button>
-                  <Button
-                    onClick={() => (isOn ? onRemove(ev.slug) : onAdd(ev.slug))}
-                    className={`h-7 px-3 text-[10px] uppercase font-bold ${
-                      isOn
-                        ? "bg-slate-800 border border-slate-700 hover:bg-slate-700"
-                        : "bg-blue-600 hover:bg-blue-500"
-                    }`}
-                  >
-                    {isOn ? "Remove" : "Add"}
-                  </Button>
-                </div>
+                {moneyline.length >= 2 && (
+                  <div className={`mt-auto grid w-full gap-1.5 ${moneyline.length >= 2 ? "grid-cols-2" : "grid-cols-1"}`}>
+                    {moneyline.map((row) => (
+                      <span
+                        key={row.tokenId}
+                        className="w-full truncate rounded bg-slate-800 px-2 py-0.5 text-center text-[10px] font-semibold text-slate-200"
+                        title={row.outcome}
+                      >
+                        {shortOutcome(row.outcome)} {formatCents(moneylineAsks[row.tokenId])}
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
             );
           })}

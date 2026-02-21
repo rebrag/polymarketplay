@@ -42,6 +42,19 @@ const extractSport = (slug: string): string => {
   return chunk.split("_")[0] ?? "";
 };
 
+const toStringList = (value: unknown): string[] => {
+  if (Array.isArray(value)) return value.map((v) => String(v));
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) return parsed.map((v) => String(v));
+    } catch {
+      return [];
+    }
+  }
+  return [];
+};
+
 
 interface Market {
   question: string;
@@ -68,6 +81,7 @@ interface TokenWidget {
   marketQuestion: string;
   marketVolume: number;
   sourceSlug?: string;
+  gameStartTime?: string;
 }
 
 interface LogEntry {
@@ -1145,6 +1159,7 @@ function App() {
                 outcomeName,
                 marketQuestion: market.question,
                 marketVolume: market.volume,
+                gameStartTime: market.gameStartTime,
               });
             });
           });
@@ -1244,6 +1259,7 @@ function App() {
             marketQuestion: market.question,
             marketVolume: market.volume,
             sourceSlug: data.slug,
+            gameStartTime: market.gameStartTime,
           });
         });
       });
@@ -1392,20 +1408,25 @@ function App() {
       if (!res.ok) throw new Error("Log not found");
       const payload = (await res.json()) as { rows?: Array<Record<string, string>> };
       const rows = payload.rows ?? [];
+      const lookupKey = `${entry.slug}|${normalizeQuestion(entry.question)}`;
+      const startMs = logStartLookup.get(lookupKey) ?? null;
       const times = rows
         .map((row) => new Date(row.timestamp ?? "").getTime())
         .filter((t) => Number.isFinite(t) && t > 0);
       const t0 = times.length ? Math.min(...times) : Date.now();
       const parsed = rows.map((row) => {
+        const rel = Number(row.time_since_gameStartTime);
+        const hasRelative = Number.isFinite(rel);
         const ts = new Date(row.timestamp ?? "").getTime();
-        const t = Number.isFinite(ts) ? Math.max(0, Math.round((ts - t0) / 1000)) : 0;
+        const t = hasRelative ? rel : Number.isFinite(ts) ? Math.max(0, Math.round((ts - t0) / 1000)) : 0;
+        const tsMs = hasRelative && Number.isFinite(startMs || NaN) ? (startMs as number) + rel * 1000 : Number.isFinite(ts) ? ts : 0;
         const bid1 = Number(row.best_bid_1);
         const ask1 = Number(row.best_ask_1);
         const bid2 = Number(row.best_bid_2);
         const ask2 = Number(row.best_ask_2);
         return {
           t,
-          tsMs: Number.isFinite(ts) ? ts : 0,
+          tsMs,
           condition_1: row.condition_1 ?? "",
           condition_2: row.condition_2 ?? "",
           best_bid_1: Number.isFinite(bid1) ? bid1 : null,
@@ -1414,9 +1435,6 @@ function App() {
           best_ask_2: Number.isFinite(ask2) ? ask2 : null,
         };
       });
-      // Find game start time from liveEvents map
-      const lookupKey = `${entry.slug}|${normalizeQuestion(entry.question)}`;
-      const startMs = logStartLookup.get(lookupKey) ?? null;
       setLogStartMs(Number.isFinite(startMs || NaN) ? (startMs as number) : null);
       setLogGraphData(parsed);
     } catch (err) {
@@ -1662,6 +1680,12 @@ function App() {
                   question: m.question,
                   volume: m.volume,
                   gameStartTime: (m as { gameStartTime?: string }).gameStartTime,
+                  outcomes: Array.isArray((m as { outcomes?: string[] }).outcomes)
+                    ? (m as { outcomes?: string[] }).outcomes
+                    : toStringList((m as { outcomes?: unknown }).outcomes),
+                  clobTokenIds: Array.isArray((m as { clobTokenIds?: string[] }).clobTokenIds)
+                    ? (m as { clobTokenIds?: string[] }).clobTokenIds
+                    : toStringList((m as { clobTokenIds?: unknown }).clobTokenIds),
                 })),
                 raw: ev,
               }))}

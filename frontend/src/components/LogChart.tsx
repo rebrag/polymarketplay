@@ -41,14 +41,15 @@ const formatQuote = (value: number | null | undefined): string => {
 };
 
 const formatElapsed = (ms: number): string => {
-  if (!Number.isFinite(ms) || ms < 0) return "--";
-  const totalSec = Math.floor(ms / 1000);
+  if (!Number.isFinite(ms)) return "--";
+  const sign = ms < 0 ? "-" : "";
+  const totalSec = Math.floor(Math.abs(ms) / 1000);
   const h = Math.floor(totalSec / 3600);
   const m = Math.floor((totalSec % 3600) / 60);
   const s = totalSec % 60;
-  if (h > 0) return `${h}h ${m}m ${s}s`;
-  if (m > 0) return `${m}m ${s}s`;
-  return `${s}s`;
+  if (h > 0) return `${sign}${h}h ${m}m ${s}s`;
+  if (m > 0) return `${sign}${m}m ${s}s`;
+  return `${sign}${s}s`;
 };
 
 interface LogTooltipProps extends TooltipProps<number, string> {
@@ -126,13 +127,10 @@ export function LogChart({
     if (data.length === 0) return [];
     const times = data.map((row) => row.t).filter((t) => Number.isFinite(t));
     if (!times.length) return [];
+    const minT = Math.min(...times);
     const maxT = Math.max(...times);
-    if (!Number.isFinite(maxT) || maxT <= 0) return [0];
-    let end =
-      maxT >= 60 ? Math.floor(maxT / 60) * 60 : Math.max(1, Math.round(maxT));
-    if (end > maxT) end = maxT;
-    const tks = end === 0 ? [0] : [0, end];
-    return Array.from(new Set(tks));
+    if (!Number.isFinite(minT) || !Number.isFinite(maxT)) return [];
+    return Array.from(new Set([Math.round(minT), 0, Math.round(maxT)])).sort((a, b) => a - b);
   }, [data]);
 
   if (error) return <div className="text-[11px] text-amber-400">{error}</div>;
@@ -156,7 +154,7 @@ export function LogChart({
           ticks={ticks}
           tickFormatter={formatTick}
           allowDuplicatedCategory={false}
-          domain={[0, "dataMax"]}
+          domain={["dataMin", "dataMax"]}
         />
         <YAxis tickLine={false} axisLine tickMargin={6} fontSize={10} domain={[0, 1]} />
         <ChartTooltip cursor={false} content={<LogChartTooltip startMs={fallbackStartMs} />} />

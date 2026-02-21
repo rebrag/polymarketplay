@@ -8,6 +8,7 @@ interface WidgetAssetMeta {
   slug?: string;
   question?: string;
   outcome?: string;
+  gameStartTime?: string;
 }
 
 interface TokenWidget {
@@ -15,6 +16,7 @@ interface TokenWidget {
   sourceSlug?: string;
   marketQuestion?: string;
   outcomeName?: string;
+  gameStartTime?: string;
 }
 
 const SOCKET_URL = "ws://localhost:8000/ws/books/stream";
@@ -27,6 +29,7 @@ function buildAssetMeta(widgets: TokenWidget[]): WidgetAssetMeta[] {
     slug: w.sourceSlug,
     question: w.marketQuestion,
     outcome: w.outcomeName,
+    gameStartTime: w.gameStartTime,
   }));
 }
 

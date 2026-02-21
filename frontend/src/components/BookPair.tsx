@@ -185,8 +185,10 @@ function BookPairComponent({
         .filter((t) => Number.isFinite(t) && t > 0);
       const t0 = times.length ? Math.min(...times) : Date.now();
       const parsed = rows.map((row) => {
+        const rel = Number(row.time_since_gameStartTime);
+        const hasRelative = Number.isFinite(rel);
         const ts = new Date(row.timestamp ?? "").getTime();
-        const t = Number.isFinite(ts) ? Math.max(0, Math.round((ts - t0) / 1000)) : 0;
+        const t = hasRelative ? rel : Number.isFinite(ts) ? Math.max(0, Math.round((ts - t0) / 1000)) : 0;
         const bid1 = Number(row.best_bid_1);
         const ask1 = Number(row.best_ask_1);
         const bid2 = Number(row.best_bid_2);

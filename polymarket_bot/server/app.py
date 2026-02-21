@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from polymarket_bot.server.lifespan import lifespan
-from polymarket_bot.server.routes import debug, events, logs, metrics, odds, orders, user, ws
+from polymarket_bot.server.routes import books, debug, events, logs, metrics, odds, orders, user, ws
 
 load_dotenv()
 
@@ -21,6 +21,7 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(events.router)
+    app.include_router(books.router)
     app.include_router(user.router)
     app.include_router(orders.router)
     app.include_router(odds.router)

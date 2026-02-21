@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException
@@ -9,6 +10,22 @@ from polymarket_bot.server.state import registry
 from polymarket_bot.utils import get_game_data
 
 router = APIRouter()
+
+
+def _parse_list_field(raw: object) -> list[str]:
+    if isinstance(raw, list):
+        return [str(x) for x in raw]
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return []
+        if isinstance(parsed, list):
+            return [str(x) for x in parsed]
+    return []
 
 
 @router.get("/events/resolve", response_model=GammaEvent)
@@ -110,6 +127,13 @@ def list_events(
 
     filtered: list[GammaEvent] = []
     for ev in events:
+        markets = ev.get("markets", [])
+        if isinstance(markets, list):
+            for m in markets:
+                if not isinstance(m, dict):
+                    continue
+                m["outcomes"] = _parse_list_field(m.get("outcomes"))
+                m["clobTokenIds"] = _parse_list_field(m.get("clobTokenIds"))
         candidates = _candidate_times(ev)
         event_tags = str(ev.get("tags") or "")
         is_nfl = "450" in event_tags.split(",") or event_tags.strip() == "450"
