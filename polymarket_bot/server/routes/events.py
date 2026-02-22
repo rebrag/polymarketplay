@@ -106,14 +106,6 @@ def list_events(
 
     def _candidate_times(ev: GammaEvent) -> list[datetime]:
         times: list[datetime] = []
-        end_raw = ev.get("endDate")
-        start_raw = ev.get("startDate")
-        end_dt = _parse(str(end_raw)) if end_raw else None
-        start_dt = _parse(str(start_raw)) if start_raw else None
-        if end_dt:
-            times.append(end_dt)
-        if start_dt:
-            times.append(start_dt)
         markets = ev.get("markets", [])
         if isinstance(markets, list):
             for m in markets:
@@ -142,10 +134,9 @@ def list_events(
             filtered.append(ev)
 
     def _sort_key(ev: GammaEvent) -> datetime:
-        end_raw = ev.get("endDate")
-        end_dt = _parse(str(end_raw)) if end_raw else None
-        if end_dt:
-            return end_dt
+        candidates = _candidate_times(ev)
+        if candidates:
+            return min(candidates)
         return now
 
     filtered.sort(key=_sort_key)

@@ -77,6 +77,8 @@ interface MoneylinePricesResponse {
   items?: Array<{ token_id?: string; best_ask?: number | null; best_bid?: number | null }>;
 }
 
+const BOOKS_BATCH_MIN_INTERVAL_MS = 10_000;
+
 function formatVol(value: number | undefined): string {
   if (!value || value <= 0) return "--";
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
@@ -98,6 +100,17 @@ function normalizeTeamName(name: string): string {
   const parts = cleaned.split(" ").filter(Boolean);
   const stop = new Set(["fc", "cf", "afc", "sc", "club", "the", "utd", "united"]);
   return parts.filter((p) => !stop.has(p)).join(" ");
+}
+
+function isSoccerEvent(ev: LiveEvent): boolean {
+  const raw = (ev.raw ?? {}) as {
+    tags?: Array<{ name?: string; label?: string; slug?: string; id?: string | number }>;
+  };
+  const tags = raw.tags ?? [];
+  return tags.some((tag) => {
+    const values = [tag?.name, tag?.label, tag?.slug].map((v) => String(v ?? "").toLowerCase());
+    return values.some((v) => v.includes("soccer"));
+  });
 }
 
 function extractTeams(title: string): [string, string] | null {
@@ -172,8 +185,102 @@ function getEventGameStart(ev: LiveEvent): string | undefined {
 }
 
 function getMoneylineTokens(ev: LiveEvent): MoneylineToken[] {
+  const normalizeRows = (
+    rows: MoneylineToken[],
+    max: number,
+    dedupeByOutcome: boolean = false
+  ): MoneylineToken[] => {
+    const seen = new Set<string>();
+    const out: MoneylineToken[] = [];
+    for (const row of rows) {
+      const token = String(row.tokenId ?? "");
+      const outcome = String(row.outcome ?? "");
+      if (!token || !outcome) continue;
+      const key = dedupeByOutcome ? outcome.toLowerCase() : `${token}|${outcome.toLowerCase()}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ tokenId: token, outcome });
+      if (out.length >= max) break;
+    }
+    return out;
+  };
+
   const markets = ev.markets ?? [];
   if (!markets.length) return [];
+  if (isSoccerEvent(ev)) {
+    const teams = extractTeams(ev.title);
+    if (!teams) return [];
+    const [teamA, teamB] = teams;
+    const normA = normalizeTeamName(teamA);
+    const normB = normalizeTeamName(teamB);
+
+    const getYesToken = (m: (typeof markets)[number]): string | null => {
+      const outcomes = m.outcomes ?? [];
+      const tokenIds = m.clobTokenIds ?? [];
+      for (let i = 0; i < outcomes.length && i < tokenIds.length; i += 1) {
+        if (String(outcomes[i] ?? "").trim().toLowerCase() === "yes") {
+          const token = String(tokenIds[i] ?? "");
+          return token || null;
+        }
+      }
+      if (tokenIds.length > 0) {
+        const token = String(tokenIds[0] ?? "");
+        return token || null;
+      }
+      return null;
+    };
+
+    const used = new Set<number>();
+    const pickMarket = (predicate: (q: string) => boolean): (typeof markets)[number] | null => {
+      for (let i = 0; i < markets.length; i += 1) {
+        if (used.has(i)) continue;
+        const q = normalizeTeamName(markets[i].question ?? "");
+        if (!predicate(q)) continue;
+        used.add(i);
+        return markets[i];
+      }
+      return null;
+    };
+
+    const marketDraw = pickMarket((q) => q.includes("draw"));
+    const marketA = pickMarket((q) => q.includes("win") && !q.includes("draw") && !!normA && q.includes(normA));
+    const marketB = pickMarket((q) => q.includes("win") && !q.includes("draw") && !!normB && q.includes(normB));
+
+    const rows: MoneylineToken[] = [];
+    if (marketA) {
+      const token = getYesToken(marketA);
+      if (token) rows.push({ tokenId: token, outcome: teamA });
+    }
+    if (marketDraw) {
+      const token = getYesToken(marketDraw);
+      if (token) rows.push({ tokenId: token, outcome: "Draw" });
+    }
+    if (marketB) {
+      const token = getYesToken(marketB);
+      if (token) rows.push({ tokenId: token, outcome: teamB });
+    }
+    if (rows.length >= 3) return normalizeRows(rows, 3, true);
+
+    // Fallback for single trinary soccer market with outcomes [Team A, Draw, Team B].
+    for (const market of markets) {
+      const outcomes = market.outcomes ?? [];
+      const tokenIds = market.clobTokenIds ?? [];
+      if (outcomes.length < 3 || tokenIds.length < 3) continue;
+      const mapped: MoneylineToken[] = [];
+      for (let i = 0; i < outcomes.length && i < tokenIds.length; i += 1) {
+        const out = String(outcomes[i] ?? "");
+        const outNorm = normalizeTeamName(out);
+        const token = String(tokenIds[i] ?? "");
+        if (!token) continue;
+        if (outNorm.includes("draw")) mapped.push({ tokenId: token, outcome: "Draw" });
+        else if (normA && outNorm.includes(normA)) mapped.push({ tokenId: token, outcome: teamA });
+        else if (normB && outNorm.includes(normB)) mapped.push({ tokenId: token, outcome: teamB });
+      }
+      const normalized = normalizeRows(mapped, 3, true);
+      if (normalized.length >= 3) return normalized;
+    }
+  }
+
   const titleNorm = normalizeMarketQuestion(ev.title);
   const byExactTitle = markets.filter((m) => normalizeMarketQuestion(m.question) === titleNorm);
   const byQuestion = byExactTitle.length ? byExactTitle : markets;
@@ -197,7 +304,7 @@ function getMoneylineTokens(ev: LiveEvent): MoneylineToken[] {
       if (!tokenId || !outcome) continue;
       rows.push({ tokenId, outcome });
     }
-    if (rows.length >= 2) return rows.slice(0, 2);
+    if (rows.length >= 2) return normalizeRows(rows, 2);
   }
   return [];
 }
@@ -205,6 +312,7 @@ function getMoneylineTokens(ev: LiveEvent): MoneylineToken[] {
 function shortOutcome(name: string): string {
   const trimmed = name.trim();
   if (!trimmed) return "N/A";
+  if (trimmed.toLowerCase() === "draw") return "DRAW";
   const token = trimmed.split(/\s+/)[0] ?? trimmed;
   return token.toUpperCase().slice(0, 4);
 }
@@ -273,11 +381,7 @@ function loadOddsSport(): string {
 export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEventsStripProps) {
   const [query, setQuery] = useState("");
   const [filtersOpen, setFiltersOpen] = useState(false);
-  const [oddsLoading, setOddsLoading] = useState(false);
-  const [oddsCopied, setOddsCopied] = useState(false);
-  const [oddsReady, setOddsReady] = useState(false);
-  const [oddsError, setOddsError] = useState<string | null>(null);
-  const [oddsData, setOddsData] = useState<OddsResponse | null>(null);
+  const [oddsData] = useState<OddsResponse | null>(null);
   const [oddsSports, setOddsSports] = useState<OddsSport[]>([]);
   const [oddsSportKey, setOddsSportKey] = useState(loadOddsSport());
   const initialFilters = useMemo(() => loadLiveFilters(), []);
@@ -335,41 +439,8 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
   const [canScrollRight, setCanScrollRight] = useState(false);
   const [copiedRaw, setCopiedRaw] = useState(false);
   const [moneylineAsks, setMoneylineAsks] = useState<Record<string, number | null>>({});
+  const lastBooksBatchFetchMsRef = useRef(0);
 
-  const handleFetchOdds = async () => {
-    setOddsLoading(true);
-    setOddsError(null);
-    try {
-      const params = new URLSearchParams();
-      if (oddsSportKey) params.set("sport", oddsSportKey);
-      const res = await fetch(`http://localhost:8000/odds/raw?${params.toString()}`);
-      if (!res.ok) {
-        setOddsError("Odds not available");
-        return;
-      }
-      const data = await res.json();
-      setOddsData(data as OddsResponse);
-      await navigator.clipboard.writeText(JSON.stringify(data, null, 2));
-      setOddsCopied(true);
-      setOddsReady(true);
-      window.setTimeout(() => setOddsCopied(false), 1200);
-    } catch {
-      setOddsError("Odds request failed");
-    } finally {
-      setOddsLoading(false);
-    }
-  };
-
-  const handleCopyOdds = async () => {
-    if (!oddsData) return;
-    try {
-      await navigator.clipboard.writeText(JSON.stringify(oddsData, null, 2));
-      setOddsCopied(true);
-      window.setTimeout(() => setOddsCopied(false), 1200);
-    } catch {
-      setOddsError("Odds copy failed");
-    }
-  };
   const oddsEvents = useMemo(() => oddsData?.events ?? [], [oddsData]);
 
   useEffect(() => {
@@ -479,6 +550,9 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
     let cancelled = false;
     const refresh = async () => {
       if (document.visibilityState === "hidden") return;
+      const now = Date.now();
+      if (now - lastBooksBatchFetchMsRef.current < BOOKS_BATCH_MIN_INTERVAL_MS) return;
+      lastBooksBatchFetchMsRef.current = now;
       try {
         const res = await fetch("http://localhost:8000/books/batch", {
           method: "POST",
@@ -501,7 +575,7 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
       }
     };
     void refresh();
-    const interval = window.setInterval(() => void refresh(), 3000);
+    const interval = window.setInterval(() => void refresh(), BOOKS_BATCH_MIN_INTERVAL_MS);
     return () => {
       cancelled = true;
       window.clearInterval(interval);
@@ -558,7 +632,7 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
               </div>
             )}
           </div>
-          <Select value={oddsSportKey} onValueChange={setOddsSportKey}>
+          {/* <Select value={oddsSportKey} onValueChange={setOddsSportKey}>
             <SelectTrigger className="h-7 px-2 text-[10px] min-w-[140px]">
               <SelectValue placeholder="Odds league" />
             </SelectTrigger>
@@ -588,10 +662,7 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
             >
               Copy Odds
             </Button>
-          </div>
-          {oddsError && (
-            <span className="text-[10px] text-amber-400">{oddsError}</span>
-          )}
+          </div> */}
         </div>
         <div className="flex items-center gap-2">
           <span className="text-[10px] text-slate-500 font-mono">Window set in Settings</span>
@@ -632,13 +703,15 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
             const displayTime = getDisplayTime(ev);
             const oddsInfo = oddsEvents.length > 0 ? getOddsOutcomes(ev, oddsEvents) : null;
             const rawJson = JSON.stringify(ev.raw ?? ev, null, 2);
-            const moneyline = getMoneylineTokens(ev);
-            const status = isClosedByMoneylinePrices(moneyline, moneylineAsks) ? "closed" : getStatus(ev);
+            const hidePreviewPills = String(ev.slug ?? "").toLowerCase().includes("more-markets");
+            const moneyline = hidePreviewPills ? [] : getMoneylineTokens(ev);
+            const previewPills = moneyline.slice(0, 3);
+            const status = isClosedByMoneylinePrices(previewPills, moneylineAsks) ? "closed" : getStatus(ev);
             return (
               <div
                 key={ev.slug}
                 title={rawJson}
-                className="flex h-[110px] min-w-[220px] max-w-[220px] flex-col rounded-md border border-slate-800 bg-slate-900/50 px-3 py-2"
+                className="flex h-[95px] min-w-[220px] max-w-[220px] flex-col rounded-md border border-slate-800 bg-slate-900/50 px-3 py-2"
               >
                 <div className="flex min-h-0 items-start justify-between gap-3">
                   <div className="flex min-w-0 flex-1 flex-col">
@@ -653,7 +726,7 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
                       {status === "closed" && (
                         <>
                           <span className="ml-2 text-slate-300">CLOSED</span>
-                          <span className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-slate-400 align-middle" />
+                          <span className="ml-1 align-middle text-[10px]">🔒</span>
                         </>
                       )}
                     </span>
@@ -689,12 +762,16 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
                     </Button>
                   </div>
                 </div>
-                {moneyline.length >= 2 && (
-                  <div className={`mt-auto grid w-full gap-1.5 ${moneyline.length >= 2 ? "grid-cols-2" : "grid-cols-1"}`}>
-                    {moneyline.map((row) => (
+                {previewPills.length >= 2 && (
+                  <div
+                    className={`mt-2 grid w-full gap-1 ${
+                      previewPills.length >= 3 ? "grid-cols-3" : previewPills.length === 2 ? "grid-cols-2" : "grid-cols-1"
+                    }`}
+                  >
+                    {previewPills.map((row, idx) => (
                       <span
-                        key={row.tokenId}
-                        className="w-full truncate rounded bg-slate-800 px-2 py-0.5 text-center text-[10px] font-semibold text-slate-200"
+                        key={`${row.tokenId}-${row.outcome}-${idx}`}
+                        className="w-full truncate rounded bg-slate-800 px-1.5 py-[1px] text-center text-[9px] font-semibold text-slate-200"
                         title={row.outcome}
                       >
                         {shortOutcome(row.outcome)} {formatCents(moneylineAsks[row.tokenId])}

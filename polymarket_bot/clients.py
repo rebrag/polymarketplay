@@ -486,6 +486,14 @@ class PolyClient:
         self._trading_clob = client
         return client
 
+    def warm_trading_client(self) -> None:
+        """
+        Pre-initializes the authenticated trading client and API creds.
+
+        Call once at server startup so the first order does not pay init latency.
+        """
+        self._get_trading_clob_client()
+
     def get_api_creds(self) -> ApiCreds:
         if self._api_creds is not None:
             return self._api_creds
@@ -527,6 +535,16 @@ class PolyClient:
         """
         client = self._get_trading_clob_client()
         return self.check_orders(client)
+
+    def get_open_orders_strict(self) -> list[Order]:
+        """
+        Fetches open orders and raises on upstream failure.
+        """
+        client = self._get_trading_clob_client()
+        raw_orders = client.get_orders(OpenOrderParams())  # type: ignore
+        if isinstance(raw_orders, list):
+            return cast(list[Order], raw_orders)
+        return []
 
     def cancel_order(self, order_id: str) -> dict[str, Any]:
         client = self._get_trading_clob_client()
@@ -605,13 +623,13 @@ class PolyClient:
 
         side_const = BUY if side == "BUY" else SELL
         client = self._get_trading_clob_client()
-        try:
-            creds = client.create_or_derive_api_creds()  # type: ignore
-            client.set_api_creds(creds)  # type: ignore
-            self._api_creds = creds
-        except Exception:
-            # Fallback to existing creds if re-derive fails.
-            pass
+        # Reuse credentials already initialized on the trading client
+        # to avoid extra auth roundtrips on each market order.
+        if self._api_creds is not None:
+            try:
+                client.set_api_creds(self._api_creds)  # type: ignore
+            except Exception:
+                pass
 
         order = MarketOrderArgs(
             token_id=token_id,

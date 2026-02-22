@@ -114,6 +114,11 @@ function clampOrders(list: OrderView[]): OrderView[] {
   return [...list].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 50);
 }
 
+function toFiniteNumber(value: unknown): number | null {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 type UserSocketMessage =
   | { type: "new_markets"; markets: Market[] }
   | { type: "recent_trades"; trades: Trade[] };
@@ -842,6 +847,7 @@ function App() {
       } else if (data.type === "closed") {
         const now = Date.now();
         if (data.event === "TRADE") {
+          let shouldApplyFill = true;
           const tradeId = data.trade_id;
           if (tradeId) {
             const seen = seenTradeIdsRef.current;
@@ -857,6 +863,8 @@ function App() {
                 const next = [{ ...data.order, status: "closed" as const, updatedAt: Date.now() }, ...prev];
                 return next.slice(0, 20);
               });
+            } else {
+              shouldApplyFill = false;
             }
           } else {
             playTradeFilled();
@@ -865,6 +873,9 @@ function App() {
               const next = [{ ...data.order, status: "closed" as const, updatedAt: Date.now() }, ...prev];
               return next.slice(0, 20);
             });
+          }
+          if (shouldApplyFill) {
+            applyFilledOrderToPositions(data.order);
           }
         }
         setOrders((prev) => {
@@ -1290,6 +1301,56 @@ function App() {
     setUrl(value);
     void resolveInput("replace", value);
   };
+
+  function applyFilledOrderToPositions(order: OrderView): void {
+    const asset = String(order.asset_id || "");
+    const side = String(order.side || "").toUpperCase();
+    const size = toFiniteNumber(order.size);
+    if (!asset || (side !== "BUY" && side !== "SELL") || size === null || size <= 0) return;
+    const delta = side === "BUY" ? size : -size;
+    const fillPrice = toFiniteNumber(order.price);
+
+    setAuthPositions((prev) => {
+      const idx = prev.findIndex((p) => p.asset === asset);
+      if (idx === -1) {
+        if (delta <= 0) return prev;
+        return [
+          {
+            asset,
+            size: delta,
+            avgPrice: fillPrice ?? 0,
+            currentValue: 0,
+            title: order.market || order.outcome || asset.slice(0, 10),
+            outcome: order.outcome || "",
+          },
+          ...prev,
+        ];
+      }
+
+      const current = prev[idx];
+      const currentSize = toFiniteNumber(current.size) ?? 0;
+      const currentAvg = toFiniteNumber(current.avgPrice) ?? 0;
+      const nextSize = currentSize + delta;
+      const next = [...prev];
+      if (nextSize <= 1e-9) {
+        next.splice(idx, 1);
+        return next;
+      }
+
+      let nextAvg = currentAvg;
+      if (side === "BUY" && fillPrice !== null) {
+        const totalCost = currentSize * currentAvg + size * fillPrice;
+        nextAvg = totalCost / nextSize;
+      }
+
+      next[idx] = {
+        ...current,
+        size: nextSize,
+        avgPrice: nextAvg,
+      };
+      return next;
+    });
+  }
 
   const handleAddSlug = (slug: string) => {
     void resolveInput("add", slug);

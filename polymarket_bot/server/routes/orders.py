@@ -46,13 +46,18 @@ def post_limit_order(req: LimitOrderRequest) -> dict[str, object]:
     try:
         best_price = _best_price_from_book(req.token_id, req.side)
         if best_price is None:
-            try:
-                best_price = registry.poly_client.get_best_price(req.token_id, req.side)
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=503,
-                    detail={"error": "best_price unavailable", "upstream": str(exc)},
-                )
+            # Fail fast for low-latency execution: do not fall back to REST best-price fetch.
+            # try:
+            #     best_price = registry.poly_client.get_best_price(req.token_id, req.side)
+            # except Exception as exc:
+            #     raise HTTPException(
+            #         status_code=503,
+            #         detail={"error": "best_price unavailable", "upstream": str(exc)},
+            #     )
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "book_not_ready", "message": "Local book not ready; retry shortly."},
+            )
         price: float | None = None
         if req.level is not None:
             price = registry.get_price_for_level(req.token_id, req.side, req.level)
@@ -65,31 +70,21 @@ def post_limit_order(req: LimitOrderRequest) -> dict[str, object]:
         if ttl < 0:
             raise HTTPException(status_code=400, detail="ttl_seconds must be >= 0 (or omitted for GTC)")
 
-        last_exc: Exception | None = None
-        for attempt in range(2):
-            try:
-                start = time.perf_counter()
-                result = registry.poly_client.place_limit_order(
-                    token_id=req.token_id,
-                    side=req.side,
-                    size=req.size,
-                    price=price,
-                    ttl_seconds=ttl + 60,
-                )
-                _log_submit_latency(
-                    "limit",
-                    req.token_id,
-                    req.side,
-                    (time.perf_counter() - start) * 1000.0,
-                )
-                return {"ok": True, "placed_price": price, "result": result}
-            except Exception as exc:
-                last_exc = exc
-                if attempt == 0 and "Request exception" in str(exc):
-                    time.sleep(0.25)
-                    continue
-                raise
-        raise last_exc  # type: ignore[misc]
+        start = time.perf_counter()
+        result = registry.poly_client.place_limit_order(
+            token_id=req.token_id,
+            side=req.side,
+            size=req.size,
+            price=price,
+            ttl_seconds=ttl + 60,
+        )
+        _log_submit_latency(
+            "limit",
+            req.token_id,
+            req.side,
+            (time.perf_counter() - start) * 1000.0,
+        )
+        return {"ok": True, "placed_price": price, "result": result}
     except HTTPException:
         raise
     except Exception as e:
@@ -136,7 +131,7 @@ def get_auto_pair(pair_key: str) -> dict[str, object]:
     with registry._auto_lock:
         config = registry._auto_pairs.get(pair_key)
     if config is None:
-        raise HTTPException(status_code=404, detail="Auto pair not found")
+        return {"ok": True, "pair": None}
     settings = [
         {
             "asset_id": s.asset_id,

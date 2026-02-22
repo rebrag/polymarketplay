@@ -38,16 +38,29 @@ class DefaultStrategy:
         other_asset = ctx.assets[1] if asset_id == ctx.assets[0] else ctx.assets[0]
         current_shares = ctx.positions.get(asset_id, 0.0)
         other_shares = ctx.positions.get(other_asset, 0.0)
-        both_over_10 = current_shares >= 10 and other_shares >= 10
-        exposure_diff = current_shares - other_shares
-        trade_side = "SELL" if both_over_10 or exposure_diff >= config.auto_sell_min_shares else "BUY"
-        if trade_side == "BUY" and current_shares >= 15:
+        current_cfg = config.asset_settings.get(asset_id)
+        other_cfg = config.asset_settings.get(other_asset)
+        current_threshold = float(current_cfg.shares) if current_cfg is not None else 0.0
+        other_threshold = float(other_cfg.shares) if other_cfg is not None else 0.0
+        has_current_inventory = current_shares >= current_threshold > 0
+        has_other_inventory = other_shares >= other_threshold > 0
+
+        # Capital-efficient behavior:
+        # - "Has inventory" means position >= configured per-asset shares size.
+        # - If this asset has inventory, prioritize SELL on this same asset.
+        # - If only the opposite asset has inventory, do not BUY this asset.
+        # - If both sides are below their configured shares sizes, keep BUY behavior.
+        if has_current_inventory:
+            if not ctx.sell_allowed:
+                return []
+            return [OrderIntent(side="SELL")]
+        if has_other_inventory:
             return []
-        if trade_side == "BUY" and not ctx.buy_allowed:
+
+        # No meaningful inventory on either side: keep posting BUYs.
+        if not ctx.buy_allowed:
             return []
-        if trade_side == "SELL" and not ctx.sell_allowed:
-            return []
-        return [OrderIntent(side=trade_side)]
+        return [OrderIntent(side="BUY")]
 
 
 class ConservativeStrategy:

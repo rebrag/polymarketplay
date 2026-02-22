@@ -62,8 +62,19 @@ class BookManager:
         self._auto_lock = threading.Lock()
         self._auto_stop = threading.Event()
         self._auto_thread: threading.Thread | None = None
+        self._positions_lock = threading.Lock()
         self._positions_cache: Dict[str, float] = {}
         self._positions_last_fetch = 0.0
+        self._positions_refresh_interval_s = 60.0
+        self._auto_last_submit_ts: Dict[tuple[str, str], float] = {}
+        self._auto_submit_cooldown_s = 3.0
+        self._auto_pending_submits: Dict[tuple[str, str], tuple[float, float]] = {}
+        self._auto_pending_timeout_s = 20.0
+        self._auto_pair_last_fill_ts: Dict[str, float] = {}
+        self._auto_fill_repost_cooldown_s = 4.0
+        self._open_orders_lock = threading.Lock()
+        self._open_orders_by_id: Dict[str, Order] = {}
+        self._open_orders_initialized = False
 
     def register_subscriber(self, asset_id: str, q: Queue[None], loop: AbstractEventLoop) -> None:
         self._subs.setdefault(asset_id, set()).add(q)
@@ -225,6 +236,11 @@ class BookManager:
         with self._auto_lock:
             self._auto_pairs[config.pair_key] = config
         if config.enabled:
+            try:
+                self.ensure_user_socket()
+            except Exception:
+                pass
+            self._ensure_open_orders_index()
             for asset in config.assets:
                 try:
                     self.get_or_create(asset)
@@ -251,11 +267,13 @@ class BookManager:
 
     def _get_positions_cache(self) -> Dict[str, float]:
         now = time.time()
-        if now - self._positions_last_fetch < 5 and self._positions_cache:
-            return self._positions_cache
+        with self._positions_lock:
+            if self._positions_cache and (now - self._positions_last_fetch) < self._positions_refresh_interval_s:
+                return dict(self._positions_cache)
         address = self.poly_client.get_positions_address()
         if not address:
-            return self._positions_cache
+            with self._positions_lock:
+                return dict(self._positions_cache)
         positions = self.poly_client.get_positions(address, limit=200)
         cache: Dict[str, float] = {}
         for pos in positions:
@@ -267,9 +285,32 @@ class BookManager:
             except (TypeError, ValueError):
                 size = 0.0
             cache[asset] = size
-        self._positions_cache = cache
-        self._positions_last_fetch = now
-        return cache
+        with self._positions_lock:
+            self._positions_cache = cache
+            self._positions_last_fetch = now
+            return dict(self._positions_cache)
+
+    def _apply_fill_to_positions(self, order_obj: dict[str, object]) -> None:
+        asset = str(order_obj.get("asset_id") or "")
+        if not asset:
+            return
+        side = str(order_obj.get("side", "")).upper()
+        if side not in {"BUY", "SELL"}:
+            return
+        try:
+            size = float(order_obj.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0.0
+        if size <= 0:
+            return
+        delta = size if side == "BUY" else -size
+        with self._positions_lock:
+            current = float(self._positions_cache.get(asset, 0.0))
+            next_size = current + delta
+            if next_size <= 1e-9:
+                self._positions_cache.pop(asset, None)
+            else:
+                self._positions_cache[asset] = next_size
 
     def _decimals_for_tick(self, tick: float) -> int:
         if not tick or tick <= 0:
@@ -361,19 +402,16 @@ class BookManager:
             if not configs:
                 return
             positions = self._get_positions_cache()
-            open_assets: Dict[str, set[str]] = {}
-            try:
-                orders = self.poly_client.get_open_orders()
-                for order in orders:
-                    asset = str(order.get("asset_id") or "")
-                    if not asset:
-                        continue
-                    side = str(order.get("side", "")).upper()
-                    if side not in {"BUY", "SELL"}:
-                        continue
-                    open_assets.setdefault(asset, set()).add(side)
-            except Exception as e:
-                print(f"Auto order open-orders fetch failed: {e}")
+            if not self._ensure_open_orders_index():
+                # Fail closed to avoid duplicate placements when open-order state is unavailable.
+                self._auto_stop.wait(1.0)
+                continue
+            open_assets, open_sell_sizes = self._get_open_orders_snapshot()
+            # Clear pending markers once the corresponding side appears in open orders.
+            for key in list(self._auto_pending_submits.keys()):
+                asset, side = key
+                if side in open_assets.get(asset, set()):
+                    self._auto_pending_submits.pop(key, None)
             now = time.time()
             for config in configs:
                 if len(config.assets) < 2:
@@ -418,6 +456,7 @@ class BookManager:
                     last_trades=last_trades, #type: ignore
                 )
                 strategy = get_strategy(getattr(config, "strategy", "default"))
+                pair_last_fill = self._auto_pair_last_fill_ts.get(config.pair_key, 0.0)
 
                 for asset in assets:
                     if asset in config.disabled_assets:
@@ -433,10 +472,27 @@ class BookManager:
                         trade_side = intent.side
                         if trade_side in open_assets.get(asset, set()):
                             continue
+                        submit_key = (asset, trade_side)
+                        pending = self._auto_pending_submits.get(submit_key)
+                        if pending is not None:
+                            pending_ts, _pending_size = pending
+                            if now - pending_ts < self._auto_pending_timeout_s:
+                                continue
+                            self._auto_pending_submits.pop(submit_key, None)
+                        last_submit = self._auto_last_submit_ts.get(submit_key, 0.0)
+                        if now - last_submit < self._auto_submit_cooldown_s:
+                            continue
+                        if now - pair_last_fill < self._auto_fill_repost_cooldown_s:
+                            continue
                         size_multiplier = 1.0
                         if intent.size_multiplier:
                             size_multiplier = max(0.01, float(intent.size_multiplier))
                         level = settings.level
+                        if trade_side == "SELL" and len(assets) >= 2:
+                            other_asset = assets[1] if asset == assets[0] else assets[0]
+                            other_settings = config.asset_settings.get(other_asset)
+                            if other_settings is not None:
+                                level = other_settings.level
                         if intent.level is not None:
                             level = intent.level
                         price = self._price_for_level(books[asset], trade_side, level)
@@ -445,14 +501,31 @@ class BookManager:
                         price = max(0.01, min(0.99, price))
                         ttl_val = max(0, settings.ttl_seconds)
                         ttl_seconds = None if ttl_val <= 0 else ttl_val + 60
+                        order_size = settings.shares * size_multiplier
+                        if trade_side == "SELL":
+                            pending_sell_size = 0.0
+                            for (pending_asset, pending_side), (_ts, pending_sz) in self._auto_pending_submits.items():
+                                if pending_asset == asset and pending_side == "SELL":
+                                    pending_sell_size += pending_sz
+                            available_sell = max(
+                                0.0,
+                                float(positions.get(asset, 0.0)) - open_sell_sizes.get(asset, 0.0) - pending_sell_size,
+                            )
+                            if available_sell + 1e-9 < order_size:
+                                continue
                         try:
                             self.poly_client.place_limit_order(
                                 token_id=asset,
                                 side=cast(Literal["BUY", "SELL"], trade_side),
-                                size=settings.shares * size_multiplier,
+                                size=order_size,
                                 price=price,
                                 ttl_seconds=ttl_seconds,
                             )
+                            self._auto_last_submit_ts[submit_key] = now
+                            self._auto_pending_submits[submit_key] = (now, order_size)
+                            open_assets.setdefault(asset, set()).add(trade_side)
+                            if trade_side == "SELL":
+                                open_sell_sizes[asset] = open_sell_sizes.get(asset, 0.0) + order_size
                         except Exception as e:
                             meta = self._asset_meta.get(asset, {})
                             question = meta.get("question") or "unknown"
@@ -781,6 +854,7 @@ class BookManager:
         self._dispatch_order_payload(payload)
 
     def _dispatch_order_payload(self, payload: dict[str, object]) -> None:
+        self._apply_order_payload_to_index(payload)
         if not self._order_subs:
             print("User WS event dropped (no subscribers)")
         for q in tuple(self._order_subs):
@@ -798,6 +872,73 @@ class BookManager:
                     pass
 
             loop.call_soon_threadsafe(_put_one)
+
+    def _ensure_open_orders_index(self) -> bool:
+        with self._open_orders_lock:
+            if self._open_orders_initialized:
+                return True
+        try:
+            orders = self.poly_client.get_open_orders_strict()
+        except Exception as exc:
+            print(f"Auto order open-orders bootstrap failed: {exc}")
+            return False
+        with self._open_orders_lock:
+            self._open_orders_by_id = {}
+            for order in orders:
+                oid = str(order.get("orderID") or "")
+                if not oid:
+                    continue
+                self._open_orders_by_id[oid] = order
+            self._open_orders_initialized = True
+        return True
+
+    def _get_open_orders_snapshot(self) -> tuple[Dict[str, set[str]], Dict[str, float]]:
+        with self._open_orders_lock:
+            orders = list(self._open_orders_by_id.values())
+        open_assets: Dict[str, set[str]] = {}
+        open_sell_sizes: Dict[str, float] = {}
+        for order in orders:
+            asset = str(order.get("asset_id") or "")
+            if not asset:
+                continue
+            side = str(order.get("side", "")).upper()
+            if side not in {"BUY", "SELL"}:
+                continue
+            open_assets.setdefault(asset, set()).add(side)
+            if side == "SELL":
+                try:
+                    sz = float(order.get("size") or 0)
+                except (TypeError, ValueError):
+                    sz = 0.0
+                if sz > 0:
+                    open_sell_sizes[asset] = open_sell_sizes.get(asset, 0.0) + sz
+        return open_assets, open_sell_sizes
+
+    def _apply_order_payload_to_index(self, payload: dict[str, object]) -> None:
+        order_obj = payload.get("order")
+        if not isinstance(order_obj, dict):
+            return
+        oid = str(order_obj.get("orderID") or "")
+        if not oid:
+            return
+        msg_type = str(payload.get("type", "")).lower()
+        event_type = str(payload.get("event", "")).upper()
+        if event_type == "TRADE" and msg_type == "closed":
+            asset = str(order_obj.get("asset_id") or "")
+            side = str(order_obj.get("side", "")).upper()
+            if asset and side in {"BUY", "SELL"}:
+                now = time.time()
+                with self._auto_lock:
+                    for pair_key, cfg in self._auto_pairs.items():
+                        if asset in cfg.assets:
+                            self._auto_pair_last_fill_ts[pair_key] = now
+                self._apply_fill_to_positions(order_obj)
+        with self._open_orders_lock:
+            if msg_type in {"opened", "update"}:
+                self._open_orders_by_id[oid] = cast(Order, order_obj)
+            elif msg_type == "closed":
+                self._open_orders_by_id.pop(oid, None)
+            self._open_orders_initialized = True
 
     def get_user_socket_status(self) -> dict[str, object]:
         connected = False

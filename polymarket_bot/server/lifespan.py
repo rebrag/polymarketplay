@@ -36,6 +36,11 @@ async def lifespan(app: FastAPI):
 
     registry.disable_auto_trading()
     try:
+        registry.poly_client.warm_trading_client()
+        print("Trading client warmed at startup.")
+    except Exception as e:
+        print(f"Trading client warmup failed: {e}")
+    try:
         registry.ensure_user_socket()
     except Exception as e:
         print(f"User WS startup failed: {e}")
