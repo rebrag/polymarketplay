@@ -539,7 +539,7 @@ function OrderBookWidgetFull({
       const rawMarketAmount =
         side === "BUY" && bestAskNum && bestAskNum > 0 ? amountNum * bestAskNum : amountNum;
       const marketAmount =
-        side === "BUY" ? Math.max(rawMarketAmount - 0.02, 0.01) : rawMarketAmount;
+        side === "BUY" ? Math.max(rawMarketAmount, 0.01) : rawMarketAmount;
       const confirmText =
         side === "BUY"
           ? `Market BUY $${marketAmount.toFixed(2)} USDC at best ask?`

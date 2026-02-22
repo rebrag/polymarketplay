@@ -22,6 +22,7 @@ import { LiveEventsStrip } from "./components/LiveEventsStrip";
 import { OrdersPanel, type OrderView } from "./components/OrdersPanel";
 import { LogChart, type LogPoint } from "./components/LogChart";
 import { Event } from "./components/Event";
+import { useBookStore } from "@/stores/bookStore";
 
 const normalizeQuestion = (q: string | undefined): string =>
   (q ?? "")
@@ -223,6 +224,7 @@ function App() {
   const [ordersWsErrorInfo, setOrdersWsErrorInfo] = useState<string | null>(null);
   const seenTradeIdsRef = useRef<Set<string>>(new Set());
   const [draggedWidgetKey, setDraggedWidgetKey] = useState<string | null>(null);
+  const booksByAsset = useBookStore((state) => state.books);
 
   const [autoPairs, setAutoPairs] = useState<Set<string>>(new Set());
   const [autoDisabledAssets, setAutoDisabledAssets] = useState<Set<string>>(new Set());
@@ -248,7 +250,6 @@ function App() {
   const [tradeNotices, setTradeNotices] = useState<
     { id: string; market: string; outcome: string; side: "BUY" | "SELL"; size: string; price: string; ts: number }[]
   >([]);
-  const fetchAuthMetricsRef = useRef<() => void>(() => {});
   const memStatsRef = useRef({
     widgets: 0,
     liveEvents: 0,
@@ -397,6 +398,20 @@ function App() {
       return Number.isFinite(value) && value > 0.01;
     });
   }, [authPositions]);
+
+  const livePortfolioValue = useMemo(() => {
+    const cash = authBalance?.balance ?? null;
+    if (cash === null || cash === undefined) return null;
+    const positionsValue = authPositions.reduce((sum, p) => {
+      const shares = Number(p.size);
+      if (!Number.isFinite(shares) || shares <= 0) return sum;
+      const book = booksByAsset[p.asset];
+      const bestBid = book?.bids?.[0]?.price;
+      if (!Number.isFinite(bestBid ?? NaN)) return sum;
+      return sum + shares * (bestBid as number);
+    }, 0);
+    return cash + positionsValue;
+  }, [authBalance?.balance, authPositions, booksByAsset]);
 
   const fullModeKeys = useMemo(() => {
     return new Set(widgets.map((w) => w.uniqueKey));
@@ -849,10 +864,12 @@ function App() {
         if (data.event === "TRADE") {
           let shouldApplyFill = true;
           const tradeId = data.trade_id;
+          const orderId = String(data.order.orderID ?? "");
+          const fillEventId = tradeId ? `${tradeId}:${orderId}` : orderId;
           if (tradeId) {
             const seen = seenTradeIdsRef.current;
-            if (!seen.has(tradeId)) {
-              seen.add(tradeId);
+            if (!seen.has(fillEventId)) {
+              seen.add(fillEventId);
               if (seen.size > 200) {
                 const [first] = seen;
                 if (first) seen.delete(first);
@@ -876,6 +893,7 @@ function App() {
           }
           if (shouldApplyFill) {
             applyFilledOrderToPositions(data.order);
+            applyFilledOrderToBalance(data.order);
           }
         }
         setOrders((prev) => {
@@ -1070,10 +1088,6 @@ function App() {
     }
   }, []);
   useEffect(() => {
-    fetchAuthMetricsRef.current = () => void fetchAuthMetrics();
-  }, [fetchAuthMetrics]);
-
-  useEffect(() => {
     if (!activeAddress) return;
     void fetchUserMetrics(activeAddress);
     const interval = window.setInterval(() => void fetchUserMetrics(activeAddress), 30000);
@@ -1081,9 +1095,8 @@ function App() {
   }, [activeAddress, fetchUserMetrics]);
 
   useEffect(() => {
+    // One-time bootstrap. After this, balances/positions are updated from fill events.
     void fetchAuthMetrics();
-    const interval = window.setInterval(() => void fetchAuthMetrics(), 30000);
-    return () => window.clearInterval(interval);
   }, [fetchAuthMetrics]);
 
   useEffect(() => {
@@ -1352,6 +1365,19 @@ function App() {
     });
   }
 
+  function applyFilledOrderToBalance(order: OrderView): void {
+    const side = String(order.side || "").toUpperCase();
+    const size = toFiniteNumber(order.size);
+    const price = toFiniteNumber(order.price);
+    if ((side !== "BUY" && side !== "SELL") || size === null || price === null || size <= 0 || price <= 0) return;
+    const cashDelta = size * price * (side === "BUY" ? -1 : 1);
+    setAuthBalance((prev) => {
+      if (!prev) return prev;
+      const current = toFiniteNumber(prev.balance) ?? 0;
+      return { balance: current + cashDelta };
+    });
+  }
+
   const handleAddSlug = (slug: string) => {
     void resolveInput("add", slug);
   };
@@ -1549,15 +1575,7 @@ function App() {
       onAdd={handleAdd}
       loading={loading}
       balance={authBalance?.balance ?? null}
-      portfolio={(() => {
-        if (!authBalance) return null;
-        const cash = authBalance.balance ?? 0;
-        const positionsValue = authPositions.reduce((sum, p) => {
-          const value = Number(p.currentValue);
-          return Number.isFinite(value) ? sum + value : sum;
-        }, 0);
-        return cash + positionsValue;
-      })()}
+      portfolio={livePortfolioValue}
       positionsCount={(() => {
         return authPositions.filter((p) => {
           const value = Number(p.currentValue);
