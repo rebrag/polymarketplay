@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 from contextlib import asynccontextmanager
 
@@ -44,11 +45,30 @@ async def lifespan(app: FastAPI):
         registry.ensure_user_socket()
     except Exception as e:
         print(f"User WS startup failed: {e}")
+    threshold_raw = os.getenv("ORDERBOOK_MIN_VOLUME", os.getenv("AUTO_LOG_VOLUME_THRESHOLD", "50000"))
+    refresh_raw = os.getenv("ORDERBOOK_POPULATE_REFRESH_SECONDS", os.getenv("AUTO_LOG_REFRESH_SECONDS", "30"))
+    try:
+        threshold = float(threshold_raw)
+    except ValueError:
+        threshold = 50_000.0
+    try:
+        refresh_s = float(refresh_raw)
+    except ValueError:
+        refresh_s = 30.0
+    registry.start_auto_event_logging(
+        volume_threshold=threshold,
+        refresh_interval_s=refresh_s,
+    )
+    print(
+        "Auto event logging started "
+        f"(volume_threshold={threshold}, refresh_interval_s={refresh_s})"
+    )
     _start_mem_logger()
     latency_monitor.start()
     yield
     print("Shutting down: Closing all WebSockets...")
     registry.disable_auto_trading()
+    registry.stop_auto_event_logging()
     _mem_log_stop.set()
     latency_monitor.stop()
     asset_ids = list(registry.active_books.keys())

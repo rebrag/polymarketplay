@@ -354,17 +354,18 @@ function getDisplayTime(ev: LiveEvent): string | null {
   return formatStart(gameStart);
 }
 
-function loadLiveFilters(): { minVolume: string; tagFilter: string } {
+function loadLiveFilters(): { minVolume: string; tagFilter: string; hideMoreMarkets: boolean } {
   try {
     const raw = localStorage.getItem("pm_live_filters");
-    if (!raw) return { minVolume: "0", tagFilter: "all" };
-    const parsed = JSON.parse(raw) as { minVolume?: string; tagFilter?: string };
+    if (!raw) return { minVolume: "0", tagFilter: "all", hideMoreMarkets: true };
+    const parsed = JSON.parse(raw) as { minVolume?: string; tagFilter?: string; hideMoreMarkets?: boolean };
     return {
       minVolume: typeof parsed.minVolume === "string" ? parsed.minVolume : "0",
       tagFilter: typeof parsed.tagFilter === "string" ? parsed.tagFilter : "all",
+      hideMoreMarkets: parsed.hideMoreMarkets !== false,
     };
   } catch {
-    return { minVolume: "0", tagFilter: "all" };
+    return { minVolume: "0", tagFilter: "all", hideMoreMarkets: true };
   }
 }
 
@@ -387,6 +388,7 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
   const initialFilters = useMemo(() => loadLiveFilters(), []);
   const [minVolume, setMinVolume] = useState(initialFilters.minVolume);
   const [tagFilter, setTagFilter] = useState(initialFilters.tagFilter);
+  const [hideMoreMarkets, setHideMoreMarkets] = useState(initialFilters.hideMoreMarkets);
   const initialScrollDone = useRef(false);
   const tagOptions = useMemo(() => {
     const tags = new Set<string>();
@@ -420,6 +422,7 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
     const minVol = Number.isFinite(minVolNum) ? minVolNum : 0;
     return sorted.filter((ev) => {
       if (q && !ev.title.toLowerCase().includes(q)) return false;
+      if (hideMoreMarkets && String(ev.slug ?? "").toLowerCase().includes("more-markets")) return false;
       const volume = ev.volume ?? 0;
       if (volume < minVol) return false;
       if (tagFilter !== "all") {
@@ -433,7 +436,7 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
       }
       return true;
     });
-  }, [query, sorted, minVolume, tagFilter]);
+  }, [query, sorted, minVolume, tagFilter, hideMoreMarkets]);
   const trackRef = useRef<HTMLDivElement | null>(null);
   const [canScrollLeft, setCanScrollLeft] = useState(false);
   const [canScrollRight, setCanScrollRight] = useState(false);
@@ -528,11 +531,11 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
   }, [sorted]);
   useEffect(() => {
     try {
-      localStorage.setItem("pm_live_filters", JSON.stringify({ minVolume, tagFilter }));
+      localStorage.setItem("pm_live_filters", JSON.stringify({ minVolume, tagFilter, hideMoreMarkets }));
     } catch {
       // ignore
     }
-  }, [minVolume, tagFilter]);
+  }, [minVolume, tagFilter, hideMoreMarkets]);
 
   const visibleMoneylineTokens = useMemo(() => {
     const ids: string[] = [];
@@ -582,6 +585,31 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
     };
   }, [visibleMoneylineTokens]);
 
+  const liveEventSlugs = useMemo(() => {
+    const slugs: string[] = [];
+    for (const ev of filtered.slice(0, 500)) {
+      const hidePreviewPills = String(ev.slug ?? "").toLowerCase().includes("more-markets");
+      const moneyline = hidePreviewPills ? [] : getMoneylineTokens(ev);
+      const previewPills = moneyline.slice(0, 3);
+      const status = isClosedByMoneylinePrices(previewPills, moneylineAsks) ? "closed" : getStatus(ev);
+      if (status === "live" && !subscribed.has(ev.slug)) {
+        slugs.push(ev.slug);
+      }
+    }
+    return slugs;
+  }, [filtered, moneylineAsks, subscribed]);
+  const liveEventsCount = useMemo(() => {
+    let count = 0;
+    for (const ev of filtered.slice(0, 500)) {
+      const hidePreviewPills = String(ev.slug ?? "").toLowerCase().includes("more-markets");
+      const moneyline = hidePreviewPills ? [] : getMoneylineTokens(ev);
+      const previewPills = moneyline.slice(0, 3);
+      const status = isClosedByMoneylinePrices(previewPills, moneylineAsks) ? "closed" : getStatus(ev);
+      if (status === "live") count += 1;
+    }
+    return count;
+  }, [filtered, moneylineAsks]);
+
   return (
     <div className="relative rounded-md border border-slate-800 bg-slate-950/70 px-3 py-2">
       <div className="flex items-center justify-between mb-2">
@@ -590,8 +618,8 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
           <Input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder={`Search (${filtered.length}) events...`}
-            className="h-7 w-44 bg-slate-900/60 border-slate-800 text-[10px] text-slate-200"
+            placeholder={`Search (${filtered.length}) events. (${liveEventsCount} LIVE)`}
+            className="h-7 w-60 bg-slate-900/60 border-slate-800 text-[10px] text-slate-200"
           />
           <div className="relative">
             <Button
@@ -632,6 +660,29 @@ export function LiveEventsStrip({ events, subscribed, onAdd, onRemove }: LiveEve
               </div>
             )}
           </div>
+          <Button
+            onClick={() => {
+              liveEventSlugs.forEach((slug) => onAdd(slug));
+            }}
+            disabled={liveEventSlugs.length === 0}
+            className={`h-7 px-2 text-[10px] uppercase font-bold border ${
+              liveEventSlugs.length > 0
+                ? "border-slate-800 bg-slate-950 text-slate-300 hover:text-white hover:border-slate-700"
+                : "border-slate-800/60 bg-slate-950/40 text-slate-500"
+            }`}
+          >
+            Add All Live
+          </Button>
+          <Button
+            onClick={() => setHideMoreMarkets((v: boolean) => !v)}
+            className={`h-7 px-2 text-[10px] uppercase font-bold border ${
+              hideMoreMarkets
+                ? "border-emerald-700 bg-emerald-900/30 text-emerald-100 hover:text-white"
+                : "border-slate-800 bg-slate-950 text-slate-300 hover:text-white hover:border-slate-700"
+            }`}
+          >
+            {hideMoreMarkets ? "Hide More-Markets" : "Show More-Markets"}
+          </Button>
           {/* <Select value={oddsSportKey} onValueChange={setOddsSportKey}>
             <SelectTrigger className="h-7 px-2 text-[10px] min-w-[140px]">
               <SelectValue placeholder="Odds league" />

@@ -8,6 +8,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query
 
 from polymarket_bot.server.helpers import _safe_path_segment
+from polymarket_bot.server.state import registry
 
 router = APIRouter()
 
@@ -66,3 +67,8 @@ def list_market_logs() -> list[dict[str, str]]:
             )
     entries.sort(key=lambda item: (item["slug"], item["question"]))
     return entries
+
+
+@router.get("/logs/auto/status")
+def get_auto_logging_status() -> dict[str, object]:
+    return registry.get_auto_event_logging_status()

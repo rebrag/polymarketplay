@@ -628,25 +628,12 @@ function App() {
   }, []);
 
   const toggleEventMinimized = useCallback((slug: string) => {
-    setMinimizedEvents((prev) => {
-      const next = new Set(prev);
-      if (next.has(slug)) {
-        next.delete(slug);
-        eventDataList.forEach((ev) => {
-          if (ev.slug && ev.slug !== slug) {
-            next.add(ev.slug);
-          }
-        });
-        setActiveEventSlug(slug);
-      } else {
-        next.add(slug);
-        if (activeEventSlug === slug) {
-          setActiveEventSlug(null);
-        }
-      }
-      return next;
-    });
-  }, [activeEventSlug, eventDataList]);
+    if (activeEventSlug === slug) {
+      setActiveEventSlug(null);
+      return;
+    }
+    setActiveEventSlug(slug);
+  }, [activeEventSlug]);
 
   const closeEventWindow = useCallback((slug: string) => {
     setEventDataList((prev) => prev.filter((ev) => ev.slug !== slug));
@@ -661,6 +648,33 @@ function App() {
       setActiveEventSlug(null);
     }
   }, [activeEventSlug]);
+
+  useEffect(() => {
+    if (!eventDataList.length) {
+      setActiveEventSlug(null);
+      setMinimizedEvents(new Set());
+      return;
+    }
+    setActiveEventSlug((prev) => {
+      if (!prev) return null;
+      return eventDataList.some((ev) => ev.slug === prev) ? prev : null;
+    });
+  }, [eventDataList]);
+
+  useEffect(() => {
+    if (!eventDataList.length) {
+      setMinimizedEvents(new Set());
+      return;
+    }
+    setMinimizedEvents(() => {
+      const next = new Set<string>();
+      for (const ev of eventDataList) {
+        if (!ev.slug) continue;
+        if (ev.slug !== activeEventSlug) next.add(ev.slug);
+      }
+      return next;
+    });
+  }, [activeEventSlug, eventDataList]);
 
   const killAutotrader = useCallback(async () => {
     try {
@@ -1108,7 +1122,7 @@ function App() {
         const before = Number.isFinite(beforeNum) ? beforeNum : 0;
         const after = Number.isFinite(afterNum) ? afterNum : 24;
         const res = await fetch(
-          `${baseUrl}/events/list?limit=120&window_before_hours=${before}&window_hours=${after}`
+          `${baseUrl}/events/list?limit=500&window_before_hours=${before}&window_hours=${after}`
         );
         if (!res.ok) return;
         const data = (await res.json()) as EventData[];
@@ -1250,17 +1264,11 @@ function App() {
         return exists ? prev : [...prev, data];
       });
       if (data.slug) {
-        setActiveEventSlug(data.slug);
-        setMinimizedEvents(() => {
-          const slugs = eventDataList.map((ev) => ev.slug).filter(Boolean);
-          const next = new Set<string>();
-          slugs.forEach((slug) => {
-            if (slug && slug !== data.slug) {
-              next.add(slug);
-            }
-          });
-          return next;
-        });
+        if (mode === "replace") {
+          setActiveEventSlug(data.slug);
+        } else {
+          setActiveEventSlug((prev) => prev || data.slug);
+        }
       }
       if (data.slug) {
         setSubscribedSlugs((prev) => {

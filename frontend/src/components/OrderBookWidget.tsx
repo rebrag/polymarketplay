@@ -92,7 +92,9 @@ function formatOrderKey(price: number, tickSize: number): string {
   return formatPrice(price, tickSize);
 }
 
-function formatVol(num: number): string {
+function formatVol(raw: number | string | null | undefined): string {
+  const num = Number(raw);
+  if (!Number.isFinite(num) || num <= 0) return "--";
   if (num >= 1_000_000) return `${(num / 1_000_000).toFixed(1)}M`;
   if (num >= 1_000) return `${(num / 1_000).toFixed(1)}k`;
   return num.toFixed(0);

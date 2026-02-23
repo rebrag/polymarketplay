@@ -44,3 +44,8 @@ def books_batch(req: BooksBatchRequest) -> dict[str, object]:
         }
     items = [by_token.get(tid, {"token_id": tid, "best_bid": None, "best_ask": None}) for tid in unique_ids]
     return {"ok": True, "count": len(items), "items": items}
+
+
+@router.get("/books/auto/status")
+def books_auto_status() -> dict[str, object]:
+    return registry.get_auto_event_logging_status()

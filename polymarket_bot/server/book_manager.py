@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
 import re
 import threading
@@ -75,6 +76,16 @@ class BookManager:
         self._open_orders_lock = threading.Lock()
         self._open_orders_by_id: Dict[str, Order] = {}
         self._open_orders_initialized = False
+        self._auto_log_lock = threading.Lock()
+        self._auto_log_stop = threading.Event()
+        self._auto_log_thread: threading.Thread | None = None
+        self._auto_log_enabled = False
+        self._auto_log_volume_threshold = 50_000.0
+        self._auto_log_refresh_interval_s = 30.0
+        self._auto_log_managed_assets: set[str] = set()
+        self._auto_log_items: dict[str, dict[str, object]] = {}
+        self._auto_log_last_run_ts: float | None = None
+        self._auto_log_last_error: str | None = None
 
     def register_subscriber(self, asset_id: str, q: Queue[None], loop: AbstractEventLoop) -> None:
         self._subs.setdefault(asset_id, set()).add(q)
@@ -598,7 +609,6 @@ class BookManager:
         def _log_loop() -> None:
             base_dir = Path("logs")
             folder = base_dir / self._safe_slug(slug)
-            folder.mkdir(parents=True, exist_ok=True)
             path = folder / f"{self._safe_slug(question)}.csv"
 
             def _fmt(val: str) -> str:
@@ -614,6 +624,10 @@ class BookManager:
                 if seconds is None:
                     return ""
                 return f"{seconds:.3f}".rstrip("0").rstrip(".")
+
+            def _headerize(label: str) -> str:
+                cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", (label or "").strip()).strip("_").lower()
+                return cleaned or "unknown"
 
             seen_non_empty = False
             last_snapshot: tuple[float | None, float | None, float | None, float | None] | None = None
@@ -686,29 +700,32 @@ class BookManager:
                 volatile = last_change_ts and (loop_start - last_change_ts) <= 10.0
                 if current_non_empty and changed:
                     is_new = not path.exists()
+                    if is_new:
+                        folder.mkdir(parents=True, exist_ok=True)
                     with path.open("a", newline="") as fh:
                         writer = csv.writer(fh)
+                        ask_1 = first_raw[2]
+                        ask_2 = second_raw[2]
+                        spread: float | None = None
+                        if ask_1 is not None and ask_2 is not None:
+                            spread = float(ask_1) + float(ask_2) - 1.0
+                        cond1 = _headerize(first[0])
+                        cond2 = _headerize(second[0])
                         if is_new:
                             writer.writerow(
                                 [
                                     "time_since_gameStartTime",
-                                    "condition_1",
-                                    "best_bid_1",
-                                    "best_ask_1",
-                                    "condition_2",
-                                    "best_bid_2",
-                                    "best_ask_2",
+                                    f"best_ask_{cond1}",
+                                    f"best_ask_{cond2}",
+                                    "spread",
                                 ]
                             )
                         writer.writerow(
                             [
                                 _fmt_elapsed(loop_start - game_start_ts if game_start_ts is not None else None),
-                                first[0],
-                                first[1],
                                 first[2],
-                                second[0],
-                                second[1],
                                 second[2],
+                                _fmt(str(spread) if spread is not None else ""),
                             ]
                         )
                     last_logged_snapshot = current_snapshot
@@ -961,3 +978,172 @@ class BookManager:
 
     def get_last_trade(self, asset_id: str) -> WsLastTrade | None:
         return self._last_trades.get(asset_id)
+
+    def _prime_book_from_rest(self, asset_id: str) -> None:
+        book = self.active_books.get(asset_id)
+        if not book or getattr(book, "ready", False):
+            return
+        snapshot = self.poly_client.get_order_book_snapshot(asset_id)
+        if not snapshot:
+            return
+        try:
+            book.on_book_snapshot(snapshot)
+            self.notify_updated(asset_id)
+        except Exception:
+            pass
+
+    def _parse_string_or_list(self, raw: object) -> list[str]:
+        if isinstance(raw, list):
+            return [str(x) for x in raw]
+        if isinstance(raw, str):
+            text = raw.strip()
+            if not text:
+                return []
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                return []
+            if isinstance(parsed, list):
+                return [str(x) for x in parsed]
+        return []
+
+    def start_auto_event_logging(
+        self,
+        volume_threshold: float = 50_000.0,
+        refresh_interval_s: float = 30.0,
+    ) -> None:
+        with self._auto_log_lock:
+            self._auto_log_volume_threshold = max(0.0, float(volume_threshold))
+            self._auto_log_refresh_interval_s = max(5.0, float(refresh_interval_s))
+            self._auto_log_enabled = True
+            if self._auto_log_thread and self._auto_log_thread.is_alive():
+                return
+            self._auto_log_stop.clear()
+
+        def _loop() -> None:
+            while not self._auto_log_stop.is_set():
+                try:
+                    self._refresh_auto_event_logging_once()
+                    with self._auto_log_lock:
+                        self._auto_log_last_error = None
+                except Exception as exc:
+                    with self._auto_log_lock:
+                        self._auto_log_last_error = str(exc)
+                    print(f"Auto event logging refresh failed: {exc}")
+                wait_s = self._auto_log_refresh_interval_s
+                self._auto_log_stop.wait(wait_s)
+
+        self._auto_log_thread = threading.Thread(target=_loop, name="auto_event_logger", daemon=True)
+        self._auto_log_thread.start()
+
+    def stop_auto_event_logging(self) -> None:
+        self._auto_log_stop.set()
+        with self._auto_log_lock:
+            self._auto_log_enabled = False
+            managed = list(self._auto_log_managed_assets)
+            self._auto_log_managed_assets.clear()
+            self._auto_log_items = {}
+        for aid in managed:
+            try:
+                self.release(aid)
+            except Exception:
+                pass
+
+    def _refresh_auto_event_logging_once(self) -> None:
+        threshold = self._auto_log_volume_threshold
+        events = self.poly_client.get_gamma_events(
+            active=True,
+            closed=False,
+            limit=500,
+            order="volume24hr",
+            ascending=False,
+            volume_min=threshold,
+        )
+        desired_assets: set[str] = set()
+        items: dict[str, dict[str, object]] = {}
+        for ev in events:
+            slug = str(ev.get("slug") or "").strip()
+            title = str(ev.get("title") or "").strip()
+            if "more-markets" in slug.lower():
+                continue
+            markets = ev.get("markets", [])
+            if not slug or not isinstance(markets, list):
+                continue
+            for m in markets:
+                if not isinstance(m, dict):
+                    continue
+                question = str(m.get("question") or "").strip()
+                if not question:
+                    continue
+                vol = _to_float(m.get("volume", 0.0))
+                if vol < threshold:
+                    continue
+                game_start_time = str(m.get("gameStartTime") or "").strip() or None
+                outcomes = self._parse_string_or_list(m.get("outcomes"))
+                token_ids = self._parse_string_or_list(m.get("clobTokenIds"))
+                if len(outcomes) < 2 or len(token_ids) < 2:
+                    continue
+                # Existing logger format is pair-oriented; keep auto mode on 2-outcome markets.
+                if len(outcomes) != 2 or len(token_ids) != 2:
+                    continue
+                pair_assets: list[str] = []
+                for idx in range(2):
+                    aid = str(token_ids[idx] or "").strip()
+                    outcome = str(outcomes[idx] or "").strip()
+                    if not aid:
+                        continue
+                    pair_assets.append(aid)
+                    desired_assets.add(aid)
+                    self.set_asset_meta(
+                        aid,
+                        slug=slug,
+                        question=question,
+                        outcome=outcome,
+                        game_start_time=game_start_time,
+                    )
+                if len(pair_assets) != 2:
+                    continue
+                key = self._market_key(slug, question)
+                items[key] = {
+                    "event_slug": slug,
+                    "event_title": title,
+                    "question": question,
+                    "market_volume": vol,
+                    "assets": pair_assets,
+                    "game_start_time": game_start_time,
+                }
+
+        with self._auto_log_lock:
+            current = set(self._auto_log_managed_assets)
+        to_add = desired_assets - current
+        to_remove = current - desired_assets
+        for aid in to_add:
+            try:
+                self.get_or_create(aid)
+                self._prime_book_from_rest(aid)
+            except Exception as exc:
+                print(f"Auto event logging subscribe failed (asset={aid}): {exc}")
+        for aid in to_remove:
+            try:
+                self.release(aid)
+            except Exception as exc:
+                print(f"Auto event logging release failed (asset={aid}): {exc}")
+        with self._auto_log_lock:
+            self._auto_log_managed_assets = desired_assets
+            self._auto_log_items = items
+            self._auto_log_last_run_ts = time.time()
+
+    def get_auto_event_logging_status(self) -> dict[str, object]:
+        with self._auto_log_lock:
+            items = list(self._auto_log_items.values())
+            items.sort(key=lambda x: float(x.get("market_volume") or 0.0), reverse=True)
+            return {
+                "enabled": self._auto_log_enabled,
+                "volume_threshold": self._auto_log_volume_threshold,
+                "refresh_interval_s": self._auto_log_refresh_interval_s,
+                "last_run_ts": self._auto_log_last_run_ts,
+                "last_error": self._auto_log_last_error,
+                "managed_assets_count": len(self._auto_log_managed_assets),
+                "markets_count": len(items),
+                "markets": items,
+            }
