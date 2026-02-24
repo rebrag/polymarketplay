@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BookPair } from "./components/BookPair";
-import { useBookSocket } from "./hooks/useBookSocket";
+import { useServerBooksSocket } from "./hooks/useBookSocket";
 // import { Input } from "@/components/ui/input";
 // import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -291,7 +291,7 @@ function App() {
     if (activeEventSlug === null) return [];
     return widgets.filter((w) => (w.sourceSlug ?? "") === activeEventSlug);
   }, [activeEventSlug, widgets]);
-  useBookSocket(socketWidgets);
+  useServerBooksSocket(socketWidgets);
   const autoOpenSyncedRef = useRef(false);
   const [autoStatusPairs, setAutoStatusPairs] = useState<AutoStatusPair[]>([]);
   const logStartLookup = useMemo(() => {
@@ -465,16 +465,15 @@ function App() {
     const fetchBooks = async () => {
       try {
         const res = await fetch("http://localhost:8000/debug/books");
-        if (!res.ok) return;
+        if (!res.ok) {
+          if (mounted) setBackendBooksCount(0);
+          return;
+        }
         const data = (await res.json()) as { active_books?: number; tracked_assets?: number };
         if (!mounted) return;
-        if (typeof data.tracked_assets === "number") {
-          setBackendBooksCount(data.tracked_assets);
-        } else if (typeof data.active_books === "number") {
-          setBackendBooksCount(data.active_books);
-        }
+        setBackendBooksCount(typeof data.active_books === "number" ? data.active_books : 0);
       } catch {
-        // ignore
+        if (mounted) setBackendBooksCount(0);
       }
     };
     fetchBooks();

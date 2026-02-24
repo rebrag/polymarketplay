@@ -7,7 +7,7 @@ import re
 import threading
 import time
 from asyncio import AbstractEventLoop, Queue
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Literal, Set, TypedDict, cast
 
@@ -41,8 +41,9 @@ class BookManager:
         self._subs: Dict[str, Set[Queue[None]]] = {}
         self._loops: Dict[str, AbstractEventLoop] = {}
         self._tracked_assets: set[str] = set()
-        self._socket: PolySocket | None = None
-        self._socket_lock = threading.Lock()
+        # Upstream market data socket (server -> Polymarket CLOB WS).
+        self._market_feed_socket: PolySocket | None = None
+        self._market_feed_socket_lock = threading.Lock()
         self._logged_books: set[str] = set()
         self._logged_price_changes: set[str] = set()
         self._order_subs: set[Queue[dict[str, object]]] = set()
@@ -76,16 +77,20 @@ class BookManager:
         self._open_orders_lock = threading.Lock()
         self._open_orders_by_id: Dict[str, Order] = {}
         self._open_orders_initialized = False
-        self._auto_log_lock = threading.Lock()
-        self._auto_log_stop = threading.Event()
-        self._auto_log_thread: threading.Thread | None = None
-        self._auto_log_enabled = False
-        self._auto_log_volume_threshold = 50_000.0
-        self._auto_log_refresh_interval_s = 30.0
-        self._auto_log_managed_assets: set[str] = set()
-        self._auto_log_items: dict[str, dict[str, object]] = {}
-        self._auto_log_last_run_ts: float | None = None
-        self._auto_log_last_error: str | None = None
+        self._auto_subscribe_lock = threading.Lock()
+        self._auto_subscribe_stop = threading.Event()
+        self._auto_subscribe_thread: threading.Thread | None = None
+        self._auto_subscribe_enabled = False
+        self._auto_subscribe_volume_threshold = 10_000.0
+        self._auto_subscribe_refresh_interval_s = 30.0
+        self._auto_subscribe_window_before_h = 1.0
+        self._auto_subscribe_window_after_h = 1.0
+        self._auto_subscribe_include_more_markets = True
+        self._auto_subscribe_track_all_outcomes = True
+        self._auto_subscribe_managed_assets: set[str] = set()
+        self._auto_subscribe_items: dict[str, dict[str, object]] = {}
+        self._auto_subscribe_last_run_ts: float | None = None
+        self._auto_subscribe_last_error: str | None = None
 
     def register_subscriber(self, asset_id: str, q: Queue[None], loop: AbstractEventLoop) -> None:
         self._subs.setdefault(asset_id, set()).add(q)
@@ -114,7 +119,7 @@ class BookManager:
 
             loop.call_soon_threadsafe(_put_one)
 
-    def get_or_create(self, asset_id: str) -> OrderBook:
+    def subscribe_to_asset(self, asset_id: str) -> OrderBook:
         if asset_id in self.active_books:
             self.client_counts[asset_id] += 1
             return self.active_books[asset_id]
@@ -124,10 +129,10 @@ class BookManager:
         self.client_counts[asset_id] = 1
         self._ensure_logger(asset_id)
 
-        with self._socket_lock:
+        with self._market_feed_socket_lock:
             self._tracked_assets.add(asset_id)
-            if self._socket is None:
-                self._socket = PolySocket(list(self._tracked_assets))
+            if self._market_feed_socket is None:
+                self._market_feed_socket = PolySocket(list(self._tracked_assets))
 
                 def _on_book(msg: WsBookMessage) -> None:
                     msg_asset = msg.get("asset_id")
@@ -140,21 +145,21 @@ class BookManager:
                     target.on_book_snapshot(msg)
                     if asset_id_str not in self._logged_books:
                         self._logged_books.add(asset_id_str)
-                        print(f"Book snapshot received (asset_id={asset_id_str})")
+                        print(f"Book snapshot received (market_id={asset_id_str})")
                     self.notify_updated(asset_id_str)
 
                 def _on_price(msg: WsPriceChangeMessage) -> None:
                     changes = msg.get("price_changes", [])
                     assets = {str(ch.get("asset_id")) for ch in changes if ch.get("asset_id")}
-                    for aid in assets:
-                        target = self.active_books.get(aid)
+                    for market_id in assets:
+                        target = self.active_books.get(market_id)
                         if not target:
                             continue
                         target.on_price_change(msg)
-                        if aid not in self._logged_price_changes:
-                            self._logged_price_changes.add(aid)
-                            print(f"Price change received (asset_id={aid})")
-                        self.notify_updated(aid)
+                        if market_id not in self._logged_price_changes:
+                            self._logged_price_changes.add(market_id)
+                            print(f"Price change received (market_id={market_id})")
+                        self.notify_updated(market_id)
 
                 def _on_tick(msg: WsTickSizeChangeMessage) -> None:
                     msg_asset = msg.get("asset_id")
@@ -165,11 +170,11 @@ class BookManager:
                     if not target:
                         return
                     target.on_tick_size_change(msg)
-                    print(f"Tick size change received (asset_id={asset_id_str})")
+                    print(f"Tick size change received (market_id={asset_id_str})")
                     self.notify_updated(asset_id_str)
 
                 def _on_last_trade(msg: WsLastTradePriceMessage) -> None:
-                    msg_asset = msg.get("asset_id")
+                    msg_asset = msg.get("market_id")
                     if not msg_asset:
                         return
                     asset_id_str = str(msg_asset)
@@ -202,13 +207,13 @@ class BookManager:
                     # )
                     self.notify_updated(asset_id_str)
 
-                self._socket.on_book = _on_book
-                self._socket.on_price_change = _on_price
-                self._socket.on_tick_size_change = _on_tick
-                self._socket.on_last_trade = _on_last_trade
-                self._socket.start()
+                self._market_feed_socket.on_book = _on_book
+                self._market_feed_socket.on_price_change = _on_price
+                self._market_feed_socket.on_tick_size_change = _on_tick
+                self._market_feed_socket.on_last_trade = _on_last_trade
+                self._market_feed_socket.start()
             else:
-                self._socket.update_assets(list(self._tracked_assets), force_reconnect=True)
+                self._market_feed_socket.update_assets(list(self._tracked_assets), force_reconnect=True)
 
         return book
 
@@ -226,14 +231,14 @@ class BookManager:
         self.client_counts.pop(asset_id, None)
         self._stop_logger(asset_id)
 
-        with self._socket_lock:
+        with self._market_feed_socket_lock:
             self._tracked_assets.discard(asset_id)
-            if self._socket is not None:
+            if self._market_feed_socket is not None:
                 if not self._tracked_assets:
-                    self._socket.stop()
-                    self._socket = None
+                    self._market_feed_socket.stop()
+                    self._market_feed_socket = None
                 else:
-                    self._socket.update_assets(list(self._tracked_assets))
+                    self._market_feed_socket.update_assets(list(self._tracked_assets))
 
     def register_order_subscriber(self, q: Queue[dict[str, object]], loop: AbstractEventLoop) -> None:
         print(f"Registering order subscriber (pre_count={len(self._order_subs)})")
@@ -254,7 +259,7 @@ class BookManager:
             self._ensure_open_orders_index()
             for asset in config.assets:
                 try:
-                    self.get_or_create(asset)
+                    self.subscribe_to_asset(asset)
                 except Exception:
                     pass
             self._ensure_auto_loop()
@@ -1007,64 +1012,92 @@ class BookManager:
                 return [str(x) for x in parsed]
         return []
 
-    def start_auto_event_logging(
+    def start_auto_subscribe(
         self,
         volume_threshold: float = 50_000.0,
         refresh_interval_s: float = 30.0,
+        window_before_hours: float = 1.0,
+        window_hours: float = 1.0,
+        include_more_markets: bool = True,
+        track_all_outcomes: bool = True,
     ) -> None:
-        with self._auto_log_lock:
-            self._auto_log_volume_threshold = max(0.0, float(volume_threshold))
-            self._auto_log_refresh_interval_s = max(5.0, float(refresh_interval_s))
-            self._auto_log_enabled = True
-            if self._auto_log_thread and self._auto_log_thread.is_alive():
+        with self._auto_subscribe_lock:
+            self._auto_subscribe_volume_threshold = max(0.0, float(volume_threshold))
+            self._auto_subscribe_refresh_interval_s = max(5.0, float(refresh_interval_s))
+            self._auto_subscribe_window_before_h = max(0.0, float(window_before_hours))
+            self._auto_subscribe_window_after_h = max(0.0, float(window_hours))
+            self._auto_subscribe_include_more_markets = bool(include_more_markets)
+            self._auto_subscribe_track_all_outcomes = bool(track_all_outcomes)
+            self._auto_subscribe_enabled = True
+            if self._auto_subscribe_thread and self._auto_subscribe_thread.is_alive():
                 return
-            self._auto_log_stop.clear()
+            self._auto_subscribe_stop.clear()
 
         def _loop() -> None:
-            while not self._auto_log_stop.is_set():
+            while not self._auto_subscribe_stop.is_set():
                 try:
-                    self._refresh_auto_event_logging_once()
-                    with self._auto_log_lock:
-                        self._auto_log_last_error = None
+                    self._refresh_auto_subscribe_once()
+                    with self._auto_subscribe_lock:
+                        self._auto_subscribe_last_error = None
                 except Exception as exc:
-                    with self._auto_log_lock:
-                        self._auto_log_last_error = str(exc)
-                    print(f"Auto event logging refresh failed: {exc}")
-                wait_s = self._auto_log_refresh_interval_s
-                self._auto_log_stop.wait(wait_s)
+                    with self._auto_subscribe_lock:
+                        self._auto_subscribe_last_error = str(exc)
+                    print(f"Auto subscribe refresh failed: {exc}")
+                wait_s = self._auto_subscribe_refresh_interval_s
+                self._auto_subscribe_stop.wait(wait_s)
 
-        self._auto_log_thread = threading.Thread(target=_loop, name="auto_event_logger", daemon=True)
-        self._auto_log_thread.start()
+        self._auto_subscribe_thread = threading.Thread(target=_loop, name="auto_subscriber", daemon=True)
+        self._auto_subscribe_thread.start()
 
-    def stop_auto_event_logging(self) -> None:
-        self._auto_log_stop.set()
-        with self._auto_log_lock:
-            self._auto_log_enabled = False
-            managed = list(self._auto_log_managed_assets)
-            self._auto_log_managed_assets.clear()
-            self._auto_log_items = {}
+    def stop_auto_subscribe(self) -> None:
+        self._auto_subscribe_stop.set()
+        with self._auto_subscribe_lock:
+            self._auto_subscribe_enabled = False
+            managed = list(self._auto_subscribe_managed_assets)
+            self._auto_subscribe_managed_assets.clear()
+            self._auto_subscribe_items = {}
         for aid in managed:
             try:
                 self.release(aid)
             except Exception:
                 pass
 
-    def _refresh_auto_event_logging_once(self) -> None:
-        threshold = self._auto_log_volume_threshold
-        events = self.poly_client.get_gamma_events(
-            active=True,
-            closed=False,
-            limit=500,
-            order="volume24hr",
-            ascending=False,
-            volume_min=threshold,
-        )
+    def _refresh_auto_subscribe_once(self) -> None:
+        with self._auto_subscribe_lock:
+            threshold = self._auto_subscribe_volume_threshold
+            include_more_markets = self._auto_subscribe_include_more_markets
+            track_all_outcomes = self._auto_subscribe_track_all_outcomes
+            window_before_h = self._auto_subscribe_window_before_h
+            window_after_h = self._auto_subscribe_window_after_h
+        now = datetime.now(timezone.utc)
+        window_start = now - timedelta(hours=3)
+        window_end = now + timedelta(hours=12)
+        fetch_limit = 500
+        fetch_params: dict[str, object] = {
+            "limit": fetch_limit,
+            "active": True,
+            "closed": False,
+            "order": "volume24hr",
+            "ascending": False,
+            "volume_min": threshold,
+            # Match events/list source-of-truth windowing at fetch-time.
+            "end_date_min": window_start.isoformat(),
+            "end_date_max": window_end.isoformat(),
+        }
+        events = self.poly_client.get_gamma_events(**fetch_params)  # type: ignore[arg-type]
+        total_markets = 0
+        for ev in events:
+            markets_obj = ev.get("markets", [])
+            if isinstance(markets_obj, list):
+                total_markets += len(markets_obj)
+        print(f"Gamma events fetched: {len(events)} events, {total_markets} markets")
         desired_assets: set[str] = set()
         items: dict[str, dict[str, object]] = {}
         for ev in events:
             slug = str(ev.get("slug") or "").strip()
             title = str(ev.get("title") or "").strip()
-            if "more-markets" in slug.lower():
+            event_volume = _to_float(ev.get("volume24hr", 0.0))
+            if not include_more_markets and "more-markets" in slug.lower():
                 continue
             markets = ev.get("markets", [])
             if not slug or not isinstance(markets, list):
@@ -1075,75 +1108,167 @@ class BookManager:
                 question = str(m.get("question") or "").strip()
                 if not question:
                     continue
-                vol = _to_float(m.get("volume", 0.0))
-                if vol < threshold:
+                market_vol = _to_float(m.get("volume", 0.0))
+                game_start_time_raw = str(m.get("gameStartTime") or "").strip()
+                if not game_start_time_raw:
+                    # Keep backend tracking aligned with live event discovery:
+                    # no market gameStartTime => do not auto-subscribe.
                     continue
-                game_start_time = str(m.get("gameStartTime") or "").strip() or None
+                market_start_text = game_start_time_raw
+                if market_start_text.endswith("Z"):
+                    market_start_text = f"{market_start_text[:-1]}+00:00"
+                try:
+                    game_start_dt = datetime.fromisoformat(market_start_text)
+                except ValueError:
+                    continue
+                if game_start_dt.tzinfo is None:
+                    game_start_dt = game_start_dt.replace(tzinfo=timezone.utc)
+                else:
+                    game_start_dt = game_start_dt.astimezone(timezone.utc)
+                if game_start_dt < window_start or game_start_dt > window_end:
+                    continue
+                game_start_time = game_start_time_raw
                 outcomes = self._parse_string_or_list(m.get("outcomes"))
                 token_ids = self._parse_string_or_list(m.get("clobTokenIds"))
                 if len(outcomes) < 2 or len(token_ids) < 2:
                     continue
-                # Existing logger format is pair-oriented; keep auto mode on 2-outcome markets.
-                if len(outcomes) != 2 or len(token_ids) != 2:
-                    continue
+                valid_assets: list[str] = []
                 pair_assets: list[str] = []
-                for idx in range(2):
+                pair_outcomes: list[str] = []
+                max_len = min(len(outcomes), len(token_ids))
+                for idx in range(max_len):
                     aid = str(token_ids[idx] or "").strip()
                     outcome = str(outcomes[idx] or "").strip()
                     if not aid:
                         continue
-                    pair_assets.append(aid)
-                    desired_assets.add(aid)
-                    self.set_asset_meta(
-                        aid,
-                        slug=slug,
-                        question=question,
-                        outcome=outcome,
-                        game_start_time=game_start_time,
-                    )
-                if len(pair_assets) != 2:
+                    valid_assets.append(aid)
+                    if len(pair_assets) < 2:
+                        pair_assets.append(aid)
+                        pair_outcomes.append(outcome)
+                if not valid_assets:
                     continue
-                key = self._market_key(slug, question)
-                items[key] = {
-                    "event_slug": slug,
-                    "event_title": title,
-                    "question": question,
-                    "market_volume": vol,
-                    "assets": pair_assets,
-                    "game_start_time": game_start_time,
-                }
 
-        with self._auto_log_lock:
-            current = set(self._auto_log_managed_assets)
+                if track_all_outcomes:
+                    for aid in valid_assets:
+                        desired_assets.add(aid)
+
+                # Keep CSV logger metadata strictly pair-oriented for backward compatibility.
+                if len(pair_assets) == 2 and len(outcomes) == 2 and len(token_ids) == 2:
+                    for idx in range(2):
+                        aid = pair_assets[idx]
+                        outcome = pair_outcomes[idx] if idx < len(pair_outcomes) else ""
+                        desired_assets.add(aid)
+                        self.set_asset_meta(
+                            aid,
+                            slug=slug,
+                            question=question,
+                            outcome=outcome,
+                            game_start_time=game_start_time,
+                        )
+                    key = self._market_key(slug, question)
+                    items[key] = {
+                        "event_slug": slug,
+                        "event_title": title,
+                        "event_volume": event_volume,
+                        "question": question,
+                        "market_volume": market_vol,
+                        "assets": pair_assets,
+                        "game_start_time": game_start_time,
+                    }
+                elif not track_all_outcomes:
+                    # If all-outcome tracking is disabled, still track the first pair.
+                    for idx in range(len(pair_assets)):
+                        aid = pair_assets[idx]
+                        desired_assets.add(aid)
+                    if len(pair_assets) == 2:
+                        for idx in range(2):
+                            aid = pair_assets[idx]
+                            outcome = pair_outcomes[idx] if idx < len(pair_outcomes) else ""
+                            self.set_asset_meta(
+                                aid,
+                                slug=slug,
+                                question=question,
+                                outcome=outcome,
+                                game_start_time=game_start_time,
+                            )
+                        key = self._market_key(slug, question)
+                        items[key] = {
+                            "event_slug": slug,
+                            "event_title": title,
+                            "event_volume": event_volume,
+                            "question": question,
+                            "market_volume": market_vol,
+                            "assets": pair_assets,
+                            "game_start_time": game_start_time,
+                        }
+
+        with self._auto_subscribe_lock:
+            current = set(self._auto_subscribe_managed_assets)
         to_add = desired_assets - current
         to_remove = current - desired_assets
         for aid in to_add:
             try:
-                self.get_or_create(aid)
+                self.subscribe_to_asset(aid)
                 self._prime_book_from_rest(aid)
             except Exception as exc:
-                print(f"Auto event logging subscribe failed (asset={aid}): {exc}")
+                meta = self._asset_meta.get(aid, {})
+                question = str(meta.get("question") or "unknown")
+                outcome = str(meta.get("outcome") or "unknown")
+                print(
+                    "Auto subscribe failed "
+                    f"(question={question} outcome={outcome}): {exc}"
+                )
         for aid in to_remove:
             try:
                 self.release(aid)
             except Exception as exc:
-                print(f"Auto event logging release failed (asset={aid}): {exc}")
-        with self._auto_log_lock:
-            self._auto_log_managed_assets = desired_assets
-            self._auto_log_items = items
-            self._auto_log_last_run_ts = time.time()
+                print(f"Auto subscribe release failed (asset={aid}): {exc}")
+        with self._auto_subscribe_lock:
+            self._auto_subscribe_managed_assets = desired_assets
+            self._auto_subscribe_items = items
+            self._auto_subscribe_last_run_ts = time.time()
 
-    def get_auto_event_logging_status(self) -> dict[str, object]:
-        with self._auto_log_lock:
-            items = list(self._auto_log_items.values())
+    def get_auto_subscribe_status(self) -> dict[str, object]:
+        with self._auto_subscribe_lock:
+            items = list(self._auto_subscribe_items.values())
             items.sort(key=lambda x: float(x.get("market_volume") or 0.0), reverse=True)
             return {
-                "enabled": self._auto_log_enabled,
-                "volume_threshold": self._auto_log_volume_threshold,
-                "refresh_interval_s": self._auto_log_refresh_interval_s,
-                "last_run_ts": self._auto_log_last_run_ts,
-                "last_error": self._auto_log_last_error,
-                "managed_assets_count": len(self._auto_log_managed_assets),
+                "enabled": self._auto_subscribe_enabled,
+                "volume_threshold": self._auto_subscribe_volume_threshold,
+                "refresh_interval_s": self._auto_subscribe_refresh_interval_s,
+                "window_before_hours": self._auto_subscribe_window_before_h,
+                "window_hours": self._auto_subscribe_window_after_h,
+                "include_more_markets": self._auto_subscribe_include_more_markets,
+                "track_all_outcomes": self._auto_subscribe_track_all_outcomes,
+                "last_run_ts": self._auto_subscribe_last_run_ts,
+                "last_error": self._auto_subscribe_last_error,
+                "managed_assets_count": len(self._auto_subscribe_managed_assets),
                 "markets_count": len(items),
                 "markets": items,
             }
+
+    # Backward-compatible aliases while callers migrate from "auto_event_logging" naming.
+    def start_auto_event_logging(
+        self,
+        volume_threshold: float = 50_000.0,
+        refresh_interval_s: float = 30.0,
+        window_before_hours: float = 1.0,
+        window_hours: float = 1.0,
+        include_more_markets: bool = True,
+        track_all_outcomes: bool = True,
+    ) -> None:
+        self.start_auto_subscribe(
+            volume_threshold=volume_threshold,
+            refresh_interval_s=refresh_interval_s,
+            window_before_hours=window_before_hours,
+            window_hours=window_hours,
+            include_more_markets=include_more_markets,
+            track_all_outcomes=track_all_outcomes,
+        )
+
+    def stop_auto_event_logging(self) -> None:
+        self.stop_auto_subscribe()
+
+    def get_auto_event_logging_status(self) -> dict[str, object]:
+        return self.get_auto_subscribe_status()
+

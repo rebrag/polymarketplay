@@ -19,7 +19,8 @@ interface TokenWidget {
   gameStartTime?: string;
 }
 
-const SOCKET_URL = "ws://localhost:8000/ws/books/stream";
+// Browser -> backend books stream socket (not the backend's upstream Polymarket feed).
+const SERVER_BOOKS_WS_URL = "ws://localhost:8000/ws/books/stream";
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 5000;
 
@@ -33,8 +34,8 @@ function buildAssetMeta(widgets: TokenWidget[]): WidgetAssetMeta[] {
   }));
 }
 
-export function useBookSocket(widgets: TokenWidget[]): void {
-  const wsRef = useRef<WebSocket | null>(null);
+export function useServerBooksSocket(widgets: TokenWidget[]): void {
+  const serverWsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
   const reconnectAttemptsRef = useRef(0);
   const assetsRef = useRef<Map<string, WidgetAssetMeta>>(new Map());
@@ -82,14 +83,14 @@ export function useBookSocket(widgets: TokenWidget[]): void {
       );
     }
     if (toRemove.length) {
-      const ws = wsRef.current;
+      const ws = serverWsRef.current;
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "unsubscribe", assets: toRemove }));
       }
       toRemove.forEach((assetId) => clearBook(assetId));
     }
 
-    const ws = wsRef.current;
+    const ws = serverWsRef.current;
     if (ws && ws.readyState === WebSocket.OPEN && toAdd.length) {
       ws.send(JSON.stringify({ type: "subscribe", assets: toAdd }));
       pendingSubscribeRef.current = [];
@@ -100,7 +101,7 @@ export function useBookSocket(widgets: TokenWidget[]): void {
     let active = true;
 
     if (!shouldConnect) {
-      const ws = wsRef.current;
+      const ws = serverWsRef.current;
       if (ws) {
         ws.onopen = null;
         ws.onclose = null;
@@ -108,7 +109,7 @@ export function useBookSocket(widgets: TokenWidget[]): void {
         ws.onmessage = null;
         ws.close();
       }
-      wsRef.current = null;
+      serverWsRef.current = null;
       if (workerRef.current) {
         workerRef.current.terminate();
         workerRef.current = null;
@@ -167,8 +168,8 @@ export function useBookSocket(widgets: TokenWidget[]): void {
 
     const connect = () => {
       if (!active) return;
-      const ws = new WebSocket(SOCKET_URL);
-      wsRef.current = ws;
+      const ws = new WebSocket(SERVER_BOOKS_WS_URL);
+      serverWsRef.current = ws;
 
       ws.onopen = () => {
         reconnectAttemptsRef.current = 0;
@@ -210,7 +211,7 @@ export function useBookSocket(widgets: TokenWidget[]): void {
       }
       worker.terminate();
       workerRef.current = null;
-      const ws = wsRef.current;
+      const ws = serverWsRef.current;
       if (ws) {
         ws.onopen = null;
         ws.onclose = null;
@@ -218,7 +219,7 @@ export function useBookSocket(widgets: TokenWidget[]): void {
         ws.onmessage = null;
         ws.close();
       }
-      wsRef.current = null;
+      serverWsRef.current = null;
     };
   }, [bumpFrame, setBooksBulk, setStatusBulk, shouldConnect]);
 }

@@ -48,4 +48,4 @@ def books_batch(req: BooksBatchRequest) -> dict[str, object]:
 
 @router.get("/books/auto/status")
 def books_auto_status() -> dict[str, object]:
-    return registry.get_auto_event_logging_status()
+    return registry.get_auto_subscribe_status()

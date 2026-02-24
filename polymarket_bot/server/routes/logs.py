@@ -71,4 +71,4 @@ def list_market_logs() -> list[dict[str, str]]:
 
 @router.get("/logs/auto/status")
 def get_auto_logging_status() -> dict[str, object]:
-    return registry.get_auto_event_logging_status()
+    return registry.get_auto_subscribe_status()

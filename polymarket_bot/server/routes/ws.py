@@ -30,9 +30,9 @@ WATCH_USER_MAX_SEEN_ASSETS: Final[int] = 20_000
 WATCH_USER_INTERVAL_S: Final[float] = 2.0
 
 
-async def _safe_close(websocket: WebSocket) -> None:
+async def _safe_close(client_ws: WebSocket) -> None:
     try:
-        await websocket.close()
+        await client_ws.close()
     except Exception:
         return
 
@@ -46,8 +46,8 @@ def _now_s() -> int:
 
 
 @router.websocket("/ws/watch/user/{address}")
-async def watch_user_endpoint(websocket: WebSocket, address: str, min_volume: float = 0.0) -> None:
-    await websocket.accept()
+async def watch_user_endpoint(client_ws: WebSocket, address: str, min_volume: float = 0.0) -> None:
+    await client_ws.accept()
 
     # Use an order-preserving bounded structure so this can't grow forever.
     sent_asset_ids: deque[str] = deque(maxlen=WATCH_USER_MAX_SEEN_ASSETS)
@@ -67,7 +67,7 @@ async def watch_user_endpoint(websocket: WebSocket, address: str, min_volume: fl
                 trades = []
 
             if trades:
-                await websocket.send_json({"type": "recent_trades", "trades": trades})
+                await client_ws.send_json({"type": "recent_trades", "trades": trades})
 
             new_asset_ids: set[str] = set()
             new_event_slugs: set[str] = set()
@@ -103,7 +103,7 @@ async def watch_user_endpoint(websocket: WebSocket, address: str, min_volume: fl
                         batch_markets.extend(filtered)
 
                 if batch_markets:
-                    await websocket.send_json({"type": "new_markets", "markets": batch_markets})
+                    await client_ws.send_json({"type": "new_markets", "markets": batch_markets})
 
                 # Record what we’ve seen (bounded).
                 for asset in new_asset_ids:
@@ -123,13 +123,13 @@ async def watch_user_endpoint(websocket: WebSocket, address: str, min_volume: fl
         print(f"Stopped watching user: {address}")
     except Exception as e:
         print(f"Error watching user: {e}")
-        await _safe_close(websocket)
+        await _safe_close(client_ws)
 
 
 @router.websocket("/ws/orders")
 @router.websocket("/ws/user")
-async def orders_websocket_endpoint(websocket: WebSocket) -> None:
-    await websocket.accept()
+async def orders_websocket_endpoint(client_ws: WebSocket) -> None:
+    await client_ws.accept()
     print(f"Orders WS accepted (pid={os.getpid()})")
     registry._last_order_ws_accept_ts = time.time()
 
@@ -139,7 +139,7 @@ async def orders_websocket_endpoint(websocket: WebSocket) -> None:
         registry.register_order_subscriber(q, asyncio.get_running_loop())
         print(f"Orders WS registered (subscribers={len(registry._order_subs)})")
 
-        await websocket.send_json(
+        await client_ws.send_json(
             {"type": "status", "status": "subscribed", "pid": os.getpid(), "server_now": _now_s()}
         )
 
@@ -147,19 +147,19 @@ async def orders_websocket_endpoint(websocket: WebSocket) -> None:
         try:
             open_orders = await asyncio.to_thread(registry.poly_client.get_open_orders)
             normalized = normalize_open_orders(open_orders)  # type: ignore[arg-type]
-            await websocket.send_json({"type": "snapshot", "orders": normalized, "server_now": _now_s()})
+            await client_ws.send_json({"type": "snapshot", "orders": normalized, "server_now": _now_s()})
         except Exception as e:
-            await websocket.send_json({"type": "error", "error": str(e), "server_now": _now_s()})
+            await client_ws.send_json({"type": "error", "error": str(e), "server_now": _now_s()})
 
         # Loop: either forward an order event, or periodically ping so we detect dead clients.
         while True:
             try:
                 msg = await asyncio.wait_for(q.get(), timeout=ORDER_WS_PING_SECONDS)
                 msg["server_now"] = _now_s()
-                await websocket.send_json(msg)
+                await client_ws.send_json(msg)
             except asyncio.TimeoutError:
                 # If the client is gone, this send will raise and we’ll fall out to finally/unregister.
-                await websocket.send_json({"type": "ping", "server_now": _now_s()})
+                await client_ws.send_json({"type": "ping", "server_now": _now_s()})
 
     except WebSocketDisconnect:
         print("Orders WS disconnected")
@@ -167,7 +167,7 @@ async def orders_websocket_endpoint(websocket: WebSocket) -> None:
         print(f"Orders WS error: {e}")
     finally:
         registry.unregister_order_subscriber(q)
-        await _safe_close(websocket)
+        await _safe_close(client_ws)
 
 
 def _build_book_payload(
@@ -200,14 +200,14 @@ def _build_book_payload(
 
 
 @router.websocket("/ws/{asset_id}")
-async def websocket_endpoint(websocket: WebSocket, asset_id: str) -> None:
-    await websocket.accept()
+async def websocket_endpoint(client_ws: WebSocket, asset_id: str) -> None:
+    await client_ws.accept()
 
     try:
         # metadata setup...
-        book = registry.get_or_create(asset_id)
+        book = registry.subscribe_to_asset(asset_id)
     except Exception:
-        await _safe_close(websocket)
+        await _safe_close(client_ws)
         return
 
     try:
@@ -216,7 +216,7 @@ async def websocket_endpoint(websocket: WebSocket, asset_id: str) -> None:
         while True:
             # 1. State Check: If book isn't ready, throttle and wait.
             if not getattr(book, "ready", True):
-                await websocket.send_json({"status": "loading", "asset_id": asset_id})
+                await client_ws.send_json({"status": "loading", "asset_id": asset_id})
                 await asyncio.sleep(0.5) # Heavy throttle during loading
                 continue
 
@@ -228,7 +228,7 @@ async def websocket_endpoint(websocket: WebSocket, asset_id: str) -> None:
             payload = _build_book_payload(asset_id, book, msg_count, last_trade) #type: ignore
             
             # 4. Send to Frontend
-            await websocket.send_json(payload)
+            await client_ws.send_json(payload)
             
             # 5. THE FIX: Strict Fixed Interval
             # By using a flat sleep, you guarantee the React Scheduler (Scheduler.js) 
@@ -242,12 +242,12 @@ async def websocket_endpoint(websocket: WebSocket, asset_id: str) -> None:
         print(f"Socket Error: {e}")
     finally:
         registry.release(asset_id)
-        await _safe_close(websocket)
+        await _safe_close(client_ws)
 
 
 @router.websocket("/ws/books/stream")
-async def websocket_books(websocket: WebSocket) -> None:
-    await websocket.accept()
+async def websocket_books(client_ws: WebSocket) -> None:
+    await client_ws.accept()
 
     subscribed: set[str] = set()
     update_q: Queue[None] = Queue(maxsize=1)
@@ -257,7 +257,7 @@ async def websocket_books(websocket: WebSocket) -> None:
 
     async def _receive_messages() -> None:
         while True:
-            payload = await websocket.receive_json()
+            payload = await client_ws.receive_json()
             if not isinstance(payload, dict):
                 continue
             msg_type = payload.get("type")
@@ -292,7 +292,7 @@ async def websocket_books(websocket: WebSocket) -> None:
                             game_start_time if isinstance(game_start_time, str) else None,
                         )
                     try:
-                        registry.get_or_create(asset_id)
+                        registry.subscribe_to_asset(asset_id)
                         registry.register_subscriber(asset_id, update_q, loop)
                     except Exception:
                         continue
@@ -327,7 +327,7 @@ async def websocket_books(websocket: WebSocket) -> None:
             for asset_id in tuple(subscribed):
                 book = registry.active_books.get(asset_id)
                 if book is None:
-                    book = registry.get_or_create(asset_id)
+                    book = registry.subscribe_to_asset(asset_id)
                 if not getattr(book, "ready", True):
                     continue
                 msg_count = int(getattr(book, "msg_count", 0))
@@ -343,7 +343,7 @@ async def websocket_books(websocket: WebSocket) -> None:
                 updates.append(_build_book_payload(asset_id, book, msg_count, last_trade)) #type: ignore
 
             if updates:
-                await websocket.send_json({"type": "books", "updates": updates})
+                await client_ws.send_json({"type": "books", "updates": updates})
     except WebSocketDisconnect:
         return
     except Exception as exc:
@@ -352,4 +352,4 @@ async def websocket_books(websocket: WebSocket) -> None:
         receiver_task.cancel()
         for asset_id in tuple(subscribed):
             registry.unregister_subscriber(asset_id, update_q)
-        await _safe_close(websocket)
+        await _safe_close(client_ws)

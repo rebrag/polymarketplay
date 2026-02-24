@@ -13,10 +13,19 @@ class OrderBook:
     def __init__(self, asset_id: str) -> None:
         self.asset_id = asset_id
         self.lock = threading.Lock()
-        
-        # Event used to wake up the server websocket immediately on change
-        self.updated_event = asyncio.Event()
-        self.loop = asyncio.get_event_loop()
+
+        # Optional asyncio signaling support. This must be thread-safe because
+        # books can be created from background threads (for example auto logger).
+        self.updated_event: asyncio.Event | None = None
+        self.loop: asyncio.AbstractEventLoop | None = None
+        try:
+            self.loop = asyncio.get_running_loop()
+            self.updated_event = asyncio.Event()
+        except RuntimeError:
+            # No running loop in this thread; BookManager queue notifications
+            # still drive downstream websocket pushes.
+            self.loop = None
+            self.updated_event = None
         
         self.bids: Dict[float, float] = {}
         self.asks: Dict[float, float] = {}
@@ -26,7 +35,9 @@ class OrderBook:
         self._queue: List[WsPriceChangeMessage] = []
 
     def _trigger_update(self) -> None:
-        """Schedules the event trigger on the main event loop."""
+        """Schedules the optional event trigger on an asyncio loop."""
+        if self.loop is None or self.updated_event is None:
+            return
         self.loop.call_soon_threadsafe(self.updated_event.set)
 
     def _safe_float(self, val: object) -> float:
