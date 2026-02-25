@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -30,6 +30,14 @@ interface NavbarProps {
   onLogsClick?: () => void;
   logsCount?: number | null;
   backendBooksCount?: number | null;
+  backendBookAssets?: Array<{
+    asset_id: string;
+    slug: string;
+    event_title: string;
+    question: string;
+    outcome: string;
+    game_start_time: string;
+  }>;
   backendLatencyMs?: number | null;
   recentFills?: Array<{
     orderID: string;
@@ -76,13 +84,48 @@ export function Navbar({
   onLogsClick,
   logsCount,
   backendBooksCount,
+  backendBookAssets = [],
   backendLatencyMs,
   recentFills = [],
 }: NavbarProps) {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [backendBooksOpen, setBackendBooksOpen] = useState(false);
+  const [openBackendSlugs, setOpenBackendSlugs] = useState<Set<string>>(new Set());
   const notificationsRef = useRef<HTMLDivElement | null>(null);
+  const backendBooksRef = useRef<HTMLDivElement | null>(null);
   const fills = recentFills;
+  const backendBooksBySlug = useMemo(() => {
+    const groups = new Map<string, typeof backendBookAssets>();
+    backendBookAssets.forEach((item) => {
+      const slug = item.slug || "unknown-slug";
+      const current = groups.get(slug) ?? [];
+      current.push(item);
+      groups.set(slug, current);
+    });
+    const entries = Array.from(groups.entries());
+    entries.sort((a, b) => a[0].localeCompare(b[0]));
+    entries.forEach(([, items]) => {
+      items.sort((x, y) => {
+        const q = x.question.localeCompare(y.question);
+        if (q !== 0) return q;
+        return x.outcome.localeCompare(y.outcome);
+      });
+    });
+    return entries;
+  }, [backendBookAssets]);
+  const backendNumEvents = useMemo(() => {
+    const slugs = new Set<string>();
+    backendBookAssets.forEach((item) => {
+      const slug = String(item.slug ?? "").trim();
+      if (slug) slugs.add(slug);
+    });
+    return slugs.size;
+  }, [backendBookAssets]);
+  const backendNumTokens =
+    backendBooksCount === null || backendBooksCount === undefined
+      ? backendBookAssets.length
+      : backendBooksCount;
 
   useEffect(() => {
     if (!notificationsOpen) return;
@@ -94,6 +137,28 @@ export function Navbar({
     document.addEventListener("mousedown", handleClick);
     return () => document.removeEventListener("mousedown", handleClick);
   }, [notificationsOpen]);
+
+  useEffect(() => {
+    if (!backendBooksOpen) return;
+    const handleClick = (event: MouseEvent) => {
+      if (!backendBooksRef.current) return;
+      if (backendBooksRef.current.contains(event.target as Node)) return;
+      setBackendBooksOpen(false);
+    };
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [backendBooksOpen]);
+
+  useEffect(() => {
+    setOpenBackendSlugs((prev) => {
+      const next = new Set<string>();
+      const valid = new Set(backendBooksBySlug.map(([slug]) => slug));
+      prev.forEach((slug) => {
+        if (valid.has(slug)) next.add(slug);
+      });
+      return next;
+    });
+  }, [backendBooksBySlug]);
 //   const [data, setData] = useState<BalanceData>({ portfolioValue: 0, cash: 0 });
 
 //   useEffect(() => {
@@ -183,11 +248,73 @@ export function Navbar({
             {balance === null || balance === undefined ? "--" : `$${balance.toFixed(2)}`}
           </span>
         </div>
-        <div className="flex flex-col items-end">
-          <span className="text-[9px] text-slate-500 uppercase font-bold">Backend Books</span>
-          <span className="text-sm font-bold text-slate-200 font-mono">
-            {backendBooksCount === null || backendBooksCount === undefined ? "--" : backendBooksCount}
-          </span>
+        <div className="relative flex flex-col items-end" ref={backendBooksRef}>
+          <span className="text-[9px] text-slate-500 uppercase font-bold">Subscribed</span>
+          <button
+            onClick={() => setBackendBooksOpen((open) => !open)}
+            className="text-sm font-bold text-slate-200 font-mono hover:text-white"
+            title="Show subscribed backend events and tokens"
+          >
+            {`${backendNumEvents} events | ${backendNumTokens} tokens`}
+          </button>
+          {backendBooksOpen && (
+            <div className="absolute right-0 top-10 z-40 w-[640px] rounded-md border border-slate-200 bg-white/90 text-slate-900 shadow-xl">
+              <div className="px-3 py-2 text-[10px] uppercase tracking-widest text-slate-500 border-b border-slate-200">
+                Subscribed ({backendNumEvents} events, {backendNumTokens} tokens)
+              </div>
+              {backendBookAssets.length === 0 ? (
+                <div className="px-3 py-3 text-xs text-slate-500">No active backend assets</div>
+              ) : (
+                <ScrollArea className="h-[360px]">
+                  <div className="divide-y divide-slate-200">
+                    {backendBooksBySlug.map(([slug, items]) => {
+                      const open = openBackendSlugs.has(slug);
+                      const eventTitle = items.find((item) => item.event_title)?.event_title || "";
+                      return (
+                        <div key={slug}>
+                          <button
+                            onClick={() =>
+                              setOpenBackendSlugs((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(slug)) next.delete(slug);
+                                else next.add(slug);
+                                return next;
+                              })
+                            }
+                            className="w-full px-3 py-2 text-left hover:bg-slate-100"
+                          >
+                            <div className="flex items-center justify-between gap-3">
+                              <span className="text-[11px] font-mono text-slate-800 truncate">
+                                {open ? "v" : ">"} {slug}
+                                {eventTitle ? ` - ${eventTitle}` : ""}
+                              </span>
+                              <span className="text-[10px] text-slate-500 font-mono">
+                                {items.length}
+                              </span>
+                            </div>
+                          </button>
+                          {open && (
+                            <div className="border-t border-slate-200 bg-slate-50/80">
+                              {items.map((item) => (
+                                <div key={item.asset_id} className="px-5 py-2 border-b border-slate-200/70 last:border-b-0">
+                                  <div className="text-[11px] text-slate-900 font-semibold truncate">
+                                    {item.question || "Unknown market"}
+                                  </div>
+                                  <div className="text-[11px] text-slate-600 font-mono truncate">
+                                    {item.outcome || "Unknown outcome"} {item.game_start_time ? `@ ${item.game_start_time}` : ""}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </ScrollArea>
+              )}
+            </div>
+          )}
         </div>
         <div className="flex flex-col items-end">
           <span className="text-[9px] text-slate-500 uppercase font-bold">PM Latency</span>

@@ -7,6 +7,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from polymarket_bot.server.metrics import latency_monitor
+from polymarket_bot.server.settings import (
+    AUTO_SUBSCRIBE_ENABLED,
+    AUTO_SUBSCRIBE_REFRESH_INTERVAL_S,
+    AUTO_SUBSCRIBE_END_DATE_WINDOW_BEFORE_HOURS,
+    AUTO_SUBSCRIBE_END_DATE_WINDOW_HOURS,
+    AUTO_SUBSCRIBE_GAMESTART_WINDOW_BEFORE_HOURS,
+    AUTO_SUBSCRIBE_GAMESTART_WINDOW_HOURS,
+)
 from polymarket_bot.server.state import registry
 
 _mem_log_stop = threading.Event()
@@ -58,41 +66,39 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"User WS startup failed: {e}")
     threshold_raw = os.getenv("ORDERBOOK_MIN_VOLUME", os.getenv("AUTO_LOG_VOLUME_THRESHOLD", "10000"))
-    refresh_raw = os.getenv("ORDERBOOK_POPULATE_REFRESH_SECONDS", os.getenv("AUTO_LOG_REFRESH_SECONDS", "30"))
-    window_before_raw = os.getenv("ORDERBOOK_WINDOW_BEFORE_HOURS", "1")
-    window_after_raw = os.getenv("ORDERBOOK_WINDOW_HOURS", "1")
     include_more_markets = _env_bool("ORDERBOOK_INCLUDE_MORE_MARKETS", True)
     track_all_outcomes = _env_bool("ORDERBOOK_TRACK_ALL_OUTCOMES", True)
     try:
         threshold = float(threshold_raw)
     except ValueError:
         threshold = 50_000.0
-    try:
-        refresh_s = float(refresh_raw)
-    except ValueError:
-        refresh_s = 30.0
-    try:
-        window_before_h = float(window_before_raw)
-    except ValueError:
-        window_before_h = 1.0
-    try:
-        window_after_h = float(window_after_raw)
-    except ValueError:
-        window_after_h = 1.0
-    registry.start_auto_subscribe(
-        volume_threshold=threshold,
-        refresh_interval_s=refresh_s,
-        window_before_hours=window_before_h,
-        window_hours=window_after_h,
-        include_more_markets=include_more_markets,
-        track_all_outcomes=track_all_outcomes,
-    )
-    print(
-        "Auto subscribe started "
-        f"(volume_threshold={threshold}, refresh_interval_s={refresh_s}, "
-        f"window_before_hours={window_before_h}, window_hours={window_after_h}, "
-        f"include_more_markets={include_more_markets}, track_all_outcomes={track_all_outcomes})"
-    )
+    refresh_s = AUTO_SUBSCRIBE_REFRESH_INTERVAL_S
+    game_start_window_before_h = AUTO_SUBSCRIBE_GAMESTART_WINDOW_BEFORE_HOURS
+    game_start_window_after_h = AUTO_SUBSCRIBE_GAMESTART_WINDOW_HOURS
+    end_date_window_before_h = AUTO_SUBSCRIBE_END_DATE_WINDOW_BEFORE_HOURS
+    end_date_window_after_h = AUTO_SUBSCRIBE_END_DATE_WINDOW_HOURS
+    if AUTO_SUBSCRIBE_ENABLED:
+        registry.start_auto_subscribe(
+            volume_threshold=threshold,
+            refresh_interval_s=refresh_s,
+            window_before_hours=game_start_window_before_h,
+            window_hours=game_start_window_after_h,
+            end_date_window_before_hours=end_date_window_before_h,
+            end_date_window_hours=end_date_window_after_h,
+            include_more_markets=include_more_markets,
+            track_all_outcomes=track_all_outcomes,
+        )
+        print(
+            "Auto subscribe started "
+            f"(volume_threshold={threshold}, refresh_interval_s={refresh_s}, "
+            f"game_start_window_before_hours={game_start_window_before_h}, "
+            f"game_start_window_hours={game_start_window_after_h}, "
+            f"end_date_window_before_hours={end_date_window_before_h}, "
+            f"end_date_window_hours={end_date_window_after_h}, "
+            f"include_more_markets={include_more_markets}, track_all_outcomes={track_all_outcomes})"
+        )
+    else:
+        print("Auto subscribe disabled (AUTO_SUBSCRIBE_ENABLED=False).")
     _start_mem_logger()
     latency_monitor.start()
     yield

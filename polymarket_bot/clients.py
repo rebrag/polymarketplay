@@ -710,11 +710,14 @@ class PolySocket:
     """
 
     def __init__(self, asset_ids: list[str]):
-        self.asset_ids = asset_ids
+        self.asset_ids = list(dict.fromkeys(asset_ids))
         self.ws: websocket.WebSocketApp | None = None
         self.thread: threading.Thread | None = None
         self.keep_running = True
         self._asset_lock = threading.Lock()
+        self._subscribed_assets: set[str] = set()
+        self._flush_timer: threading.Timer | None = None
+        self._flush_delay_s = 0.2
 
         self.on_book: BookCallback | None = None
         self.on_price_change: PriceChangeCallback | None = None
@@ -728,6 +731,11 @@ class PolySocket:
 
     def stop(self) -> None:
         self.keep_running = False
+        with self._asset_lock:
+            timer = self._flush_timer
+            self._flush_timer = None
+        if timer:
+            timer.cancel()
         if self.ws:
             cast(WebSocketAppProto, self.ws).close()
 
@@ -738,36 +746,99 @@ class PolySocket:
                 on_open=self._on_open,
                 on_message=self._on_message,
                 on_error=self._on_error,
+                on_close=self._on_close,
             )
             cast(WebSocketAppProto, self.ws).run_forever(ping_interval=30, ping_timeout=10)
+            with self._asset_lock:
+                self._subscribed_assets.clear()
+                self.ws = None
 
             if self.keep_running:
-                print("⚠️ WebSocket disconnected. Reconnecting in 2s...")
+                print("WebSocket disconnected. Reconnecting in 2s...")
                 time.sleep(2.0)
+
+    def _is_ws_open(self, ws: websocket.WebSocketApp | None) -> bool:
+        if ws is None:
+            return False
+        sock = getattr(ws, "sock", None)
+        if sock is None:
+            return False
+        return bool(getattr(sock, "connected", False))
+
+    def _send_json(self, ws: websocket.WebSocketApp, payload: dict[str, Any], err_label: str) -> bool:
+        if not self._is_ws_open(ws):
+            return False
+        try:
+            ws.send(json.dumps(payload))
+            return True
+        except Exception as e:
+            print(f"{err_label}: {e}")
+            return False
+
+    def _schedule_asset_flush(self) -> None:
+        with self._asset_lock:
+            if self._flush_timer is not None:
+                return
+            timer = threading.Timer(self._flush_delay_s, self._flush_asset_updates)
+            timer.daemon = True
+            self._flush_timer = timer
+            timer.start()
+
+    def _flush_asset_updates(self) -> None:
+        with self._asset_lock:
+            self._flush_timer = None
+            ws = self.ws
+            desired_assets = set(self.asset_ids)
+            subscribed_assets = set(self._subscribed_assets)
+        if ws is None or not self._is_ws_open(ws):
+            return
+
+        to_unsub = sorted(subscribed_assets - desired_assets)
+        if to_unsub:
+            ok = self._send_json(
+                ws,
+                {"assets_ids": to_unsub, "type": "market", "operation": "unsubscribe"},
+                "WebSocket Unsubscribe Error",
+            )
+            if ok:
+                with self._asset_lock:
+                    self._subscribed_assets.difference_update(to_unsub)
+
+        with self._asset_lock:
+            desired_assets = set(self.asset_ids)
+            subscribed_assets = set(self._subscribed_assets)
+        to_sub = sorted(desired_assets - subscribed_assets)
+        if to_sub:
+            ok = self._send_json(
+                ws,
+                {"assets_ids": to_sub, "type": "market", "operation": "subscribe"},
+                "WebSocket Subscribe Error",
+            )
+            if ok:
+                with self._asset_lock:
+                    self._subscribed_assets.update(to_sub)
 
     def _on_open(self, ws: websocket.WebSocketApp) -> None:
         with self._asset_lock:
             assets = list(self.asset_ids)
-        print(f"✅ Connected. Subscribing to {len(assets)} assets...")
+        print(f"Connected. Subscribing to {len(assets)} assets...")
         sub_msg: dict[str, Any] = {"assets_ids": assets, "type": "market"}
-        ws.send(json.dumps(sub_msg))
+        if self._send_json(ws, sub_msg, "WebSocket Initial Subscribe Error"):
+            with self._asset_lock:
+                self._subscribed_assets = set(assets)
 
     def update_assets(self, asset_ids: list[str], force_reconnect: bool = False) -> None:
+        normalized = [aid for aid in dict.fromkeys(asset_ids) if aid]
         with self._asset_lock:
-            self.asset_ids = asset_ids
+            self.asset_ids = normalized
             ws = self.ws
-            assets = list(self.asset_ids)
-        if ws and force_reconnect:
+        if ws and force_reconnect and self._is_ws_open(ws):
             try:
                 ws.close()
             except Exception as e:
-                print(f"⚠️ WebSocket Reconnect Error: {e}")
+                print(f"WebSocket Reconnect Error: {e}")
             return
-        if ws:
-            try:
-                ws.send(json.dumps({"assets_ids": assets, "type": "market"}))
-            except Exception as e:
-                print(f"⚠️ WebSocket Subscribe Error: {e}")
+        self._schedule_asset_flush()
 
     def _on_message(self, ws: websocket.WebSocketApp, msg_str: str) -> None:
         try:
@@ -798,7 +869,16 @@ class PolySocket:
                 self.on_last_trade(cast(WsLastTradePriceMessage, ev))
 
     def _on_error(self, ws: websocket.WebSocketApp, error: object) -> None:
-        print(f"❌ WebSocket Error: {error}")
+        print(f"WebSocket Error: {error}")
+
+    def _on_close(
+        self,
+        ws: websocket.WebSocketApp,
+        status_code: int | None,
+        msg: str | None,
+    ) -> None:
+        with self._asset_lock:
+            self._subscribed_assets.clear()
 
 class UserSocket:
     """
@@ -838,7 +918,7 @@ class UserSocket:
                 on_error=self._on_error,
                 on_close=self._on_close,
             )
-            cast(WebSocketAppProto, self.ws).run_forever(ping_interval=30, ping_timeout=10)
+            cast(WebSocketAppProto, self.ws).run_forever(ping_interval=10, ping_timeout=5)
 
             if self.keep_running:
                 time.sleep(2.0)
@@ -912,3 +992,4 @@ class UserSocket:
             else:
                 out[key] = val
         return out
+

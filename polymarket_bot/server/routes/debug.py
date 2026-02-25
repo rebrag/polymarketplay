@@ -143,8 +143,38 @@ def debug_user_ws_start() -> dict[str, object]:
 
 @router.get("/debug/books")
 def debug_books() -> dict[str, object]:
+    active_asset_ids = sorted(registry.active_books.keys())
+    slug_to_title: dict[str, str] = {}
+    with registry._auto_subscribe_lock:
+        for item in registry._auto_subscribe_items.values():
+            slug = str(item.get("event_slug") or "").strip()
+            title = str(item.get("event_title") or "").strip()
+            if slug and title and slug not in slug_to_title:
+                slug_to_title[slug] = title
+    active_assets: list[dict[str, str]] = []
+    for aid in active_asset_ids:
+        meta = registry._asset_meta.get(aid, {})
+        slug = str(meta.get("slug") or "")
+        active_assets.append(
+            {
+                "asset_id": aid,
+                "slug": slug,
+                "event_title": slug_to_title.get(slug, ""),
+                "question": str(meta.get("question") or ""),
+                "outcome": str(meta.get("outcome") or ""),
+                "game_start_time": (
+                    datetime.fromtimestamp(float(meta.get("game_start_ts")), tz=timezone.utc)
+                    .astimezone()
+                    .strftime("%H:%M")
+                    if meta.get("game_start_ts") is not None
+                    else ""
+                ),
+            }
+        )
     return {
         "active_books": len(registry.active_books),
+        "active_asset_ids": active_asset_ids,
+        "active_assets": active_assets,
         "tracked_assets": len(registry._tracked_assets),
         "market_threads": len(registry._market_threads),
         "market_assets": len(registry._market_assets),

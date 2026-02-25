@@ -23,6 +23,13 @@ from polymarket_bot.models import (
 )
 from polymarket_bot.server.helpers import _to_float, _to_int, _to_side
 from polymarket_bot.server.models import AutoPairConfig
+from polymarket_bot.server.settings import (
+    AUTO_SUBSCRIBE_END_DATE_WINDOW_BEFORE_HOURS,
+    AUTO_SUBSCRIBE_END_DATE_WINDOW_HOURS,
+    AUTO_SUBSCRIBE_GAMESTART_WINDOW_BEFORE_HOURS,
+    AUTO_SUBSCRIBE_GAMESTART_WINDOW_HOURS,
+    AUTO_SUBSCRIBE_REFRESH_INTERVAL_S,
+)
 from polymarket_bot.server.strategies import OrderIntent, PairContext, get_strategy
 
 
@@ -59,6 +66,7 @@ class BookManager:
         self._market_assets: Dict[str, set[str]] = {}
         self._market_threads: Dict[str, threading.Thread] = {}
         self._market_stops: Dict[str, threading.Event] = {}
+        self._market_end_reasons: Dict[str, str] = {}
         self._last_trades: Dict[str, WsLastTrade] = {}
         self._auto_pairs: Dict[str, AutoPairConfig] = {}
         self._auto_lock = threading.Lock()
@@ -82,9 +90,11 @@ class BookManager:
         self._auto_subscribe_thread: threading.Thread | None = None
         self._auto_subscribe_enabled = False
         self._auto_subscribe_volume_threshold = 10_000.0
-        self._auto_subscribe_refresh_interval_s = 30.0
-        self._auto_subscribe_window_before_h = 1.0
-        self._auto_subscribe_window_after_h = 1.0
+        self._auto_subscribe_refresh_interval_s = AUTO_SUBSCRIBE_REFRESH_INTERVAL_S
+        self._auto_subscribe_window_before_h = AUTO_SUBSCRIBE_GAMESTART_WINDOW_BEFORE_HOURS
+        self._auto_subscribe_window_after_h = AUTO_SUBSCRIBE_GAMESTART_WINDOW_HOURS
+        self._auto_subscribe_end_date_window_before_h = AUTO_SUBSCRIBE_END_DATE_WINDOW_BEFORE_HOURS
+        self._auto_subscribe_end_date_window_after_h = AUTO_SUBSCRIBE_END_DATE_WINDOW_HOURS
         self._auto_subscribe_include_more_markets = True
         self._auto_subscribe_track_all_outcomes = True
         self._auto_subscribe_managed_assets: set[str] = set()
@@ -213,7 +223,7 @@ class BookManager:
                 self._market_feed_socket.on_last_trade = _on_last_trade
                 self._market_feed_socket.start()
             else:
-                self._market_feed_socket.update_assets(list(self._tracked_assets), force_reconnect=True)
+                self._market_feed_socket.update_assets(list(self._tracked_assets))
 
         return book
 
@@ -735,6 +745,14 @@ class BookManager:
                         )
                     last_logged_snapshot = current_snapshot
                 stop_event.wait(1.0 if volatile else 4.0)
+            reason = self._market_end_reasons.pop(key, None)
+            if reason == "unsubscribed" and path.exists():
+                try:
+                    with path.open("a", newline="") as fh:
+                        writer = csv.writer(fh)
+                        writer.writerow(["END_UNSUBSCRIBED", "", "", ""])
+                except Exception:
+                    pass
             self._market_threads.pop(key, None)
             self._market_stops.pop(key, None)
 
@@ -754,6 +772,7 @@ class BookManager:
                 self._market_assets.pop(key, None)
                 stop = self._market_stops.get(key)
                 if stop:
+                    self._market_end_reasons[key] = "unsubscribed"
                     stop.set()
 
     def unregister_order_subscriber(self, q: Queue[dict[str, object]]) -> None:
@@ -1012,12 +1031,44 @@ class BookManager:
                 return [str(x) for x in parsed]
         return []
 
+    def _best_ask_from_book(self, asset_id: str) -> float | None:
+        book = self.active_books.get(asset_id)
+        if not book or not getattr(book, "ready", False):
+            return None
+        _bids, asks = book.get_snapshot(limit=1)
+        if not asks:
+            return None
+        try:
+            return float(asks[0][0])
+        except Exception:
+            return None
+
+    def _is_closed_by_best_asks(
+        self,
+        asset_ids: list[str],
+        ask_lookup: dict[str, float | None],
+    ) -> bool:
+        if len(asset_ids) < 2:
+            return False
+        cents: list[int] = []
+        for aid in asset_ids:
+            ask = ask_lookup.get(aid)
+            if ask is None:
+                cents.append(100)
+                continue
+            cents.append(round(float(ask) * 100))
+        if len(cents) < 2:
+            return False
+        return min(cents) <= 1 and max(cents) >= 99
+
     def start_auto_subscribe(
         self,
         volume_threshold: float = 50_000.0,
-        refresh_interval_s: float = 30.0,
-        window_before_hours: float = 1.0,
-        window_hours: float = 1.0,
+        refresh_interval_s: float = AUTO_SUBSCRIBE_REFRESH_INTERVAL_S,
+        window_before_hours: float = AUTO_SUBSCRIBE_GAMESTART_WINDOW_BEFORE_HOURS,
+        window_hours: float = AUTO_SUBSCRIBE_GAMESTART_WINDOW_HOURS,
+        end_date_window_before_hours: float = AUTO_SUBSCRIBE_END_DATE_WINDOW_BEFORE_HOURS,
+        end_date_window_hours: float = AUTO_SUBSCRIBE_END_DATE_WINDOW_HOURS,
         include_more_markets: bool = True,
         track_all_outcomes: bool = True,
     ) -> None:
@@ -1026,6 +1077,8 @@ class BookManager:
             self._auto_subscribe_refresh_interval_s = max(5.0, float(refresh_interval_s))
             self._auto_subscribe_window_before_h = max(0.0, float(window_before_hours))
             self._auto_subscribe_window_after_h = max(0.0, float(window_hours))
+            self._auto_subscribe_end_date_window_before_h = max(0.0, float(end_date_window_before_hours))
+            self._auto_subscribe_end_date_window_after_h = max(0.0, float(end_date_window_hours))
             self._auto_subscribe_include_more_markets = bool(include_more_markets)
             self._auto_subscribe_track_all_outcomes = bool(track_all_outcomes)
             self._auto_subscribe_enabled = True
@@ -1067,11 +1120,15 @@ class BookManager:
             threshold = self._auto_subscribe_volume_threshold
             include_more_markets = self._auto_subscribe_include_more_markets
             track_all_outcomes = self._auto_subscribe_track_all_outcomes
-            window_before_h = self._auto_subscribe_window_before_h
-            window_after_h = self._auto_subscribe_window_after_h
+            game_window_before_h = self._auto_subscribe_window_before_h
+            game_window_after_h = self._auto_subscribe_window_after_h
+            end_date_window_before_h = self._auto_subscribe_end_date_window_before_h
+            end_date_window_after_h = self._auto_subscribe_end_date_window_after_h
         now = datetime.now(timezone.utc)
-        window_start = now - timedelta(hours=3)
-        window_end = now + timedelta(hours=12)
+        game_window_start = now - timedelta(hours=game_window_before_h)
+        game_window_end = now + timedelta(hours=game_window_after_h)
+        end_date_window_start = now - timedelta(hours=end_date_window_before_h)
+        end_date_window_end = now + timedelta(hours=end_date_window_after_h)
         fetch_limit = 500
         fetch_params: dict[str, object] = {
             "limit": fetch_limit,
@@ -1080,9 +1137,8 @@ class BookManager:
             "order": "volume24hr",
             "ascending": False,
             "volume_min": threshold,
-            # Match events/list source-of-truth windowing at fetch-time.
-            "end_date_min": window_start.isoformat(),
-            "end_date_max": window_end.isoformat(),
+            "end_date_min": end_date_window_start.isoformat(),
+            "end_date_max": end_date_window_end.isoformat(),
         }
         events = self.poly_client.get_gamma_events(**fetch_params)  # type: ignore[arg-type]
         total_markets = 0
@@ -1125,7 +1181,7 @@ class BookManager:
                     game_start_dt = game_start_dt.replace(tzinfo=timezone.utc)
                 else:
                     game_start_dt = game_start_dt.astimezone(timezone.utc)
-                if game_start_dt < window_start or game_start_dt > window_end:
+                if game_start_dt < game_window_start or game_start_dt > game_window_end:
                     continue
                 game_start_time = game_start_time_raw
                 outcomes = self._parse_string_or_list(m.get("outcomes"))
@@ -1204,8 +1260,25 @@ class BookManager:
 
         with self._auto_subscribe_lock:
             current = set(self._auto_subscribe_managed_assets)
+        market_assets: list[list[str]] = []
+        for item in items.values():
+            raw_assets = item.get("assets", [])
+            if not isinstance(raw_assets, list):
+                continue
+            asset_ids = [str(x).strip() for x in raw_assets if str(x).strip()]
+            if len(asset_ids) < 2:
+                continue
+            market_assets.append(asset_ids)
+        ask_lookup: dict[str, float | None] = {}
+        for aid in {asset for pair in market_assets for asset in pair}:
+            ask_lookup[aid] = self._best_ask_from_book(aid)
+        closed_assets: set[str] = set()
+        for asset_ids in market_assets:
+            if self._is_closed_by_best_asks(asset_ids, ask_lookup):
+                closed_assets.update(asset_ids)
+        if closed_assets:
+            desired_assets -= closed_assets
         to_add = desired_assets - current
-        to_remove = current - desired_assets
         for aid in to_add:
             try:
                 self.subscribe_to_asset(aid)
@@ -1218,14 +1291,29 @@ class BookManager:
                     "Auto subscribe failed "
                     f"(question={question} outcome={outcome}): {exc}"
                 )
-        for aid in to_remove:
+        to_remove_closed = current & closed_assets
+        for aid in to_remove_closed:
             try:
                 self.release(aid)
             except Exception as exc:
                 print(f"Auto subscribe release failed (asset={aid}): {exc}")
         with self._auto_subscribe_lock:
-            self._auto_subscribe_managed_assets = desired_assets
-            self._auto_subscribe_items = items
+            next_managed = (current | to_add) - to_remove_closed
+            self._auto_subscribe_managed_assets = next_managed
+            merged_items = dict(self._auto_subscribe_items)
+            merged_items.update(items)
+            if closed_assets:
+                closed_keys = []
+                for key, item in merged_items.items():
+                    raw_assets = item.get("assets", [])
+                    if not isinstance(raw_assets, list):
+                        continue
+                    asset_ids = [str(x).strip() for x in raw_assets if str(x).strip()]
+                    if asset_ids and all(aid in closed_assets for aid in asset_ids):
+                        closed_keys.append(key)
+                for key in closed_keys:
+                    merged_items.pop(key, None)
+            self._auto_subscribe_items = merged_items
             self._auto_subscribe_last_run_ts = time.time()
 
     def get_auto_subscribe_status(self) -> dict[str, object]:
@@ -1238,6 +1326,8 @@ class BookManager:
                 "refresh_interval_s": self._auto_subscribe_refresh_interval_s,
                 "window_before_hours": self._auto_subscribe_window_before_h,
                 "window_hours": self._auto_subscribe_window_after_h,
+                "end_date_window_before_hours": self._auto_subscribe_end_date_window_before_h,
+                "end_date_window_hours": self._auto_subscribe_end_date_window_after_h,
                 "include_more_markets": self._auto_subscribe_include_more_markets,
                 "track_all_outcomes": self._auto_subscribe_track_all_outcomes,
                 "last_run_ts": self._auto_subscribe_last_run_ts,
@@ -1251,9 +1341,11 @@ class BookManager:
     def start_auto_event_logging(
         self,
         volume_threshold: float = 50_000.0,
-        refresh_interval_s: float = 30.0,
-        window_before_hours: float = 1.0,
-        window_hours: float = 1.0,
+        refresh_interval_s: float = AUTO_SUBSCRIBE_REFRESH_INTERVAL_S,
+        window_before_hours: float = AUTO_SUBSCRIBE_GAMESTART_WINDOW_BEFORE_HOURS,
+        window_hours: float = AUTO_SUBSCRIBE_GAMESTART_WINDOW_HOURS,
+        end_date_window_before_hours: float = AUTO_SUBSCRIBE_END_DATE_WINDOW_BEFORE_HOURS,
+        end_date_window_hours: float = AUTO_SUBSCRIBE_END_DATE_WINDOW_HOURS,
         include_more_markets: bool = True,
         track_all_outcomes: bool = True,
     ) -> None:
@@ -1262,6 +1354,8 @@ class BookManager:
             refresh_interval_s=refresh_interval_s,
             window_before_hours=window_before_hours,
             window_hours=window_hours,
+            end_date_window_before_hours=end_date_window_before_hours,
+            end_date_window_hours=end_date_window_hours,
             include_more_markets=include_more_markets,
             track_all_outcomes=track_all_outcomes,
         )

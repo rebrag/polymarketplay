@@ -232,6 +232,16 @@ function App() {
   const [autoStrategyOptions, setAutoStrategyOptions] = useState<string[]>(["default"]);
   const [recentFills, setRecentFills] = useState<OrderView[]>([]);
   const [backendBooksCount, setBackendBooksCount] = useState<number | null>(null);
+  const [backendBookAssets, setBackendBookAssets] = useState<
+    {
+      asset_id: string;
+      slug: string;
+      event_title: string;
+      question: string;
+      outcome: string;
+      game_start_time: string;
+    }[]
+  >([]);
   const [backendLatencyMs, setBackendLatencyMs] = useState<number | null>(null);
   const [assetLevels, setAssetLevels] = useState<Record<string, number>>(() => {
     try {
@@ -466,14 +476,42 @@ function App() {
       try {
         const res = await fetch("http://localhost:8000/debug/books");
         if (!res.ok) {
-          if (mounted) setBackendBooksCount(0);
+          if (mounted) {
+            setBackendBooksCount(0);
+            setBackendBookAssets([]);
+          }
           return;
         }
-        const data = (await res.json()) as { active_books?: number; tracked_assets?: number };
+        const data = (await res.json()) as {
+          active_books?: number;
+          active_assets?: Array<{
+            asset_id?: string;
+            slug?: string;
+            event_title?: string;
+            question?: string;
+            outcome?: string;
+            game_start_time?: string;
+          }>;
+        };
         if (!mounted) return;
         setBackendBooksCount(typeof data.active_books === "number" ? data.active_books : 0);
+        setBackendBookAssets(
+          Array.isArray(data.active_assets)
+            ? data.active_assets.map((item) => ({
+              asset_id: String(item?.asset_id ?? ""),
+              slug: String(item?.slug ?? ""),
+              event_title: String(item?.event_title ?? ""),
+              question: String(item?.question ?? ""),
+              outcome: String(item?.outcome ?? ""),
+              game_start_time: String(item?.game_start_time ?? ""),
+            }))
+            : []
+        );
       } catch {
-        if (mounted) setBackendBooksCount(0);
+        if (mounted) {
+          setBackendBooksCount(0);
+          setBackendBookAssets([]);
+        }
       }
     };
     fetchBooks();
@@ -1596,6 +1634,7 @@ function App() {
       logsCount={logIndex.length || null}
       ordersCount={orders.filter((o) => o.status === "open").length}
       backendBooksCount={backendBooksCount}
+      backendBookAssets={backendBookAssets}
       backendLatencyMs={backendLatencyMs}
       notificationsCount={recentFills.length}
       recentFills={recentFillsDisplay}
