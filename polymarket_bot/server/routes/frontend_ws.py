@@ -255,65 +255,26 @@ async def websocket_books(client_ws: WebSocket) -> None:
     last_sent_msg_count: dict[str, int] = {}
     last_sent_trade_ts: dict[str, int] = {}
 
-    async def _receive_messages() -> None:
-        while True:
-            payload = await client_ws.receive_json()
-            if not isinstance(payload, dict):
-                continue
-            msg_type = payload.get("type")
-            if msg_type == "subscribe":
-                items = payload.get("assets")
-                if not isinstance(items, list):
-                    continue
-                for item in items:
-                    game_start_time = None
-                    if isinstance(item, str):
-                        asset_id = item
-                        slug = question = outcome = None
-                    elif isinstance(item, dict):
-                        asset_id = item.get("asset_id")
-                        slug = item.get("slug")
-                        question = item.get("question")
-                        outcome = item.get("outcome")
-                        game_start_time = item.get("gameStartTime")
-                    else:
-                        continue
-                    if not isinstance(asset_id, str) or not asset_id:
-                        continue
-                    if asset_id in subscribed:
-                        continue
-                    subscribed.add(asset_id)
-                    if isinstance(slug, str) and isinstance(question, str):
-                        registry.set_asset_meta(
-                            asset_id,
-                            slug,
-                            question,
-                            outcome if isinstance(outcome, str) else None,
-                            game_start_time if isinstance(game_start_time, str) else None,
-                        )
-                    try:
-                        registry.subscribe_to_asset(asset_id)
-                        registry.register_subscriber(asset_id, update_q, loop)
-                    except Exception:
-                        continue
-            elif msg_type == "unsubscribe":
-                items = payload.get("assets")
-                if not isinstance(items, list):
-                    continue
-                for item in items:
-                    if not isinstance(item, str) or not item:
-                        continue
-                    if item not in subscribed:
-                        continue
-                    subscribed.remove(item)
-                    registry.unregister_subscriber(item, update_q)
-                    last_sent_msg_count.pop(item, None)
-                    last_sent_trade_ts.pop(item, None)
+    def _sync_backend_assets() -> None:
+        with registry._market_feed_socket_lock:
+            backend_assets = set(registry._tracked_assets)
 
-    receiver_task = asyncio.create_task(_receive_messages())
+        to_add = backend_assets - subscribed
+        to_remove = subscribed - backend_assets
+
+        for asset_id in to_add:
+            subscribed.add(asset_id)
+            registry.register_subscriber(asset_id, update_q, loop)
+
+        for asset_id in to_remove:
+            subscribed.remove(asset_id)
+            registry.unregister_subscriber(asset_id, update_q)
+            last_sent_msg_count.pop(asset_id, None)
+            last_sent_trade_ts.pop(asset_id, None)
 
     try:
         while True:
+            _sync_backend_assets()
             if not subscribed:
                 await asyncio.sleep(BOOK_MIN_SEND_INTERVAL_S)
                 continue
@@ -323,11 +284,12 @@ async def websocket_books(client_ws: WebSocket) -> None:
             except asyncio.TimeoutError:
                 pass
 
+            _sync_backend_assets()
             updates: list[WsPayload] = []
             for asset_id in tuple(subscribed):
                 book = registry.active_books.get(asset_id)
                 if book is None:
-                    book = registry.subscribe_to_asset(asset_id)
+                    continue
                 if not getattr(book, "ready", True):
                     continue
                 msg_count = int(getattr(book, "msg_count", 0))
@@ -349,7 +311,6 @@ async def websocket_books(client_ws: WebSocket) -> None:
     except Exception as exc:
         print(f"Books WS Error: {exc}")
     finally:
-        receiver_task.cancel()
         for asset_id in tuple(subscribed):
             registry.unregister_subscriber(asset_id, update_q)
         await _safe_close(client_ws)

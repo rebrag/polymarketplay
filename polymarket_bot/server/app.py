@@ -4,10 +4,10 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+load_dotenv()
+
 from polymarket_bot.server.lifespan import lifespan
 from polymarket_bot.server.routes import books, debug, events, logs, metrics, odds, orders, user, frontend_ws
-
-load_dotenv()
 
 
 def create_app() -> FastAPI:

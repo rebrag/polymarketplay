@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # Single source of truth for auto-subscribe timing.
 AUTO_SUBSCRIBE_ENABLED: bool = True
-AUTO_SUBSCRIBE_REFRESH_INTERVAL_S: float = 30.0
+AUTO_SUBSCRIBE_REFRESH_INTERVAL_S: float = 20.0
 AUTO_SUBSCRIBE_GAMESTART_WINDOW_BEFORE_HOURS: float = 3.0
 AUTO_SUBSCRIBE_GAMESTART_WINDOW_HOURS: float = 1.0
 AUTO_SUBSCRIBE_END_DATE_WINDOW_BEFORE_HOURS: float = 3.0

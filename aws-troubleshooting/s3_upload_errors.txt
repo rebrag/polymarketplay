@@ -1,0 +1,2 @@
+[2026-02-27T20:39:45.491673+00:00] phase=startup_preflight bucket=rebrag-polymarket-logs prefix=polymarket-logs folder=logs error=Your session has expired or credentials have changed. Please reauthenticate using 'aws login'.
+[2026-02-27T20:40:16.216665+00:00] phase=startup_preflight bucket=rebrag-polymarket-logs prefix=polymarket-logs folder=logs error=Your session has expired or credentials have changed. Please reauthenticate using 'aws login'.

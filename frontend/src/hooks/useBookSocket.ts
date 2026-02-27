@@ -19,7 +19,7 @@ interface TokenWidget {
   gameStartTime?: string;
 }
 
-// Browser -> backend books stream socket (not the backend's upstream Polymarket feed).
+// Browser -> backend books stream socket (backend-owned asset subscriptions).
 const SERVER_BOOKS_WS_URL = "ws://localhost:8000/ws/books/stream";
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 5000;
@@ -39,7 +39,6 @@ export function useServerBooksSocket(widgets: TokenWidget[]): void {
   const reconnectTimerRef = useRef<number | null>(null);
   const reconnectAttemptsRef = useRef(0);
   const assetsRef = useRef<Map<string, WidgetAssetMeta>>(new Map());
-  const pendingSubscribeRef = useRef<WidgetAssetMeta[]>([]);
   const workerRef = useRef<Worker | null>(null);
   const pendingUpdatesRef = useRef<Record<string, BookState> | null>(null);
   const applyTimerRef = useRef<number | null>(null);
@@ -76,24 +75,13 @@ export function useServerBooksSocket(widgets: TokenWidget[]): void {
 
     assetsRef.current = nextMap;
     if (toAdd.length) {
-      pendingSubscribeRef.current = toAdd;
       setStatusBulk(
         toAdd.map((meta) => meta.asset_id),
         "connecting"
       );
     }
     if (toRemove.length) {
-      const ws = serverWsRef.current;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "unsubscribe", assets: toRemove }));
-      }
       toRemove.forEach((assetId) => clearBook(assetId));
-    }
-
-    const ws = serverWsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN && toAdd.length) {
-      ws.send(JSON.stringify({ type: "subscribe", assets: toAdd }));
-      pendingSubscribeRef.current = [];
     }
   }, [assetMeta, clearBook, setStatusBulk]);
 
@@ -136,12 +124,17 @@ export function useServerBooksSocket(widgets: TokenWidget[]): void {
       const payload = event.data as { type?: string; updates?: Record<string, BookState> };
       if (!payload || payload.type !== "batch" || !payload.updates) return;
       const updates = payload.updates;
-      const assetIds = Object.keys(updates);
-      if (!assetIds.length) return;
+      const filteredUpdates: Record<string, BookState> = {};
+      Object.entries(updates).forEach(([assetId, bookState]) => {
+        if (assetsRef.current.has(assetId)) {
+          filteredUpdates[assetId] = bookState;
+        }
+      });
+      if (!Object.keys(filteredUpdates).length) return;
       if (!pendingUpdatesRef.current) {
-        pendingUpdatesRef.current = { ...updates };
+        pendingUpdatesRef.current = { ...filteredUpdates };
       } else {
-        Object.assign(pendingUpdatesRef.current, updates);
+        Object.assign(pendingUpdatesRef.current, filteredUpdates);
       }
       if (applyTimerRef.current !== null) return;
       applyTimerRef.current = window.setTimeout(() => {
@@ -173,11 +166,8 @@ export function useServerBooksSocket(widgets: TokenWidget[]): void {
 
       ws.onopen = () => {
         reconnectAttemptsRef.current = 0;
-        const assets = Array.from(assetsRef.current.values());
-        if (assets.length) {
-          ws.send(JSON.stringify({ type: "subscribe", assets }));
-          pendingSubscribeRef.current = [];
-        }
+        const assets = assetsRef.current.keys();
+        setStatusBulk(assets, "connecting");
       };
 
       ws.onmessage = (event) => {

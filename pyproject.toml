@@ -10,6 +10,7 @@ dependencies = [
     "python-dotenv",
     "websocket-client",
     "py-clob-client",
+    "boto3",
     "thefuzz",
     "fastapi",
     "uvicorn[standard]"

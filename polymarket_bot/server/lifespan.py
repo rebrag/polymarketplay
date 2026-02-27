@@ -32,6 +32,16 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     def _start_mem_logger() -> None:
@@ -57,6 +67,20 @@ async def lifespan(app: FastAPI):
 
     registry.disable_auto_trading()
     try:
+        registry.ensure_log_archiver_ready()
+    except Exception as exc:
+        print(f"S3 archiver startup preflight failed: {exc}")
+        raise RuntimeError("S3 archiver preflight failed. Aborting server startup.") from exc
+    backfill_on_startup = _env_bool("LOG_ARCHIVE_S3_BACKFILL_ON_STARTUP", False)
+    backfill_max_folders = max(0, _env_int("LOG_ARCHIVE_S3_BACKFILL_MAX_FOLDERS", 0))
+    if backfill_on_startup:
+        stats = registry.archive_existing_log_folders(max_folders=backfill_max_folders)
+        print(
+            "S3 startup backfill finished "
+            f"(checked={stats.get('checked', 0)}, uploaded={stats.get('uploaded', 0)}, "
+            f"max_folders={backfill_max_folders})"
+        )
+    try:
         registry.poly_client.warm_trading_client()
         print("Trading client warmed at startup.")
     except Exception as e:
@@ -66,7 +90,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"User WS startup failed: {e}")
     threshold_raw = os.getenv("ORDERBOOK_MIN_VOLUME", os.getenv("AUTO_LOG_VOLUME_THRESHOLD", "10000"))
-    include_more_markets = _env_bool("ORDERBOOK_INCLUDE_MORE_MARKETS", True)
+    include_more_markets = _env_bool("ORDERBOOK_INCLUDE_MORE_MARKETS", False)
     track_all_outcomes = _env_bool("ORDERBOOK_TRACK_ALL_OUTCOMES", True)
     try:
         threshold = float(threshold_raw)

@@ -143,7 +143,8 @@ def debug_user_ws_start() -> dict[str, object]:
 
 @router.get("/debug/books")
 def debug_books() -> dict[str, object]:
-    active_asset_ids = sorted(registry.active_books.keys())
+    with registry._market_feed_socket_lock:
+        tracked_asset_ids = sorted(registry._tracked_assets)
     slug_to_title: dict[str, str] = {}
     with registry._auto_subscribe_lock:
         for item in registry._auto_subscribe_items.values():
@@ -152,7 +153,7 @@ def debug_books() -> dict[str, object]:
             if slug and title and slug not in slug_to_title:
                 slug_to_title[slug] = title
     active_assets: list[dict[str, str]] = []
-    for aid in active_asset_ids:
+    for aid in tracked_asset_ids:
         meta = registry._asset_meta.get(aid, {})
         slug = str(meta.get("slug") or "")
         active_assets.append(
@@ -172,8 +173,10 @@ def debug_books() -> dict[str, object]:
             }
         )
     return {
-        "active_books": len(registry.active_books),
-        "active_asset_ids": active_asset_ids,
+        # For frontend "Subscribed", treat tracked upstream assets as source-of-truth.
+        "active_books": len(tracked_asset_ids),
+        "active_asset_ids": tracked_asset_ids,
+        "tracked_asset_ids": tracked_asset_ids,
         "active_assets": active_assets,
         "tracked_assets": len(registry._tracked_assets),
         "market_threads": len(registry._market_threads),

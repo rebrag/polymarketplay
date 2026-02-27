@@ -111,3 +111,31 @@ The authors are not responsible for financial losses incurred by using this soft
 
 🤝 Contributing
 Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
+
+## S3 Log Archiving
+
+Completed log folders under `logs/<event-slug>/` can be uploaded to S3 automatically.
+
+1. Install dependencies:
+```
+pip install -e .
+```
+2. Configure `.env`:
+```
+LOG_ARCHIVE_S3_ENABLED=true
+LOG_ARCHIVE_S3_BUCKET=your-s3-bucket
+LOG_ARCHIVE_S3_PREFIX=polymarket-logs
+LOG_ARCHIVE_AWS_REGION=us-east-1
+LOG_ARCHIVE_DELETE_LOCAL_AFTER_UPLOAD=false
+LOG_ARCHIVE_UPLOAD_RETRIES=3
+LOG_ARCHIVE_S3_BACKFILL_ON_STARTUP=false
+LOG_ARCHIVE_S3_BACKFILL_MAX_FOLDERS=0
+```
+3. Ensure AWS credentials are available in your environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and optional `AWS_SESSION_TOKEN`) or through your configured AWS profile/role.
+
+Behavior:
+- When the last logger for an event slug exits, all `*.csv` files in that slug folder are uploaded.
+- A `_UPLOAD_COMPLETE.txt` marker is written to the same S3 prefix.
+- If `LOG_ARCHIVE_DELETE_LOCAL_AFTER_UPLOAD=true`, uploaded local CSV files are removed and the folder is removed if empty.
+- If `LOG_ARCHIVE_S3_BACKFILL_ON_STARTUP=true`, existing slug folders in `logs/` are swept once at startup.
+- `LOG_ARCHIVE_S3_BACKFILL_MAX_FOLDERS` limits startup sweep size (`0` means no limit).

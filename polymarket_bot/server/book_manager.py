@@ -22,6 +22,7 @@ from polymarket_bot.models import (
     WsTickSizeChangeMessage,
 )
 from polymarket_bot.server.helpers import _to_float, _to_int, _to_side
+from polymarket_bot.server.log_archiver import S3LogArchiver
 from polymarket_bot.server.models import AutoPairConfig
 from polymarket_bot.server.settings import (
     AUTO_SUBSCRIBE_END_DATE_WINDOW_BEFORE_HOURS,
@@ -101,6 +102,7 @@ class BookManager:
         self._auto_subscribe_items: dict[str, dict[str, object]] = {}
         self._auto_subscribe_last_run_ts: float | None = None
         self._auto_subscribe_last_error: str | None = None
+        self._log_archiver = S3LogArchiver.from_env()
 
     def register_subscriber(self, asset_id: str, q: Queue[None], loop: AbstractEventLoop) -> None:
         self._subs.setdefault(asset_id, set()).add(q)
@@ -755,10 +757,38 @@ class BookManager:
                     pass
             self._market_threads.pop(key, None)
             self._market_stops.pop(key, None)
+            self._maybe_archive_event_folder(slug)
 
         thread = threading.Thread(target=_log_loop, name=f"market_logger_{key}", daemon=True)
         self._market_threads[key] = thread
         thread.start()
+
+    def _maybe_archive_event_folder(self, slug: str) -> None:
+        safe_slug = self._safe_slug(slug)
+        slug_prefix = f"{safe_slug}::"
+        if any(k.startswith(slug_prefix) for k in self._market_threads):
+            return
+        folder = Path("logs") / safe_slug
+        self._log_archiver.archive_folder(folder)
+
+    def archive_existing_log_folders(self, max_folders: int = 0) -> dict[str, int]:
+        base = Path("logs")
+        if not base.exists() or not base.is_dir():
+            return {"checked": 0, "uploaded": 0}
+        dirs = sorted([p for p in base.iterdir() if p.is_dir()], key=lambda p: p.name)
+        if max_folders > 0:
+            dirs = dirs[:max_folders]
+        uploaded = 0
+        for folder in dirs:
+            try:
+                if self._log_archiver.archive_folder(folder):
+                    uploaded += 1
+            except Exception as exc:
+                print(f"S3 startup backfill failed (folder={folder}): {exc}")
+        return {"checked": len(dirs), "uploaded": uploaded}
+
+    def ensure_log_archiver_ready(self) -> None:
+        self._log_archiver.startup_preflight()
 
     def _stop_logger(self, asset_id: str) -> None:
         meta = self._asset_meta.pop(asset_id, None)
@@ -1007,7 +1037,9 @@ class BookManager:
         book = self.active_books.get(asset_id)
         if not book or getattr(book, "ready", False):
             return
-        snapshot = self.poly_client.get_order_book_snapshot(asset_id)
+        meta = self._asset_meta.get(asset_id, {})
+        slug = str(meta.get("slug") or "").strip() or None
+        snapshot = self.poly_client.get_order_book_snapshot(asset_id, event_slug=slug)
         if not snapshot:
             return
         try:
@@ -1015,6 +1047,12 @@ class BookManager:
             self.notify_updated(asset_id)
         except Exception:
             pass
+
+    def _rest_order_book_exists(self, asset_id: str) -> bool:
+        meta = self._asset_meta.get(asset_id, {})
+        slug = str(meta.get("slug") or "").strip() or None
+        snapshot = self.poly_client.get_order_book_snapshot(asset_id, event_slug=slug)
+        return snapshot is not None
 
     def _parse_string_or_list(self, raw: object) -> list[str]:
         if isinstance(raw, list):
@@ -1260,25 +1298,16 @@ class BookManager:
 
         with self._auto_subscribe_lock:
             current = set(self._auto_subscribe_managed_assets)
-        market_assets: list[list[str]] = []
-        for item in items.values():
-            raw_assets = item.get("assets", [])
-            if not isinstance(raw_assets, list):
-                continue
-            asset_ids = [str(x).strip() for x in raw_assets if str(x).strip()]
-            if len(asset_ids) < 2:
-                continue
-            market_assets.append(asset_ids)
-        ask_lookup: dict[str, float | None] = {}
-        for aid in {asset for pair in market_assets for asset in pair}:
-            ask_lookup[aid] = self._best_ask_from_book(aid)
-        closed_assets: set[str] = set()
-        for asset_ids in market_assets:
-            if self._is_closed_by_best_asks(asset_ids, ask_lookup):
-                closed_assets.update(asset_ids)
-        if closed_assets:
-            desired_assets -= closed_assets
-        to_add = desired_assets - current
+        # Primary prune: eligibility drift.
+        to_remove_drift = current - desired_assets
+        for aid in to_remove_drift:
+            try:
+                self.release(aid)
+            except Exception as exc:
+                print(f"Auto subscribe drift release failed (asset={aid}): {exc}")
+
+        current_after_drift = current - to_remove_drift
+        to_add = desired_assets - current_after_drift
         for aid in to_add:
             try:
                 self.subscribe_to_asset(aid)
@@ -1291,27 +1320,38 @@ class BookManager:
                     "Auto subscribe failed "
                     f"(question={question} outcome={outcome}): {exc}"
                 )
-        to_remove_closed = current & closed_assets
-        for aid in to_remove_closed:
+        managed_after_add = current_after_drift | to_add
+
+        # Secondary prune: REST existence check.
+        to_remove_missing_book: set[str] = set()
+        for aid in managed_after_add:
+            try:
+                if not self._rest_order_book_exists(aid):
+                    to_remove_missing_book.add(aid)
+            except Exception as exc:
+                print(f"Auto subscribe REST existence check failed (asset={aid}): {exc}")
+
+        for aid in to_remove_missing_book:
             try:
                 self.release(aid)
             except Exception as exc:
-                print(f"Auto subscribe release failed (asset={aid}): {exc}")
+                print(f"Auto subscribe REST release failed (asset={aid}): {exc}")
         with self._auto_subscribe_lock:
-            next_managed = (current | to_add) - to_remove_closed
+            next_managed = managed_after_add - to_remove_missing_book
             self._auto_subscribe_managed_assets = next_managed
             merged_items = dict(self._auto_subscribe_items)
             merged_items.update(items)
-            if closed_assets:
-                closed_keys = []
+            removed_assets = to_remove_drift | to_remove_missing_book
+            if removed_assets:
+                removed_keys = []
                 for key, item in merged_items.items():
                     raw_assets = item.get("assets", [])
                     if not isinstance(raw_assets, list):
                         continue
                     asset_ids = [str(x).strip() for x in raw_assets if str(x).strip()]
-                    if asset_ids and all(aid in closed_assets for aid in asset_ids):
-                        closed_keys.append(key)
-                for key in closed_keys:
+                    if asset_ids and all(aid in removed_assets for aid in asset_ids):
+                        removed_keys.append(key)
+                for key in removed_keys:
                     merged_items.pop(key, None)
             self._auto_subscribe_items = merged_items
             self._auto_subscribe_last_run_ts = time.time()

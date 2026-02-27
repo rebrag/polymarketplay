@@ -320,7 +320,7 @@ class PolyClient:
             return float(price_val) if isinstance(price_val, str) else float(price_val) # type: ignore
         return float(raw) #type:ignore
 
-    def get_order_book_snapshot(self, token_id: str) -> WsBookMessage | None:
+    def get_order_book_snapshot(self, token_id: str, event_slug: str | None = None) -> WsBookMessage | None:
         """
         Fetches a point-in-time order book snapshot via REST.
         """
@@ -328,7 +328,8 @@ class PolyClient:
             client = self._get_public_clob_client()
             raw = client.get_order_book(token_id)  # type: ignore
         except Exception as e:
-            print(f"⚠️ Order book REST fetch failed: {e}")
+            slug_part = f", event_slug={event_slug}" if event_slug else ""
+            print(f"Order book REST fetch failed (token_id={token_id}{slug_part}): {e}")
             return None
 
         book: dict[str, Any] | None
