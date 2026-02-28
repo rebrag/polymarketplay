@@ -102,6 +102,29 @@ interface AutoStatusPair {
   strategy?: string;
 }
 
+function getMarketVolume(market: Market): number {
+  const raw = market as unknown as {
+    volumeNum?: unknown;
+    volume?: unknown;
+    volume24hr?: unknown;
+  };
+  const candidates = [raw.volumeNum, raw.volume, raw.volume24hr];
+  for (const value of candidates) {
+    const num = Number(value);
+    if (Number.isFinite(num)) return num;
+  }
+  return 0;
+}
+
+function sortPairGroupsByVolume(groups: Record<string, TokenWidget[]>): Array<[string, TokenWidget[]]> {
+  return Object.entries(groups).sort((a, b) => {
+    const left = Math.max(...a[1].map((w) => w.marketVolume));
+    const right = Math.max(...b[1].map((w) => w.marketVolume));
+    if (left !== right) return right - left;
+    return a[0].localeCompare(b[0]);
+  });
+}
+
 function toExpiration(order: OrderView): OrderView {
   const raw = (order as unknown as { expiration?: number | string }).expiration;
   const exp = Number(raw ?? 0);
@@ -1233,7 +1256,7 @@ function App() {
                 assetId,
                 outcomeName,
                 marketQuestion: market.question,
-                marketVolume: market.volume,
+                marketVolume: getMarketVolume(market),
                 gameStartTime: market.gameStartTime,
               });
             });
@@ -1326,7 +1349,7 @@ function App() {
             assetId,
             outcomeName,
             marketQuestion: market.question,
-            marketVolume: market.volume,
+            marketVolume: getMarketVolume(market),
             sourceSlug: data.slug,
             gameStartTime: market.gameStartTime,
           });
@@ -1861,7 +1884,7 @@ function App() {
                   ) : null}
 
                   <div className="grid grid-cols-1 sm:grid-cols-1 lg:grid-cols-2 xl:grid-cols-2 2xl:grid-cols-3 gap-4 pb-0">
-                    {Object.entries(eventGroups).map(([pairKey, group]) => (
+                    {sortPairGroupsByVolume(eventGroups).map(([pairKey, group]) => (
                       <BookPair
                         key={pairKey}
                         pairKey={pairKey}
@@ -1902,7 +1925,7 @@ function App() {
 
             {/* High-Density Order Book Grid */}
             <div className="grid grid-cols-1 sm:grid-cols-1 lg:grid-cols-2 xl:grid-cols-2 2xl:grid-cols-3 gap-4 pb-0">
-              {Object.entries(
+              {sortPairGroupsByVolume(
                 widgets
                   .filter((w) => {
                     if (!w.sourceSlug) return true;

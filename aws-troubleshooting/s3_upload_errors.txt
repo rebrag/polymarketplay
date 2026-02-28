@@ -1,2 +1,15 @@
 [2026-02-27T20:39:45.491673+00:00] phase=startup_preflight bucket=rebrag-polymarket-logs prefix=polymarket-logs folder=logs error=Your session has expired or credentials have changed. Please reauthenticate using 'aws login'.
 [2026-02-27T20:40:16.216665+00:00] phase=startup_preflight bucket=rebrag-polymarket-logs prefix=polymarket-logs folder=logs error=Your session has expired or credentials have changed. Please reauthenticate using 'aws login'.
+[2026-02-27T22:05:23.291717+00:00] phase=startup_preflight bucket=rebrag-polymarket-logs prefix=polymarket-logs folder=logs error=An error occurred (400) when calling the HeadBucket operation: Bad Request
+[2026-02-27T22:05:25.242852+00:00] phase=startup_preflight bucket=rebrag-polymarket-logs prefix=polymarket-logs folder=logs error=An error occurred (400) when calling the HeadBucket operation: Bad Request
+[2026-02-27T22:06:06.725802+00:00] phase=startup_preflight bucket=rebrag-polymarket-logs prefix=polymarket-logs folder=logs error=An error occurred (400) when calling the HeadBucket operation: Bad Request
+[2026-02-27T22:07:11.255849+00:00] phase=startup_preflight bucket=rebrag-polymarket-logs prefix=polymarket-logs folder=logs error=An error occurred (400) when calling the HeadBucket operation: Bad Request
+[2026-02-27T22:27:16.389111+00:00] phase=startup_preflight bucket=rebrag-polymarket-logs prefix=polymarket-logs folder=logs error=An error occurred (400) when calling the HeadBucket operation: Bad Request
+[2026-02-27T22:28:48.083997+00:00] phase=startup_preflight bucket=rebrag-polymarket-logs prefix=polymarket-logs folder=logs error=An error occurred (403) when calling the HeadBucket operation: Forbidden
+[2026-02-27T22:29:16.846583+00:00] phase=startup_preflight bucket=rebrag-polymarket-logs prefix=polymarket-logs folder=logs error=An error occurred (403) when calling the HeadBucket operation: Forbidden
+[2026-02-27T22:30:20.660369+00:00] phase=startup_preflight bucket=rebrag-polymarket-logs prefix=polymarket-logs folder=logs error=An error occurred (403) when calling the HeadBucket operation: Forbidden
+[2026-02-27T22:31:07.325408+00:00] phase=startup_preflight bucket=rebrag-polymarket-logs prefix=polymarket-logs folder=logs error=An error occurred (403) when calling the HeadBucket operation: Forbidden
+[2026-02-27T22:33:57.452448+00:00] phase=startup_preflight bucket=rebrag-polymarket-logs prefix=polymarket-logs folder=logs error=An error occurred (403) when calling the HeadBucket operation: Forbidden
+[2026-02-27T22:41:41.881331+00:00] phase=startup_preflight bucket=rebrag-polymarket-logs prefix=polymarket-logs folder=logs error=An error occurred (403) when calling the HeadBucket operation: Forbidden
+[2026-02-27T22:44:32.310394+00:00] phase=startup_preflight bucket=rebrag-polymarket-logs prefix=polymarket-logs folder=logs error=An error occurred (403) when calling the HeadBucket operation: Forbidden
+[2026-02-27T22:51:26.350681+00:00] phase=startup_preflight bucket=rebrag-polymarket-logs prefix=polymarket-logs folder=logs error=An error occurred (403) when calling the HeadBucket operation: Forbidden

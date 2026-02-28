@@ -1039,7 +1039,14 @@ class BookManager:
             return
         meta = self._asset_meta.get(asset_id, {})
         slug = str(meta.get("slug") or "").strip() or None
-        snapshot = self.poly_client.get_order_book_snapshot(asset_id, event_slug=slug)
+        question = str(meta.get("question") or "").strip() or None
+        condition_names = self._condition_names_for_asset(asset_id)
+        snapshot = self.poly_client.get_order_book_snapshot(
+            asset_id,
+            event_slug=slug,
+            question=question,
+            condition_names=condition_names,
+        )
         if not snapshot:
             return
         try:
@@ -1051,8 +1058,30 @@ class BookManager:
     def _rest_order_book_exists(self, asset_id: str) -> bool:
         meta = self._asset_meta.get(asset_id, {})
         slug = str(meta.get("slug") or "").strip() or None
-        snapshot = self.poly_client.get_order_book_snapshot(asset_id, event_slug=slug)
+        question = str(meta.get("question") or "").strip() or None
+        condition_names = self._condition_names_for_asset(asset_id)
+        snapshot = self.poly_client.get_order_book_snapshot(
+            asset_id,
+            event_slug=slug,
+            question=question,
+            condition_names=condition_names,
+        )
         return snapshot is not None
+
+    def _condition_names_for_asset(self, asset_id: str) -> list[str]:
+        meta = self._asset_meta.get(asset_id)
+        if not meta:
+            return []
+        key = self._market_key(str(meta.get("slug") or ""), str(meta.get("question") or ""))
+        names: list[str] = []
+        for aid in sorted(self._market_assets.get(key, set())):
+            m = self._asset_meta.get(aid)
+            if not m:
+                continue
+            outcome = str(m.get("outcome") or "").strip()
+            if outcome and outcome not in names:
+                names.append(outcome)
+        return names
 
     def _parse_string_or_list(self, raw: object) -> list[str]:
         if isinstance(raw, list):
@@ -1198,6 +1227,16 @@ class BookManager:
                 continue
             for m in markets:
                 if not isinstance(m, dict):
+                    continue
+                market_active_raw = m.get("active", True)
+                market_active = True
+                if isinstance(market_active_raw, bool):
+                    market_active = market_active_raw
+                elif isinstance(market_active_raw, (int, float)):
+                    market_active = bool(market_active_raw)
+                elif isinstance(market_active_raw, str):
+                    market_active = market_active_raw.strip().lower() in {"1", "true", "yes", "on"}
+                if not market_active:
                     continue
                 question = str(m.get("question") or "").strip()
                 if not question:
