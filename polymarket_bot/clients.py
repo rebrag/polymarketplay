@@ -36,6 +36,7 @@ from py_clob_client.clob_types import (
     OrderType,
 )  # type: ignore
 from py_clob_client.order_builder.constants import BUY, SELL
+from polymarket_bot.server.settings import POLYSOCKET_DISABLE_ASSET_FLUSH_DELAY
 
 class BookCallback(Protocol):
     def __call__(self, msg: WsBookMessage) -> None: ...
@@ -729,7 +730,7 @@ class PolySocket:
         self._asset_lock = threading.Lock()
         self._subscribed_assets: set[str] = set()
         self._flush_timer: threading.Timer | None = None
-        self._flush_delay_s = 0.2
+        self._flush_delay_s = 0.0 if POLYSOCKET_DISABLE_ASSET_FLUSH_DELAY else 0.01
 
         self.on_book: BookCallback | None = None
         self.on_price_change: PriceChangeCallback | None = None
@@ -788,13 +789,19 @@ class PolySocket:
             return False
 
     def _schedule_asset_flush(self) -> None:
+        immediate_flush = False
         with self._asset_lock:
-            if self._flush_timer is not None:
+            if self._flush_delay_s <= 0:
+                immediate_flush = True
+            elif self._flush_timer is not None:
                 return
-            timer = threading.Timer(self._flush_delay_s, self._flush_asset_updates)
-            timer.daemon = True
-            self._flush_timer = timer
-            timer.start()
+            else:
+                timer = threading.Timer(self._flush_delay_s, self._flush_asset_updates)
+                timer.daemon = True
+                self._flush_timer = timer
+                timer.start()
+        if immediate_flush:
+            self._flush_asset_updates()
 
     def _flush_asset_updates(self) -> None:
         with self._asset_lock:

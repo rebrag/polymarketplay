@@ -1,5 +1,5 @@
-import threading
 import asyncio
+import threading
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, List, Tuple, cast
 from polymarket_bot.models import WsBookMessage, WsPriceChangeMessage, WsTickSizeChangeMessage
@@ -32,7 +32,6 @@ class OrderBook:
         self.tick_size = 0.01
         self.ready = False
         self.msg_count = 0
-        self._queue: List[WsPriceChangeMessage] = []
 
     def _trigger_update(self) -> None:
         """Schedules the optional event trigger on an asyncio loop."""
@@ -109,10 +108,6 @@ class OrderBook:
                 self.bids[self._quantize(self._safe_float(level.get("price")))] = self._safe_float(level.get("size"))
             for level in asks_raw:
                 self.asks[self._quantize(self._safe_float(level.get("price")))] = self._safe_float(level.get("size"))
-            if self._queue:
-                for pending_msg in self._queue:
-                    self._apply_price_change(pending_msg)
-                self._queue.clear()
             self.ready = True
         self._trigger_update()
 
@@ -151,15 +146,16 @@ class OrderBook:
         with self.lock:
             self.msg_count += 1
             if not self.ready:
-                self._queue.append(msg)
                 return
             self._apply_price_change(msg)
         self._trigger_update()
 
-    def get_snapshot(self, limit: int = 50) -> Tuple[List[PriceSize], List[PriceSize]]:
+    def get_snapshot(self, limit: int | None = 50) -> Tuple[List[PriceSize], List[PriceSize]]:
         with self.lock:
             bids_sorted = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)
             asks_sorted = sorted(self.asks.items(), key=lambda x: x[0])
+            if limit is None:
+                return bids_sorted, asks_sorted
             return bids_sorted[:limit], asks_sorted[:limit]
 
     def get_cumulative_values(self, levels: List[PriceSize]) -> List[float]:

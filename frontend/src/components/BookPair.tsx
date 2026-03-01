@@ -369,7 +369,7 @@ function BookPairComponent({
       }`}
     >
       {isPair && (
-        <div className="absolute -top-2 right-2 flex items-center gap-2">
+        <div className="absolute -top-4 right-2 flex items-center gap-2">
           <Button
             onClick={handleToggleGraph}
             className={`h-6 px-2 text-[10px] uppercase font-bold border ${

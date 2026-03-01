@@ -4,6 +4,18 @@ from dataclasses import dataclass
 from typing import Dict, Protocol
 
 from polymarket_bot.server.models import AutoPairConfig
+from polymarket_bot.server.settings import (
+    DEFAULT_SMALLEST_SIZE_LEVEL_MAX_LEVEL,
+    DEFAULT_SMALLEST_SIZE_LEVEL_MIN_LEVEL,
+)
+
+
+def _smallest_level_candidates() -> list[int]:
+    low = int(min(DEFAULT_SMALLEST_SIZE_LEVEL_MIN_LEVEL, DEFAULT_SMALLEST_SIZE_LEVEL_MAX_LEVEL))
+    high = int(max(DEFAULT_SMALLEST_SIZE_LEVEL_MIN_LEVEL, DEFAULT_SMALLEST_SIZE_LEVEL_MAX_LEVEL))
+    low = min(low, -1)
+    high = min(high, -1)
+    return list(range(high, low - 1, -1))
 
 
 @dataclass(frozen=True)
@@ -15,6 +27,7 @@ class PairContext:
     both_over: bool
     best_bids: Dict[str, float]
     last_trades: Dict[str, dict[str, float | str | int]]
+    level_sizes: Dict[str, Dict[str, Dict[int, float]]]
 
 
 @dataclass(frozen=True)
@@ -61,6 +74,95 @@ class DefaultStrategy:
         if not ctx.buy_allowed:
             return []
         return [OrderIntent(side="BUY")]
+
+
+class DefaultSmallestSizeLevelStrategy:
+    name = "default-smallest-size-level"
+
+    @staticmethod
+    def _pick_level(ctx: PairContext, asset_id: str, side: str) -> int:
+        side_sizes = ctx.level_sizes.get(asset_id, {}).get(side, {})
+        levels = _smallest_level_candidates()
+        if not levels:
+            return -1
+        candidates: list[tuple[int, float]] = [
+            (level, float(side_sizes.get(level, 0.0) or 0.0))
+            for level in levels
+        ]
+        # Tie-break toward deeper levels (e.g. -2 over -1).
+        return min(candidates, key=lambda item: (item[1], item[0]))[0]
+
+    def decide(self, asset_id: str, config: AutoPairConfig, ctx: PairContext) -> list[OrderIntent]:
+        other_asset = ctx.assets[1] if asset_id == ctx.assets[0] else ctx.assets[0]
+        current_shares = ctx.positions.get(asset_id, 0.0)
+        other_shares = ctx.positions.get(other_asset, 0.0)
+        current_cfg = config.asset_settings.get(asset_id)
+        other_cfg = config.asset_settings.get(other_asset)
+        current_threshold = float(current_cfg.shares) if current_cfg is not None else 0.0
+        other_threshold = float(other_cfg.shares) if other_cfg is not None else 0.0
+        has_current_inventory = current_shares >= current_threshold > 0
+        has_other_inventory = other_shares >= other_threshold > 0
+
+        if has_current_inventory:
+            if not ctx.sell_allowed:
+                return []
+            level = self._pick_level(ctx, asset_id, "SELL")
+            return [OrderIntent(side="SELL", level=level)]
+        if has_other_inventory:
+            return []
+
+        if not ctx.buy_allowed:
+            return []
+        level = self._pick_level(ctx, asset_id, "BUY")
+        return [OrderIntent(side="BUY", level=level)]
+
+
+class ZeroOnlyStrategy:
+    name = "zero-only"
+
+    @staticmethod
+    def _pick_zero_level(ctx: PairContext, asset_id: str, side: str) -> int | None:
+        side_sizes = ctx.level_sizes.get(asset_id, {}).get(side, {})
+        levels = _smallest_level_candidates()
+        if not levels:
+            return None
+        zero_levels = [
+            level
+            for level in levels
+            if float(side_sizes.get(level, 0.0) or 0.0) <= 0.0
+        ]
+        if not zero_levels:
+            return None
+        # Tie-break toward deeper levels (e.g. -2 over -1).
+        return min(zero_levels)
+
+    def decide(self, asset_id: str, config: AutoPairConfig, ctx: PairContext) -> list[OrderIntent]:
+        other_asset = ctx.assets[1] if asset_id == ctx.assets[0] else ctx.assets[0]
+        current_shares = ctx.positions.get(asset_id, 0.0)
+        other_shares = ctx.positions.get(other_asset, 0.0)
+        current_cfg = config.asset_settings.get(asset_id)
+        other_cfg = config.asset_settings.get(other_asset)
+        current_threshold = float(current_cfg.shares) if current_cfg is not None else 0.0
+        other_threshold = float(other_cfg.shares) if other_cfg is not None else 0.0
+        has_current_inventory = current_shares >= current_threshold > 0
+        has_other_inventory = other_shares >= other_threshold > 0
+
+        if has_current_inventory:
+            if not ctx.sell_allowed:
+                return []
+            level = self._pick_zero_level(ctx, asset_id, "SELL")
+            if level is None:
+                return []
+            return [OrderIntent(side="SELL", level=level)]
+        if has_other_inventory:
+            return []
+
+        if not ctx.buy_allowed:
+            return []
+        level = self._pick_zero_level(ctx, asset_id, "BUY")
+        if level is None:
+            return []
+        return [OrderIntent(side="BUY", level=level)]
 
 
 class ConservativeStrategy:
@@ -154,6 +256,8 @@ class AdaptiveStrategy:
 
 _STRATEGIES: dict[str, AutoStrategy] = {
     "default": DefaultStrategy(),
+    "default-smallest-size-level": DefaultSmallestSizeLevelStrategy(),
+    "zero-only": ZeroOnlyStrategy(),
     "conservative": ConservativeStrategy(),
     "aggressive": AggressiveStrategy(),
     "adaptive": AdaptiveStrategy(),

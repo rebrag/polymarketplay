@@ -30,6 +30,10 @@ from polymarket_bot.server.settings import (
     AUTO_SUBSCRIBE_GAMESTART_WINDOW_BEFORE_HOURS,
     AUTO_SUBSCRIBE_GAMESTART_WINDOW_HOURS,
     AUTO_SUBSCRIBE_REFRESH_INTERVAL_S,
+    DEFAULT_SMALLEST_SIZE_LEVEL_MAX_LEVEL,
+    DEFAULT_SMALLEST_SIZE_LEVEL_MIN_LEVEL,
+    DEFAULT_SMALLEST_SIZE_LEVEL_MIN_BUY_PRICE,
+    DEFAULT_SMALLEST_SIZE_LEVEL_MAX_SELL_PRICE,
 )
 from polymarket_bot.server.strategies import OrderIntent, PairContext, get_strategy
 
@@ -78,11 +82,10 @@ class BookManager:
         self._positions_last_fetch = 0.0
         self._positions_refresh_interval_s = 60.0
         self._auto_last_submit_ts: Dict[tuple[str, str], float] = {}
-        self._auto_submit_cooldown_s = 3.0
         self._auto_pending_submits: Dict[tuple[str, str], tuple[float, float]] = {}
         self._auto_pending_timeout_s = 20.0
         self._auto_pair_last_fill_ts: Dict[str, float] = {}
-        self._auto_fill_repost_cooldown_s = 4.0
+        self._auto_fill_repost_cooldown_s = 10.0
         self._open_orders_lock = threading.Lock()
         self._open_orders_by_id: Dict[str, Order] = {}
         self._open_orders_initialized = False
@@ -268,7 +271,6 @@ class BookManager:
                 self.ensure_user_socket()
             except Exception:
                 pass
-            self._ensure_open_orders_index()
             for asset in config.assets:
                 try:
                     self.subscribe_to_asset(asset)
@@ -388,12 +390,20 @@ class BookManager:
 
         for price in prices:
             if prev is not None and price - prev > tick:
-                push_unique(rounded(prev + tick))
+                # For asks, place inside a gap at the high side (price - tick).
+                push_unique(rounded(price - tick))
                 push_unique(rounded(price))
             else:
                 push_unique(rounded(price))
             prev = price
         return out
+
+    def _smallest_level_candidates(self) -> list[int]:
+        low = int(min(DEFAULT_SMALLEST_SIZE_LEVEL_MIN_LEVEL, DEFAULT_SMALLEST_SIZE_LEVEL_MAX_LEVEL))
+        high = int(max(DEFAULT_SMALLEST_SIZE_LEVEL_MIN_LEVEL, DEFAULT_SMALLEST_SIZE_LEVEL_MAX_LEVEL))
+        low = min(low, -1)
+        high = min(high, -1)
+        return list(range(high, low - 1, -1))
 
     def _price_for_level(self, book: OrderBook, side: str, level: int) -> float | None:
         bids, asks = book.get_snapshot(limit=100)
@@ -404,18 +414,62 @@ class BookManager:
         best_bid = bid_prices[0]
         best_ask = ask_prices[0]
         tick = book.tick_size or 0.01
+        bid_placements = self._build_bid_placements(bid_prices, tick)
+        ask_placements = self._build_ask_placements(ask_prices, tick)
 
-        if level <= 0:
-            idx = min(abs(level), max(len(bid_prices), len(ask_prices)) - 1)
-            if side == "BUY":
-                placements = self._build_bid_placements(bid_prices, tick)
-                return placements[idx] if idx < len(placements) else best_bid
-            placements = self._build_ask_placements(ask_prices, tick)
-            return placements[idx] if idx < len(placements) else best_ask
+        # Mirror frontend OrderBookWidget level math exactly so submitted prices
+        # match the "BUY @ X / SELL @ X" preview for both 0.01 and 0.001 books.
+        max_negative_level = max(0, max(len(bid_placements), len(ask_placements)) - 1)
+        spread_steps = int((best_ask - best_bid) / tick) - 1
+        max_positive_level = max(0, spread_steps)
+        clamped_level = max(-max_negative_level, min(max_positive_level, level))
+        level_index = min(abs(clamped_level), max_negative_level)
+        buy_price = bid_placements[level_index] if level_index < len(bid_placements) else best_bid
+        sell_price = ask_placements[level_index] if level_index < len(ask_placements) else best_ask
 
-        buy_price = min(best_ask - tick, best_bid + level * tick)
-        sell_price = max(best_bid + tick, best_ask - level * tick)
+        if clamped_level > 0:
+            buy_price = min(best_ask - tick, best_bid + clamped_level * tick)
+            sell_price = max(best_bid + tick, best_ask - clamped_level * tick)
         return buy_price if side == "BUY" else sell_price
+
+    def _pick_smallest_size_level_now(self, book: OrderBook, side: str, zero_only: bool = False) -> int | None:
+        bids, asks = book.get_snapshot(limit=100)
+        if not bids or not asks:
+            return None
+        levels = self._smallest_level_candidates()
+        if not levels:
+            return None
+        tick = book.tick_size or 0.01
+        decimals = self._decimals_for_tick(tick)
+        if side == "BUY":
+            prices = [float(p) for p, _ in bids]
+            placements = self._build_bid_placements(prices, tick)
+            sizes_by_price: Dict[float, float] = {
+                round(float(p), decimals): float(s) for p, s in bids
+            }
+        else:
+            prices = [float(p) for p, _ in asks]
+            placements = self._build_ask_placements(prices, tick)
+            sizes_by_price = {
+                round(float(p), decimals): float(s) for p, s in asks
+            }
+
+        candidates: list[tuple[int, float]] = []
+        for level in levels:
+            i = abs(level)
+            if i < len(placements):
+                level_price = round(float(placements[i]), decimals)
+                size = float(sizes_by_price.get(level_price, 0.0))
+            else:
+                size = 0.0
+            candidates.append((level, size))
+        if zero_only:
+            zero_candidates = [item for item in candidates if item[1] <= 0.0]
+            if not zero_candidates:
+                return None
+            return min(zero_candidates, key=lambda item: item[0])[0]
+        # Tie-break toward deeper levels (e.g. -2 over -1).
+        return min(candidates, key=lambda item: (item[1], item[0]))[0]
 
     def get_price_for_level(self, token_id: str, side: str, level: int) -> float | None:
         book = self.active_books.get(token_id)
@@ -429,30 +483,67 @@ class BookManager:
                 configs = [cfg for cfg in self._auto_pairs.values() if cfg.enabled]
             if not configs:
                 return
-            positions = self._get_positions_cache()
-            if not self._ensure_open_orders_index():
-                # Fail closed to avoid duplicate placements when open-order state is unavailable.
-                self._auto_stop.wait(1.0)
-                continue
-            open_assets, open_sell_sizes = self._get_open_orders_snapshot()
-            # Clear pending markers once the corresponding side appears in open orders.
-            for key in list(self._auto_pending_submits.keys()):
-                asset, side = key
-                if side in open_assets.get(asset, set()):
-                    self._auto_pending_submits.pop(key, None)
             now = time.time()
+            next_wait_s = 1.0
+            eligible_configs: list[AutoPairConfig] = []
+
+            # Schedule work only when at least one side for a pair is due.
             for config in configs:
                 if len(config.assets) < 2:
                     continue
                 assets = config.assets[:2]
+                pair_last_fill = self._auto_pair_last_fill_ts.get(config.pair_key, 0.0)
+                fill_remaining = self._auto_fill_repost_cooldown_s - (now - pair_last_fill)
+                if fill_remaining > 0:
+                    next_wait_s = min(next_wait_s, fill_remaining)
+                    continue
+
+                has_enabled_asset = False
+                pair_due_in: float | None = None
+                for asset in assets:
+                    if asset in config.disabled_assets:
+                        continue
+                    settings = config.asset_settings.get(asset)
+                    if settings is None or not settings.enabled:
+                        continue
+                    has_enabled_asset = True
+                    ttl_val = max(0, settings.ttl_seconds)
+                    submit_cooldown_s = float(ttl_val) + 0.3
+                    for side in ("BUY", "SELL"):
+                        submit_key = (asset, side)
+                        last_submit = self._auto_last_submit_ts.get(submit_key, 0.0)
+                        due_in = (last_submit + submit_cooldown_s) - now
+                        if pair_due_in is None:
+                            pair_due_in = due_in
+                        else:
+                            pair_due_in = min(pair_due_in, due_in)
+
+                if not has_enabled_asset:
+                    continue
+                if pair_due_in is None:
+                    continue
+                if pair_due_in > 0:
+                    next_wait_s = min(next_wait_s, pair_due_in)
+                    continue
+                eligible_configs.append(config)
+
+            if not eligible_configs:
+                self._auto_stop.wait(max(0.05, min(next_wait_s, 2.0)))
+                continue
+
+            positions = self._get_positions_cache()
+            for config in eligible_configs:
+                assets = config.assets[:2]
                 books: Dict[str, OrderBook] = {}
                 prices: Dict[str, tuple[float, float]] = {}
+                level_sizes: Dict[str, Dict[str, Dict[int, float]]] = {}
+                levels = self._smallest_level_candidates()
                 for asset in assets:
                     book = self.active_books.get(asset)
                     if not book or not book.ready:
                         books = {}
                         break
-                    bids, asks = book.get_snapshot(limit=5)
+                    bids, asks = book.get_snapshot(limit=10)
                     best_bid = bids[0][0] if bids else None
                     best_ask = asks[0][0] if asks else None
                     if best_bid is None or best_ask is None:
@@ -460,7 +551,35 @@ class BookManager:
                         break
                     books[asset] = book
                     prices[asset] = (float(best_bid), float(best_ask))
+                    tick = book.tick_size or 0.01
+                    decimals = self._decimals_for_tick(tick)
+                    bid_prices = [float(p) for p, _ in bids]
+                    ask_prices = [float(p) for p, _ in asks]
+                    bid_placements = self._build_bid_placements(bid_prices, tick)
+                    ask_placements = self._build_ask_placements(ask_prices, tick)
+                    bid_sizes_by_price: Dict[float, float] = {
+                        round(float(p), decimals): float(s) for p, s in bids
+                    }
+                    ask_sizes_by_price: Dict[float, float] = {
+                        round(float(p), decimals): float(s) for p, s in asks
+                    }
+                    buy_sizes: Dict[int, float] = {}
+                    sell_sizes: Dict[int, float] = {}
+                    for level in levels:
+                        i = abs(level)
+                        if i < len(bid_placements):
+                            bid_price = round(float(bid_placements[i]), decimals)
+                            buy_sizes[level] = float(bid_sizes_by_price.get(bid_price, 0.0))
+                        else:
+                            buy_sizes[level] = 0.0
+                        if i < len(ask_placements):
+                            ask_price = round(float(ask_placements[i]), decimals)
+                            sell_sizes[level] = float(ask_sizes_by_price.get(ask_price, 0.0))
+                        else:
+                            sell_sizes[level] = 0.0
+                    level_sizes[asset] = {"BUY": buy_sizes, "SELL": sell_sizes}
                 if len(books) != 2:
+                    next_wait_s = min(next_wait_s, 0.1)
                     continue
 
                 bid_sum = sum(prices[a][0] for a in assets)
@@ -482,9 +601,10 @@ class BookManager:
                     both_over=both_over,
                     best_bids=best_bids,
                     last_trades=last_trades, #type: ignore
+                    level_sizes=level_sizes,
                 )
-                strategy = get_strategy(getattr(config, "strategy", "default"))
-                pair_last_fill = self._auto_pair_last_fill_ts.get(config.pair_key, 0.0)
+                strategy_name = (getattr(config, "strategy", "default") or "default").strip().lower()
+                strategy = get_strategy(strategy_name)
 
                 for asset in assets:
                     if asset in config.disabled_assets:
@@ -496,22 +616,25 @@ class BookManager:
                     settings = config.asset_settings.get(asset)
                     if settings is None or not settings.enabled:
                         continue
+                    ttl_val = max(0, settings.ttl_seconds)
+                    submit_cooldown_s = float(ttl_val) + 1.0
+                    ttl_seconds = None if ttl_val <= 0 else ttl_val + 60
+
                     for intent in intents:
                         trade_side = intent.side
-                        if trade_side in open_assets.get(asset, set()):
-                            continue
                         submit_key = (asset, trade_side)
-                        pending = self._auto_pending_submits.get(submit_key)
-                        if pending is not None:
-                            pending_ts, _pending_size = pending
-                            if now - pending_ts < self._auto_pending_timeout_s:
-                                continue
-                            self._auto_pending_submits.pop(submit_key, None)
+                        now_submit = time.time()
                         last_submit = self._auto_last_submit_ts.get(submit_key, 0.0)
-                        if now - last_submit < self._auto_submit_cooldown_s:
+                        cooldown_remaining = submit_cooldown_s - (now_submit - last_submit)
+                        if cooldown_remaining > 0:
+                            next_wait_s = min(next_wait_s, cooldown_remaining)
                             continue
-                        if now - pair_last_fill < self._auto_fill_repost_cooldown_s:
+                        pair_last_fill = self._auto_pair_last_fill_ts.get(config.pair_key, 0.0)
+                        fill_remaining = self._auto_fill_repost_cooldown_s - (now_submit - pair_last_fill)
+                        if fill_remaining > 0:
+                            next_wait_s = min(next_wait_s, fill_remaining)
                             continue
+
                         size_multiplier = 1.0
                         if intent.size_multiplier:
                             size_multiplier = max(0.01, float(intent.size_multiplier))
@@ -521,26 +644,27 @@ class BookManager:
                             other_settings = config.asset_settings.get(other_asset)
                             if other_settings is not None:
                                 level = other_settings.level
-                        if intent.level is not None:
+                        if strategy_name in {"default-smallest-size-level", "zero-only"}:
+                            level = self._pick_smallest_size_level_now(
+                                books[asset],
+                                trade_side,
+                                zero_only=(strategy_name == "zero-only"),
+                            )
+                            if level is None:
+                                continue
+                        elif intent.level is not None:
                             level = intent.level
                         price = self._price_for_level(books[asset], trade_side, level)
                         if price is None:
+                            next_wait_s = min(next_wait_s, 0.1)
                             continue
-                        price = max(0.01, min(0.99, price))
-                        ttl_val = max(0, settings.ttl_seconds)
-                        ttl_seconds = None if ttl_val <= 0 else ttl_val + 60
-                        order_size = settings.shares * size_multiplier
-                        if trade_side == "SELL":
-                            pending_sell_size = 0.0
-                            for (pending_asset, pending_side), (_ts, pending_sz) in self._auto_pending_submits.items():
-                                if pending_asset == asset and pending_side == "SELL":
-                                    pending_sell_size += pending_sz
-                            available_sell = max(
-                                0.0,
-                                float(positions.get(asset, 0.0)) - open_sell_sizes.get(asset, 0.0) - pending_sell_size,
-                            )
-                            if available_sell + 1e-9 < order_size:
+                        if strategy_name in {"default-smallest-size-level", "zero-only"}:
+                            if trade_side == "BUY" and price < float(DEFAULT_SMALLEST_SIZE_LEVEL_MIN_BUY_PRICE):
                                 continue
+                            if trade_side == "SELL" and price > float(DEFAULT_SMALLEST_SIZE_LEVEL_MAX_SELL_PRICE):
+                                continue
+                        price = max(0.01, min(0.99, price))
+                        order_size = settings.shares * size_multiplier
                         try:
                             self.poly_client.place_limit_order(
                                 token_id=asset,
@@ -549,11 +673,8 @@ class BookManager:
                                 price=price,
                                 ttl_seconds=ttl_seconds,
                             )
-                            self._auto_last_submit_ts[submit_key] = now
-                            self._auto_pending_submits[submit_key] = (now, order_size)
-                            open_assets.setdefault(asset, set()).add(trade_side)
-                            if trade_side == "SELL":
-                                open_sell_sizes[asset] = open_sell_sizes.get(asset, 0.0) + order_size
+                            self._auto_last_submit_ts[submit_key] = time.time()
+                            next_wait_s = min(next_wait_s, submit_cooldown_s)
                         except Exception as e:
                             meta = self._asset_meta.get(asset, {})
                             question = meta.get("question") or "unknown"
@@ -563,6 +684,8 @@ class BookManager:
                                 "Auto order failed "
                                 f"(market={question} outcome={outcome} slug={slug} asset={asset} side={trade_side}): {e}"
                             )
+
+            self._auto_stop.wait(max(0.05, min(next_wait_s, 2.0)))
 
     def _parse_game_start_ts(self, game_start_time: str | None) -> float | None:
         if not game_start_time:

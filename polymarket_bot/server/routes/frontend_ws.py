@@ -11,6 +11,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from polymarket_bot.models import GammaMarket, WsBidAsk, WsPayload
 from polymarket_bot.server.order_utils import normalize_open_orders
+from polymarket_bot.server.settings import BOOKS_STREAM_FULL_EVENT_DRIVEN
 from polymarket_bot.server.state import registry
 from polymarket_bot.utils import filter_markets_by_asset, get_game_data
 
@@ -19,8 +20,9 @@ router = APIRouter()
 ORDER_WS_PING_SECONDS: Final[float] = 15.0
 
 # Hard cap on how fast we push book updates to the browser per-asset socket.
-BOOK_MAX_HZ: Final[float] = 2.0
+BOOK_MAX_HZ: Final[float] = 5.0
 BOOK_MIN_SEND_INTERVAL_S: Final[float] = 1.0 / BOOK_MAX_HZ
+BOOK_ASSET_SYNC_INTERVAL_S: Final[float] = 1.0
 
 # If your registry doesn't support book subscriber queues, we fall back to polling.
 BOOK_POLL_FALLBACK_S: Final[float] = 0.02
@@ -177,9 +179,9 @@ def _build_book_payload(
     last_trade: dict[str, object] | None,
 ) -> WsPayload:
     # Registry book interface expected:
-    # - get_snapshot(limit=15) -> (bids, asks) as list[tuple[float,float]] or similar
+    # - get_snapshot(limit=None) -> full (bids, asks) depth as list[tuple[float,float]]
     # - get_cumulative_values(levels) -> list[float]
-    bids, asks = getattr(book, "get_snapshot")(limit=15)
+    bids, asks = getattr(book, "get_snapshot")(limit=None)
     bid_cum = getattr(book, "get_cumulative_values")(bids)
     ask_cum = getattr(book, "get_cumulative_values")(asks)
 
@@ -254,6 +256,7 @@ async def websocket_books(client_ws: WebSocket) -> None:
     loop = asyncio.get_running_loop()
     last_sent_msg_count: dict[str, int] = {}
     last_sent_trade_ts: dict[str, int] = {}
+    last_books_send_mono = 0.0
 
     def _sync_backend_assets() -> None:
         with registry._market_feed_socket_lock:
@@ -276,11 +279,15 @@ async def websocket_books(client_ws: WebSocket) -> None:
         while True:
             _sync_backend_assets()
             if not subscribed:
-                await asyncio.sleep(BOOK_MIN_SEND_INTERVAL_S)
+                idle_sleep_s = BOOK_ASSET_SYNC_INTERVAL_S if BOOKS_STREAM_FULL_EVENT_DRIVEN else BOOK_MIN_SEND_INTERVAL_S
+                await asyncio.sleep(idle_sleep_s)
                 continue
 
             try:
-                await asyncio.wait_for(update_q.get(), timeout=BOOK_MIN_SEND_INTERVAL_S)
+                wait_timeout_s = (
+                    BOOK_ASSET_SYNC_INTERVAL_S if BOOKS_STREAM_FULL_EVENT_DRIVEN else BOOK_MIN_SEND_INTERVAL_S
+                )
+                await asyncio.wait_for(update_q.get(), timeout=wait_timeout_s)
             except asyncio.TimeoutError:
                 pass
 
@@ -305,7 +312,13 @@ async def websocket_books(client_ws: WebSocket) -> None:
                 updates.append(_build_book_payload(asset_id, book, msg_count, last_trade)) #type: ignore
 
             if updates:
+                if not BOOKS_STREAM_FULL_EVENT_DRIVEN:
+                    now_mono = time.monotonic()
+                    elapsed = now_mono - last_books_send_mono
+                    if elapsed < BOOK_MIN_SEND_INTERVAL_S:
+                        await asyncio.sleep(BOOK_MIN_SEND_INTERVAL_S - elapsed)
                 await client_ws.send_json({"type": "books", "updates": updates})
+                last_books_send_mono = time.monotonic()
     except WebSocketDisconnect:
         return
     except Exception as exc:
